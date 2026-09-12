@@ -78,6 +78,23 @@ jobs:
     - name: nix flake check
       run: nix flake check -L
 
+    # `nix flake check` above only reaches the x86_64-linux outputs, so
+    # anything behind an isDarwin guard is never forced and a mac-only break
+    # reaches main unnoticed — which is how a reference to the retired
+    # darwin.apple_sdk.frameworks tree sat in flake.nix until someone tried to
+    # build on a mac. Evaluating the darwin derivations pins that down for the
+    # price of an eval: no darwin runner, nothing built, just proof that the
+    # expression still resolves on the platforms we claim to support.
+    - name: Evaluate the darwin outputs
+      run: |
+        for system in aarch64-darwin x86_64-darwin; do
+          for pkg in synology-filestation-fuse synology-filestation-ffi synologyfuse-gui; do
+            echo "::group::$system.$pkg"
+            nix eval --raw ".#packages.$system.$pkg.drvPath"
+            echo; echo "::endgroup::"
+          done
+        done
+
     - name: Upload refreshed nix/deps.json
       if: steps.regen.outputs.changed == 'true'
       uses: actions/upload-artifact@v7
