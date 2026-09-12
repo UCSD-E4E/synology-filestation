@@ -11,7 +11,7 @@
     <AvaloniaUseCompiledBindingsByDefault>true</AvaloniaUseCompiledBindingsByDefault>
     <ApplicationIcon>Assets\app.ico</ApplicationIcon>
     <!-- x-release-please-start-version -->
-    <Version>0.5.5</Version>
+    <Version>0.6.0</Version>
     <!-- x-release-please-end -->
   </PropertyGroup>
 
