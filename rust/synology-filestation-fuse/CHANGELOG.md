@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.6.0](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-fuse-v0.5.5...synology-filestation-fuse-v0.6.0) (2026-09-12)
+
+
+### Features
+
+* **fuse:** say why the SMB stream died, not only that it did ([f40184a](https://github.com/UCSD-E4E/synology-filestation/commit/f40184acd473ae94cc65728c469820adfa550081))
+
+
+### Bug Fixes
+
+* **fuse:** a redial that finds the NAS directly is still a redial ([bf3075b](https://github.com/UCSD-E4E/synology-filestation/commit/bf3075b0e832af9455384c7c5b5b3ce231bedebd))
+* **fuse:** a speculative claim must mean a download that is on the wire ([b1154e9](https://github.com/UCSD-E4E/synology-filestation/commit/b1154e960348f50c5aed1eab94d3b9079f4da5f8))
+* **fuse:** speculate only where the caller will read what we fetched ([8779914](https://github.com/UCSD-E4E/synology-filestation/commit/877991472177c46882d3ea4a93b86ca199f02c69))
+* **fuse:** stop a slow block download from being mistaken for a dead one ([de8c3c6](https://github.com/UCSD-E4E/synology-filestation/commit/de8c3c6acdc4969619a86e35bb432eb4d133c597))
+* **smb:** a tunnelled mount must be able to come back ([13bde98](https://github.com/UCSD-E4E/synology-filestation/commit/13bde98e54b36c2b022dd0ba6ed5ad67c25c2510))
+* **smb:** clearing the handle cache must take the parked handles too ([9c28686](https://github.com/UCSD-E4E/synology-filestation/commit/9c28686f82803958d8964c39b7ca03ef41276ab9))
+
+
+### Performance Improvements
+
+* **smb:** stop paying three round trips to move one block ([622c70d](https://github.com/UCSD-E4E/synology-filestation/commit/622c70d9861cf3a75473c98038c1ad6c38444cf4))
+
 ## [0.5.5](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-fuse-v0.5.4...synology-filestation-fuse-v0.5.5) (2026-08-31)
 
 

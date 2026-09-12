@@ -1,6 +1,6 @@
 [package]
 name = "synology-filestation-fuse"
-version = "0.5.5"
+version = "0.6.0"
 edition = "2021"
 license = "MIT"
 description = "Cross-platform filesystem driver mounting Synology FileStation as a local directory."
