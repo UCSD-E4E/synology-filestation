@@ -69,10 +69,15 @@
           buildInputs =
             lib.optionals isLinux [ pkgs.fuse3 ]
             ++ lib.optionals isDarwin [
-              # reqwest's rustls-tls path avoids OpenSSL; libiconv + the
-              # SystemConfiguration framework cover the common darwin link needs.
+              # reqwest's rustls-tls path avoids OpenSSL, so libiconv covers
+              # what is left of the darwin link needs. SystemConfiguration used
+              # to be listed here as darwin.apple_sdk.frameworks.*, but nixpkgs
+              # has retired that tree: the frameworks now come from the stdenv's
+              # SDK, and the old path is a stub that throws on evaluation. CI
+              # never saw it — the nix job runs on Linux, where this list is
+              # behind an isDarwin guard and so is never forced — so the flake
+              # was broken only for someone working on a mac.
               pkgs.libiconv
-              pkgs.darwin.apple_sdk.frameworks.SystemConfiguration
             ];
 
           commonArgs = {
