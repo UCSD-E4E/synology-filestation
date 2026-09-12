@@ -26,16 +26,16 @@
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="Avalonia" Version="12.1.1" />
-    <PackageReference Include="Avalonia.Desktop" Version="12.1.1" />
-    <PackageReference Include="Avalonia.Themes.Fluent" Version="12.1.1" />
-    <PackageReference Include="Avalonia.Fonts.Inter" Version="12.1.1" />
+    <PackageReference Include="Avalonia" Version="12.1.2" />
+    <PackageReference Include="Avalonia.Desktop" Version="12.1.2" />
+    <PackageReference Include="Avalonia.Themes.Fluent" Version="12.1.2" />
+    <PackageReference Include="Avalonia.Fonts.Inter" Version="12.1.2" />
     <!-- Native Wayland backend (a separate package since 12.1). Without it a
          Wayland session runs us through XWayland, which bitmap-scales the
          window on a HiDPI or fractionally-scaled display instead of rendering
          at the true scale factor. Program.cs falls back to X11 when there is
          no usable compositor. -->
-    <PackageReference Include="Avalonia.Wayland" Version="12.1.1" />
+    <PackageReference Include="Avalonia.Wayland" Version="12.1.2" />
     <PackageReference Include="CommunityToolkit.Mvvm" Version="8.4.2" />
   </ItemGroup>
 

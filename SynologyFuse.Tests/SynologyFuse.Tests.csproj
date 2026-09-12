@@ -12,7 +12,7 @@
     <!-- Headless Avalonia: lays the windows out with no display, for the
          layout tests. The xUnit adapter package is v3-only, so only the
          session type is used; see TestAppBuilder. -->
-    <PackageReference Include="Avalonia.Headless" Version="12.1.1" />
+    <PackageReference Include="Avalonia.Headless" Version="12.1.2" />
     <PackageReference Include="xunit" Version="2.9.3" />
     <PackageReference Include="xunit.runner.visualstudio" Version="4.0.0">
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
