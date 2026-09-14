@@ -136,6 +136,7 @@ pub const DEFAULT_PREFETCH_BLOCKS: u64 = 16;
 mod cache;
 #[cfg(target_os = "linux")]
 mod fs;
+pub mod logfile;
 mod spill;
 
 #[cfg(target_os = "macos")]

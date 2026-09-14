@@ -365,6 +365,7 @@ synology-filestation-fuse --host <NAS_HOST> -u <USERNAME> [OPTIONS] <MOUNTPOINT>
 | `--gid <GID>` | Group reported for every mounted entry *(Linux only)* | *(mounting user's group)* |
 | `--umask <MASK>` | Octal umask for the permissions the mount reports; `022` gives `0755` directories and `0644` files *(Linux only)* | `022` |
 | `--log-level <LEVEL>` | Log level (`error`, `warn`, `info`, `debug`, `trace`) | `info` |
+| `--log-file <PATH>` | Also write the log to this file, so it outlives the terminal. Records reach the OS as they are emitted, and warnings and errors are forced to disk, so a killed or power-cycled process still leaves them behind — which is the whole point: a mount bad enough to need the power button is the one worth reading afterwards. Refused if the path is inside the mountpoint (the log would be written through the mount it describes, deadlocking it). Rotates at 8 MiB, keeping 3 older generations beside it | *(none)* |
 | `--fuse-threads <N>` | FUSE event-loop threads; `0` picks a default from the CPU count. Bounds the callbacks that still hold a thread (a cache-missing read, a listing, a metadata call) — not file transfers, which run on the async runtime *(Linux only)* | `0` |
 
 Transport selection — see [Transports](#transports) for how these combine:
@@ -485,6 +486,12 @@ SYNOLOGY_FS_SMB_TIMEOUT_MS=500 \
 
 # Enable debug logging
 synology-filestation-fuse --host nas.local -u admin --log-level debug /mnt/nas
+
+# Keep the log after the terminal is gone. Worth doing before any run you might
+# have to explain afterwards — a mount that wedges the machine takes its
+# scrollback with it, and this is what is left to read.
+synology-filestation-fuse --host nas.local -u admin \
+  --log-level debug --log-file ~/.local/state/synology-filestation/mount.log /mnt/nas
 
 # Unmount (Linux)
 fusermount -u /mnt/nas

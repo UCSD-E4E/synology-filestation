@@ -15,7 +15,8 @@
 use std::ffi::{c_void, CStr, CString};
 use std::os::raw::c_char;
 use std::panic::AssertUnwindSafe;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::ptr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1087,6 +1088,24 @@ pub unsafe extern "C" fn syno_mount(
             None => return set_err(err, SynoStatus::NullArg, 0, "client must not be null"),
         };
 
+        // The log file and the mountpoint are chosen independently here, so
+        // this is the first moment the pair is known. Mounting anyway would
+        // wedge on the first record written from inside a callback.
+        if let Some(log) = logging::conflicts_with_mount(&mountpoint) {
+            return set_err(
+                err,
+                SynoStatus::InvalidArg,
+                0,
+                &format!(
+                    "the log file {} is inside the mountpoint {}. The log would be \
+                     written through the mount it is describing, which deadlocks it. \
+                     Choose a log path on local disk.",
+                    log.display(),
+                    mountpoint.display()
+                ),
+            );
+        }
+
         let opts = MountOptions {
             cache_ttl,
             read_cache_mb,
@@ -1178,10 +1197,56 @@ pub unsafe extern "C" fn syno_set_log_level(level: *const c_char) {
     }));
 }
 
+/// Also write every log record to `path`, so the log outlives the process.
+///
+/// The GUI's log pane goes away with the GUI, exactly as a terminal goes away
+/// with its window — including when a wedged mount forces a power cycle, which
+/// is the run worth reading afterwards. Records reach the OS as they are
+/// emitted, and warnings and errors are forced to disk, so a killed or
+/// powered-off process still leaves them behind. The file rotates at 8 MiB,
+/// keeping three older generations beside it.
+///
+/// Pass null to stop writing to a file. Returns `Ok` with the resolved path
+/// written to `out` (free it with [`syno_string_free`]) — the caller asked for
+/// a path, but parent directories are created and a relative path is made
+/// absolute, so where it actually landed is worth reporting.
+///
+/// # Safety
+/// `path` must be a valid NUL-terminated UTF-8 string, or null. `out` may be
+/// null if the caller does not want the resolved path.
+#[no_mangle]
+pub unsafe extern "C" fn syno_set_log_file(
+    path: *const c_char,
+    out: *mut *mut c_char,
+    err: *mut SynoError,
+) -> i32 {
+    guard(err, || {
+        if !out.is_null() {
+            *out = ptr::null_mut();
+        }
+        let Some(path) = opt_str(path) else {
+            logging::clear_file();
+            return SynoStatus::Ok as i32;
+        };
+        match logging::set_file(Path::new(path)) {
+            Ok(resolved) => {
+                if !out.is_null() {
+                    // A path that cannot survive the trip is not worth failing
+                    // the call over: the file is already open and collecting.
+                    if let Ok(s) = CString::new(resolved.to_string_lossy().into_owned()) {
+                        *out = s.into_raw();
+                    }
+                }
+                SynoStatus::Ok as i32
+            }
+            Err(e) => set_err(err, SynoStatus::Io, 0, &e.to_string()),
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ptr;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 

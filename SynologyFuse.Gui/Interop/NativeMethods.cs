@@ -131,6 +131,14 @@ internal static partial class NativeMethods
     [LibraryImport(Lib, StringMarshalling = StringMarshalling.Utf8)]
     internal static partial void syno_set_log_level(string level);
 
+    /// <summary>Also write every log record to <paramref name="path"/>, or stop
+    /// doing so when it is null. <paramref name="outPath"/> receives where the
+    /// file actually landed — a relative path is made absolute and parents are
+    /// created, so it is not necessarily what was asked for.</summary>
+    [LibraryImport(Lib, StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial int syno_set_log_file(
+        string? path, out IntPtr outPath, ref NativeError err);
+
     // ── Native library resolution ──────────────────────────────────────────────
 
     private static bool _resolverRegistered;

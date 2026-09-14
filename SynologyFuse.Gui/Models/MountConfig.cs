@@ -24,6 +24,12 @@ public sealed class MountConfig
     public ulong PrefetchBlocks { get; init; } = 16;
     public string LogLevel { get; init; } = "info";
 
+    /// <summary>Also write the log to this file, or null to keep it only in the
+    /// log pane. The pane goes away with the window -- including when a wedged
+    /// mount takes the machine with it, which is the run worth reading
+    /// afterwards.</summary>
+    public string? LogFile { get; init; }
+
     /// <summary>NetBIOS domain SMB authenticates in -- `KRG` for an AD account,
     /// empty for a local DSM user. Without it an AD account is checked against
     /// the appliance's own accounts, fails, and SMB is silently skipped in

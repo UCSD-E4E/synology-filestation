@@ -46,6 +46,8 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
         _readCacheMb = s.ReadCacheMb;
         _prefetchBlocks = s.PrefetchBlocks;
         _logLevel = s.LogLevel;
+        _logToFile = s.LogToFile;
+        _logFilePath = s.LogFilePath;
         _domain = s.Domain;
         _vpnProfile = s.VpnProfile;
         _vpnHost = s.VpnHost;
@@ -151,6 +153,24 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
 
     public IReadOnlyList<string> LogLevels { get; } =
         ["error", "warn", "info", "debug", "trace"];
+
+    /// <summary>Also write the log to a file, so it outlives the window.
+    ///
+    /// The log pane is gone the moment the process is — including when a wedged
+    /// mount takes the machine down with it, which is exactly the run somebody
+    /// will want to read afterwards.</summary>
+    [ObservableProperty]
+    private bool _logToFile;
+
+    /// <summary>Where that file goes. Empty means
+    /// <see cref="SettingsService.DefaultLogFilePath"/>, so ticking the box is
+    /// enough to get a log.</summary>
+    [ObservableProperty]
+    private string _logFilePath = "";
+
+    /// <summary>Shown beside the empty path box, so somebody who never types
+    /// one still knows where to look afterwards.</summary>
+    public string DefaultLogFilePath => SettingsService.DefaultLogFilePath;
 
     // ── State ─────────────────────────────────────────────────────────────────
 
@@ -404,6 +424,7 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
         ReadCacheMb = (ulong)ReadCacheMb,
         PrefetchBlocks = (ulong)PrefetchBlocks,
         LogLevel = LogLevel,
+        LogFile = SettingsService.ResolveLogFile(LogToFile, LogFilePath),
         Domain = Domain,
         VpnProfile = VpnProfile,
         VpnHost = VpnHost,
@@ -422,6 +443,8 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
         ReadCacheMb = ReadCacheMb,
         PrefetchBlocks = PrefetchBlocks,
         LogLevel = LogLevel,
+        LogToFile = LogToFile,
+        LogFilePath = LogFilePath,
         Domain = Domain,
         VpnProfile = VpnProfile,
         VpnHost = VpnHost,
