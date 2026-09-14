@@ -254,4 +254,62 @@ public class SettingsServiceTests : IDisposable
         Assert.Contains("\"Domain\": \"KRG\"", written);
         Assert.DoesNotContain("SmbDomain", written);
     }
+
+    // ── The log file ──────────────────────────────────────────────────────────
+
+    /// <summary>Writing a log file is opt-in, so a settings.json written before
+    /// the option existed must load with it off. Turning it on for everybody at
+    /// upgrade would start writing to a path nobody chose.</summary>
+    [Fact]
+    public void Load_JsonPredatingTheLogFile_DefaultsToOff()
+    {
+        File.WriteAllText(_path, """{"Host":"nas.local","LogLevel":"info"}""");
+
+        var s = SettingsService.Load(_path);
+
+        Assert.False(s.LogToFile);
+        Assert.Null(SettingsService.ResolveLogFile(s.LogToFile, s.LogFilePath));
+    }
+
+    [Fact]
+    public void ResolveLogFile_NotWanted_IsNull()
+    {
+        Assert.Null(SettingsService.ResolveLogFile(false, "/tmp/somewhere.log"));
+    }
+
+    /// <summary>Ticking the box is enough. The point of the feature is to have
+    /// a log after a lock-up, and requiring a path first is a way of finding
+    /// out afterwards that nobody set one.</summary>
+    [Fact]
+    public void ResolveLogFile_WantedWithNoPath_UsesTheDefaultBesideTheSettings()
+    {
+        Assert.Equal(
+            SettingsService.DefaultLogFilePath,
+            SettingsService.ResolveLogFile(true, ""));
+        Assert.Equal(
+            SettingsService.DefaultLogFilePath,
+            SettingsService.ResolveLogFile(true, "   "));
+        Assert.Equal(
+            SettingsService.DefaultLogFilePath,
+            SettingsService.ResolveLogFile(true, null));
+    }
+
+    [Fact]
+    public void ResolveLogFile_WantedWithAPath_UsesIt()
+    {
+        var chosen = Path.Combine(_dir, "mount.log");
+
+        Assert.Equal(chosen, SettingsService.ResolveLogFile(true, chosen));
+    }
+
+    /// <summary>The default sits beside the settings and the downloaded VPN
+    /// profile, in the same per-user directory — somewhere writable without a
+    /// prompt, and somewhere a person can be told to look.</summary>
+    [Fact]
+    public void DefaultLogFilePath_LivesWithTheOtherPerUserState()
+    {
+        Assert.Equal(
+            Path.GetDirectoryName(SettingsService.DefaultVpnProfilePath),
+            Path.GetDirectoryName(SettingsService.DefaultLogFilePath));
+    }
 }

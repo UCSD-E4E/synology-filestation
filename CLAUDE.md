@@ -162,6 +162,7 @@ The GUI path goes: MountService.cs / SynoClient.cs → P/Invoke (Interop/NativeM
 | `fs.rs`     | Linux FUSE backend. Metadata callbacks use `runtime.block_on()`; **file transfers do not** — `flush`/`release` (upload), `setattr` (truncate) and cross-directory `rename` hand the transfer to the Tokio runtime via `start_*` and reply to the kernel from there, so no transfer ever occupies an event-loop thread. Transfers are capped at `MAX_CONCURRENT_TRANSFERS` (the event loop used to be that limit by accident) and each open handle has its own buffer lock. The session also runs a multi-threaded event loop (`MountOptions::io_threads`, `--fuse-threads`) for the remaining blocking callbacks |
 | `cache.rs`  | Linux only — `InodeCache` (TTL metadata), `ReadCache` (LRU block cache, 256 KiB blocks) |
 | `prefetch.rs` | Linux only — what to speculate on and when: the container sniff that decides the open window, the sequential-detection ramp behind `read`, and `InflightGuard` |
+| `logfile.rs` | `--log-file`: a second `tracing` sink that outlives the process. Each record is one `write_all` + flush (no background writer thread, so a `SIGKILL`/OOM death loses nothing), warn and error are `fsync`ed (page cache does not survive a power cycle, and a mount that wedges the machine gets one), and the file rotates at 8 MiB × 3. A path inside the mountpoint is refused — logging through the mount you serve deadlocks it |
 | `webdav.rs` | macOS WebDAV backend; directory moves are download→upload→delete |
 | `winfs.rs`  | Windows WinFsp backend; in-memory write buffers flushed atomically on close |
 
@@ -180,7 +181,7 @@ The GUI path goes: MountService.cs / SynoClient.cs → P/Invoke (Interop/NativeM
 | File | Role |
 |------|------|
 | `src/lib.rs`     | C ABI: opaque `SynoClient`/`SynoMount` handles over an `Arc<SynologyClient>` + per-client Tokio runtime; `syno_connect` (returns `OtpRequired` so the GUI prompts), browse (`syno_list_*`/`syno_get_info`), transfers (`syno_download_to`/`syno_upload` with a progress callback), `syno_delete`/`syno_create_folder`/`syno_rename`, `syno_mount`/`syno_unmount`. Errors come back as a typed `SynoError` (status + DSM code + message); every export wraps `catch_unwind` |
-| `src/logging.rs` | Bridges `tracing` events to a registered C log callback (`syno_set_log_callback`) for the GUI log pane |
+| `src/logging.rs` | Fans `tracing` events out to a registered C log callback (`syno_set_log_callback`) for the GUI log pane **and** to an optional log file (`syno_set_log_file`, backed by the fuse crate's `logfile`). The pane dies with the GUI exactly as a terminal dies with its window, so the file is the only copy that survives the lock-up worth reading. `syno_mount` refuses a mountpoint that would contain the active log file |
 
 The `kind`/`dsm_code` error classification mirrors the PyO3 exception mapping. Download progress is fine-grained (loops the core's ranged `download`); upload progress is coarse (the core upload is single-shot). Built/clipped/tested in CI alongside the CLI and core.
 

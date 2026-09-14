@@ -207,6 +207,23 @@ public sealed class SynoClient : IDisposable
         syno_set_log_level(level);
     }
 
+    /// <summary>Also write every log record to <paramref name="path"/>, or stop
+    /// writing to a file when it is null. Returns where the log actually
+    /// landed, which is worth showing: a relative path is made absolute and
+    /// missing parent directories are created.
+    ///
+    /// The log pane this class already feeds dies with the window. A file does
+    /// not, which is the only way to read what a mount was doing when it took
+    /// the machine down with it.</summary>
+    public static string? SetLogFile(string? path)
+    {
+        NativeMethods.EnsureResolver();
+        var err = default(NativeError);
+        var rc = syno_set_log_file(path, out var outPath, ref err);
+        Check(rc, ref err);
+        return path is null ? null : TakeString(outPath);
+    }
+
     // ── Dispose ────────────────────────────────────────────────────────────────
 
     public void Dispose()

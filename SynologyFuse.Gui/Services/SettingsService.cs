@@ -32,6 +32,19 @@ public sealed class PersistedSettings
     public decimal PrefetchBlocks { get; set; } = 16;
     public string LogLevel { get; set; } = "info";
 
+    /// <summary>Also write the log to a file, so it outlives the process.
+    ///
+    /// The log pane goes away with the window — including when a wedged mount
+    /// takes the machine with it, which is the run worth reading afterwards.
+    /// Off by default, and absent from a settings file written before the
+    /// option existed, which loads as off rather than starting to write to a
+    /// path nobody chose.</summary>
+    public bool LogToFile { get; set; }
+
+    /// <summary>Where that file goes. Empty means
+    /// <see cref="SettingsService.DefaultLogFilePath"/>.</summary>
+    public string LogFilePath { get; set; } = "";
+
     /// <summary>NetBIOS domain the account lives in (`KRG` for an AD account).
     /// Empty for a local DSM user. Used by both SMB and the VPN.</summary>
     public string Domain { get; set; } = "";
@@ -79,6 +92,31 @@ public static class SettingsService
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
         "SynologyFuse",
         "vpn-profile.ovpn");
+
+    /// <summary>Where the log goes when the user asks for one on disk.
+    ///
+    /// Beside the settings and the downloaded VPN profile: writable without a
+    /// prompt on every platform, and one directory a person can be pointed at
+    /// when they are asked for the log after a lock-up.</summary>
+    public static string DefaultLogFilePath { get; } = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+        "SynologyFuse",
+        "mount.log");
+
+    /// <summary>The log file this configuration wants, or null for none.
+    ///
+    /// Ticking the box is enough: an empty path means
+    /// <see cref="DefaultLogFilePath"/> rather than nothing, because the point
+    /// of the option is to have a log after a lock-up and "on, but nowhere" is
+    /// a way of finding out too late that no path was ever set.</summary>
+    public static string? ResolveLogFile(bool logToFile, string? path)
+    {
+        if (!logToFile)
+        {
+            return null;
+        }
+        return string.IsNullOrWhiteSpace(path) ? DefaultLogFilePath : path;
+    }
 
     /// <summary>Where to keep the profile for this connection, or null when no
     /// tunnel is wanted.

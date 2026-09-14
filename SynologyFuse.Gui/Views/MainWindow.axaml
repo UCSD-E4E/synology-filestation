@@ -384,6 +384,22 @@
                          HorizontalAlignment="Stretch" />
             </Grid>
 
+            <!-- The log pane below dies with this window. A mount bad enough to
+                 need a power cycle is exactly the one worth reading afterwards,
+                 so the log can also be written somewhere that survives it. -->
+            <CheckBox Content="Also write the log to a file"
+                      IsChecked="{Binding LogToFile}"
+                      ToolTip.Tip="Keeps the log after the app closes — or after a crash or reboot. Warnings and errors are forced to disk as they happen. Rotates at 8 MiB, keeping three older files." />
+
+            <Grid ColumnDefinitions="Auto,*" IsVisible="{Binding LogToFile}">
+              <TextBlock Grid.Column="0" Text="Log file" VerticalAlignment="Center"
+                         Margin="0,0,12,0" MinWidth="130" />
+              <TextBox Grid.Column="1"
+                       Text="{Binding LogFilePath}"
+                       PlaceholderText="{Binding DefaultLogFilePath}"
+                       HorizontalAlignment="Stretch" />
+            </Grid>
+
           </StackPanel>
         </Expander>
 

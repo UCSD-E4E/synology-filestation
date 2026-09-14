@@ -2549,6 +2549,7 @@ dependencies = [
  "synology-filestation-core",
  "synology-filestation-fuse",
  "synology-filestation-smb",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

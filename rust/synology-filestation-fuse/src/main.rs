@@ -13,6 +13,7 @@ use clap::Parser;
 use tracing::{info, warn};
 
 use synology_filestation_core::client::SynologyClient;
+use synology_filestation_fuse::logfile::{self, LogFile};
 use synology_filestation_fuse::{is_otp_required, reopen_through, spawn_mount, MountOptions};
 
 #[derive(Parser, Debug)]
@@ -108,6 +109,16 @@ struct Args {
     /// Log level (error, warn, info, debug, trace)
     #[arg(long, default_value = "info")]
     log_level: String,
+
+    /// Also write the log to this file, so it survives the terminal.
+    ///
+    /// Stderr goes away when the terminal does — including when a wedged mount
+    /// forces a power cycle, which is exactly the run worth reading afterwards.
+    /// Records reach the OS as they are emitted and warnings and errors are
+    /// forced to disk, so a killed or powered-off process still leaves them.
+    /// The file rotates at 8 MiB, keeping three older generations beside it.
+    #[arg(long, value_name = "PATH")]
+    log_file: Option<PathBuf>,
 
     /// Never try SMB. Disabling means *not probing*: on a network that
     /// black-holes port 445 this also saves the connect timeout. It implies
@@ -263,13 +274,66 @@ fn resolve_password(args: &Args) -> anyhow::Result<String> {
         None => Ok(rpassword::prompt_password("Password: ")?),
     }
 }
+/// Open the `--log-file` the arguments ask for, if any.
+///
+/// Split out of [`init_logging`] because this is the part with a decision in
+/// it: only this call site knows the mountpoint, and so only this call site can
+/// refuse a log path that would be written through the mount it describes.
+fn log_file(args: &Args) -> anyhow::Result<Option<LogFile>> {
+    let Some(requested) = args.log_file.as_deref() else {
+        return Ok(None);
+    };
+    let path = logfile::resolve(requested, Some(&args.mountpoint))?;
+    Ok(Some(LogFile::open(path)?))
+}
+
+/// Install the subscriber: stderr as always, plus the file when asked for.
+///
+/// Returns where the file went, so the mount can say so on the way up — a log
+/// nobody can find is not much better than one that was never written.
+fn init_logging(args: &Args) -> anyhow::Result<Option<PathBuf>> {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    let console = tracing_subscriber::fmt::layer();
+    let registry = tracing_subscriber::registry()
+        .with(tracing_subscriber::EnvFilter::new(&args.log_level))
+        .with(console);
+
+    match log_file(args)? {
+        None => {
+            registry.init();
+            Ok(None)
+        }
+        Some(file) => {
+            let path = file.path().to_path_buf();
+            // No ANSI: this is read later, by `less` or by whoever is helping.
+            let to_file = tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(file);
+            registry.with(to_file).init();
+            Ok(Some(path))
+        }
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    tracing_subscriber::fmt()
-        .with_env_filter(&args.log_level)
-        .init();
+    let log_path = init_logging(&args)?;
+    if let Some(path) = &log_path {
+        info!("Logging to {}", path.display());
+    }
 
+    // Log the failure before returning it. Handing it back to the runtime
+    // prints it to stderr and nowhere else — so the log file, the one sink
+    // written to be read after the fact, stopped just short of saying why the
+    // run ended. The error is still returned, so the exit status and the
+    // message on the terminal are what they always were.
+    run(args).inspect_err(|e| tracing::error!("{e:#}"))
+}
+
+fn run(args: Args) -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -563,5 +627,63 @@ mod tests {
         );
         // Nonsense falls back rather than failing the mount over a typo.
         assert_eq!(probe_timeout(Some("soon".into())), Duration::from_secs(2));
+    }
+}
+
+#[cfg(test)]
+mod log_file_tests {
+    use super::*;
+
+    fn args_with(extra: &[&str]) -> Args {
+        let mut argv = vec!["synology-fuse", "--host", "nas.example", "-u", "someone"];
+        argv.extend_from_slice(extra);
+        Args::parse_from(argv)
+    }
+
+    /// The check belongs here, not only in `logfile`: it is this call site that
+    /// knows the mountpoint. A log written through the mount it describes
+    /// deadlocks the mount, and finding that out at the first `warn!` — inside
+    /// a FUSE callback, with the machine already in trouble — is too late.
+    #[test]
+    fn a_log_file_inside_the_mountpoint_is_refused_before_the_mount_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        let mountpoint = dir.path().join("mnt");
+        std::fs::create_dir(&mountpoint).unwrap();
+        let inside = mountpoint.join("mount.log");
+
+        let args = args_with(&[
+            "--log-file",
+            inside.to_str().unwrap(),
+            mountpoint.to_str().unwrap(),
+        ]);
+
+        let err = log_file(&args).expect_err("a log inside the mount must not be opened");
+        assert!(
+            err.to_string().contains("deadlock"),
+            "the message has to say why, got: {err}"
+        );
+    }
+
+    /// `--log-file` is opt-in, so the common invocation must be untouched: no
+    /// file created, nothing to clean up, stderr exactly as before.
+    #[test]
+    fn without_the_flag_no_file_is_opened() {
+        let args = args_with(&["/mnt/nas"]);
+
+        assert!(log_file(&args).unwrap().is_none());
+    }
+
+    /// The file exists the moment the mount starts, not at the first record —
+    /// a run that produced no output should still leave evidence it ran.
+    #[test]
+    fn the_requested_file_is_opened_up_front() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state/mount.log");
+
+        let args = args_with(&["--log-file", path.to_str().unwrap(), "/mnt/nas"]);
+
+        let opened = log_file(&args).unwrap().expect("a file was asked for");
+        assert_eq!(opened.path(), path);
+        assert!(path.is_file(), "{} was not created", path.display());
     }
 }

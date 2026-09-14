@@ -31,6 +31,28 @@ public sealed class MountService : IDisposable
 
     public bool IsMounted => _client is { IsMounted: true };
 
+    /// <summary>Point the native logger at this configuration's file, or clear
+    /// it, and say in the log pane where the file went.
+    ///
+    /// A log file that could not be opened must not stop the connection: the
+    /// user asked to mount a NAS, not to write a file. It is reported in the
+    /// pane and the mount goes ahead without it.</summary>
+    private void ApplyLogFile(MountConfig config)
+    {
+        try
+        {
+            var landed = SynoClient.SetLogFile(config.LogFile);
+            if (landed is not null)
+            {
+                OutputReceived?.Invoke($"Writing the log to {landed}");
+            }
+        }
+        catch (SynoException ex)
+        {
+            OutputReceived?.Invoke($"Could not write the log file: {ex.Message}");
+        }
+    }
+
     /// <summary>Which leg the last connection reached the NAS by.
     ///
     /// <see cref="SynoTransport.Unknown"/> until something has connected. Worth
@@ -65,6 +87,7 @@ public sealed class MountService : IDisposable
 
         var mountpoint = ExpandPath(config.Mountpoint);
         SynoClient.SetLogLevel(config.LogLevel);
+        ApplyLogFile(config);
 
         var client = await Task.Run(() =>
         {
@@ -114,6 +137,7 @@ public sealed class MountService : IDisposable
     public Task TestConnectionAsync(MountConfig config, string? otp = null)
     {
         SynoClient.SetLogLevel(config.LogLevel);
+        ApplyLogFile(config);
         return Task.Run(() =>
         {
             using var client = SynoClient.Connect(
