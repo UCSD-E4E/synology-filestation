@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using SynologyFuse.Gui.Interop;
+using SynologyFuse.Gui.Models;
 using SynologyFuse.Gui.Services;
 using Xunit;
 
@@ -90,6 +91,42 @@ public class MountServiceTests
     public void ExpandPath_NoTilde_Unchanged()
     {
         Assert.Equal("/mnt/nas", MountService.ExpandPath("/mnt/nas"));
+    }
+
+    // ── LogFileFor ────────────────────────────────────────────────────────────
+
+    /// <summary>The log path is typed into the same form as the mountpoint,
+    /// by somebody who has no shell to expand it for them. Left literal, a
+    /// "~/logs/mount.log" becomes a directory actually named "~" under
+    /// whatever the GUI's working directory happens to be.</summary>
+    [Fact]
+    public void LogFileFor_TildePath_IsExpandedLikeEveryOtherPath()
+    {
+        var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+
+        var resolved = MountService.LogFileFor(
+            new MountConfig { LogFile = "~/logs/mount.log" });
+
+        Assert.Equal(home + "/logs/mount.log", resolved);
+    }
+
+    /// <summary>And it has to be expanded by the same rule the mountpoint is,
+    /// or the deadlock guard compares an expanded mountpoint against a literal
+    /// log path and waves through exactly the case it exists to catch.</summary>
+    [Fact]
+    public void LogFileFor_TildePathInsideTheMountpoint_ResolvesUnderIt()
+    {
+        var config = new MountConfig { Mountpoint = "~/mnt", LogFile = "~/mnt/mount.log" };
+
+        var log = MountService.LogFileFor(config)!;
+
+        Assert.StartsWith(MountService.ExpandPath(config.Mountpoint), log);
+    }
+
+    [Fact]
+    public void LogFileFor_NoLogFile_IsNull()
+    {
+        Assert.Null(MountService.LogFileFor(new MountConfig()));
     }
 
     // ── NativeMethods.FindRepoRoot (native-library resolver) ────────────────────

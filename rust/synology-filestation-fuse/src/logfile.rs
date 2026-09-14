@@ -182,6 +182,8 @@ impl LogFile {
                 file,
                 written,
                 max_bytes,
+                rotate_at: max_bytes,
+                rotation_attempts: 0,
                 keep,
                 syncs: 0,
             })),
@@ -214,6 +216,11 @@ impl LogFile {
     pub fn sync_count(&self) -> u64 {
         lock(&self.inner).syncs
     }
+
+    /// How many times a rotation has been attempted, successful or not.
+    pub fn rotation_attempts(&self) -> u64 {
+        lock(&self.inner).rotation_attempts
+    }
 }
 
 /// The shared, locked state behind every writer handed to the `fmt` layer.
@@ -222,6 +229,12 @@ struct Rotating {
     file: File,
     written: u64,
     max_bytes: u64,
+    /// Size at which the next rotation is attempted. Normally
+    /// `max_bytes`; pushed a whole budget further out when a rotation
+    /// fails, so a persistent failure costs one attempt per budget
+    /// rather than one per record.
+    rotate_at: u64,
+    rotation_attempts: u64,
     keep: usize,
     syncs: u64,
 }
@@ -267,6 +280,23 @@ fn open_append(path: &Path) -> Result<File, LogFileError> {
         })
 }
 
+/// Say once, on stderr, that the log file is in trouble.
+///
+/// Never through `tracing`: a record emitted from inside the writer is a
+/// straight recursion back into it. Once per process, because whatever is
+/// wrong with the file will be wrong for every record that follows, and a
+/// complaint per line would bury the diagnostic it is complaining about.
+fn complain(path: &Path, error: &io::Error) {
+    static COMPLAINED: std::sync::Once = std::sync::Once::new();
+    COMPLAINED.call_once(|| {
+        let _ = writeln!(
+            io::stderr(),
+            "log file {} is not being written as asked: {error}",
+            path.display()
+        );
+    });
+}
+
 /// `mount.log` rotated `n` generations back: `mount.log.1`, `mount.log.2`, …
 fn generation(path: &Path, n: usize) -> PathBuf {
     let mut name = path.as_os_str().to_os_string();
@@ -280,10 +310,36 @@ impl Rotating {
     fn record(&mut self, buf: &[u8], sync: bool) -> io::Result<()> {
         // A record is never split across a rotation — half a line explains
         // nothing — so an empty file takes an over-sized record as it is.
-        if self.written > 0 && self.written + buf.len() as u64 > self.max_bytes {
-            self.rotate()?;
+        if self.written > 0 && self.written + buf.len() as u64 > self.rotate_at {
+            self.rotation_attempts += 1;
+            match self.rotate() {
+                Ok(()) => self.rotate_at = self.max_bytes,
+                Err(e) => {
+                    // Rotation is housekeeping; the record is the point. A
+                    // stale directory on the name we rename onto, a parent
+                    // gone read-only — none of that is a reason to stop
+                    // writing. An over-sized log beats a silent one, and this
+                    // used to be silent twice over: the record was dropped,
+                    // and `fmt::Layer` does not report writer errors.
+                    complain(&self.path, &e);
+                    // Push the next attempt a whole budget out. A rotation
+                    // that failed once will keep failing, and retrying it per
+                    // record costs a rename syscall per line of a `trace` log.
+                    self.rotate_at = self.written.saturating_add(self.max_bytes);
+                }
+            }
         }
 
+        let appended = self.append(buf, sync);
+        if let Err(e) = &appended {
+            complain(&self.path, e);
+        }
+        appended
+    }
+
+    /// The write itself, split out so [`record`](Self::record) can report a
+    /// failure before handing it back to a caller that will discard it.
+    fn append(&mut self, buf: &[u8], sync: bool) -> io::Result<()> {
         self.file.write_all(buf)?;
         self.written += buf.len() as u64;
         // Reach the OS now. A process killed without unwinding — OOM, SIGKILL,
@@ -549,6 +605,68 @@ mod tests {
         assert!(!rotated(&path, 1).exists(), "and none is kept");
     }
 
+    /// Rotation is housekeeping; the record is the point. A rotation that
+    /// cannot happen — a stale directory sitting on the name the active file
+    /// has to be renamed to, a read-only parent — used to leave `written`
+    /// permanently over the cap, so every later record retried the same failing
+    /// rename and was dropped. `fmt::Layer` does not report writer errors by
+    /// default, so the file simply ended at the cap and no stream said why.
+    #[test]
+    fn a_rotation_that_cannot_happen_must_not_silence_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mount.log");
+
+        // Renaming the active file onto a non-empty directory fails, and
+        // `keep = 1` means that rename is the whole rotation.
+        let blocked = rotated(&path, 1);
+        std::fs::create_dir(&blocked).unwrap();
+        std::fs::write(blocked.join("occupied"), b"x").unwrap();
+
+        let log = LogFile::with_rotation(path.clone(), 16, 1).unwrap();
+        log.make_writer().write_all(b"before the cap\n").unwrap();
+        for _ in 0..5 {
+            log.make_writer().write_all(b"after the cap\n").unwrap();
+        }
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("before the cap"), "held {written:?}");
+        assert_eq!(
+            written.matches("after the cap").count(),
+            5,
+            "every record after the failed rotation still has to land, held {written:?}"
+        );
+    }
+
+    /// And the failure is not retried per record: a rotation that fails once
+    /// will keep failing, and paying a rename syscall for every line of a
+    /// `trace` log is a cost the diagnostic cannot afford.
+    #[test]
+    fn a_failed_rotation_is_not_retried_for_every_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mount.log");
+        let blocked = rotated(&path, 1);
+        std::fs::create_dir(&blocked).unwrap();
+        std::fs::write(blocked.join("occupied"), b"x").unwrap();
+
+        let log = LogFile::with_rotation(path.clone(), 100, 1).unwrap();
+        for _ in 0..60 {
+            log.make_writer().write_all(b"ten bytes\n").unwrap();
+        }
+
+        // 600 bytes against a 100-byte cap. Retried per record that is a
+        // rename syscall for ~50 of the 60; deferred by a budget it is one per
+        // 100 bytes, so about five.
+        assert!(
+            log.rotation_attempts() <= 8,
+            "a failing rotation was retried {} times over 60 records",
+            log.rotation_attempts()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap().lines().count(),
+            60,
+            "and every record still has to be in the file"
+        );
+    }
     fn rotated(path: &Path, generation: usize) -> PathBuf {
         PathBuf::from(format!("{}.{generation}", path.display()))
     }

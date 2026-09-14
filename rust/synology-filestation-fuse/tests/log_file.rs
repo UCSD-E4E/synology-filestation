@@ -41,4 +41,20 @@ fn the_error_that_ended_the_run_is_in_the_log_file() {
         written.contains("Connecting to Synology NAS"),
         "and so does what led up to it, which held:\n{written}"
     );
+
+    // The terminal is what it always was: the error once, on stderr, printed
+    // by `Termination`. Sending it through `tracing` as well would put a
+    // second copy on stdout, where the ordinary records go — the same failure
+    // twice, in two places, for a run that failed once.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stdout.contains("ERROR"),
+        "the fatal record must not reach the console, which held:\n{stdout}"
+    );
+    assert_eq!(
+        stderr.matches("Error:").count(),
+        1,
+        "and stderr carries it exactly once, which held:\n{stderr}"
+    );
 }

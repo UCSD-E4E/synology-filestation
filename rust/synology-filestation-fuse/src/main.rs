@@ -274,6 +274,14 @@ fn resolve_password(args: &Args) -> anyhow::Result<String> {
         None => Ok(rpassword::prompt_password("Password: ")?),
     }
 }
+/// Target for the single record naming the error that ended the run.
+///
+/// It exists to be filtered: the record belongs in the log file, which is read
+/// after the fact and otherwise stops just short of saying why the run ended,
+/// but not on the console, where the runtime is already about to print the same
+/// error to stderr.
+const FATAL_TARGET: &str = "synology_filestation_fuse::fatal";
+
 /// Open the `--log-file` the arguments ask for, if any.
 ///
 /// Split out of [`init_logging`] because this is the part with a decision in
@@ -292,10 +300,16 @@ fn log_file(args: &Args) -> anyhow::Result<Option<LogFile>> {
 /// Returns where the file went, so the mount can say so on the way up — a log
 /// nobody can find is not much better than one that was never written.
 fn init_logging(args: &Args) -> anyhow::Result<Option<PathBuf>> {
-    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::layer::{Layer, SubscriberExt};
     use tracing_subscriber::util::SubscriberInitExt;
 
-    let console = tracing_subscriber::fmt::layer();
+    // The console sees everything except the record naming the error that
+    // ended the run: `main` already returns that error, and the runtime prints
+    // it to stderr exactly as it always has. Letting it through here too would
+    // print the one failure twice, on two different streams.
+    let console = tracing_subscriber::fmt::layer().with_filter(
+        tracing_subscriber::filter::filter_fn(|meta| meta.target() != FATAL_TARGET),
+    );
     let registry = tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::new(&args.log_level))
         .with(console);
@@ -325,12 +339,13 @@ fn main() -> anyhow::Result<()> {
         info!("Logging to {}", path.display());
     }
 
-    // Log the failure before returning it. Handing it back to the runtime
+    // Record the failure before returning it. Handing it back to the runtime
     // prints it to stderr and nowhere else — so the log file, the one sink
     // written to be read after the fact, stopped just short of saying why the
-    // run ended. The error is still returned, so the exit status and the
-    // message on the terminal are what they always were.
-    run(args).inspect_err(|e| tracing::error!("{e:#}"))
+    // run ended. It goes out under FATAL_TARGET, which the console layer drops,
+    // so the error is still returned and the terminal shows it once, on stderr,
+    // exactly as before.
+    run(args).inspect_err(|e| tracing::error!(target: FATAL_TARGET, "{e:#}"))
 }
 
 fn run(args: Args) -> anyhow::Result<()> {
