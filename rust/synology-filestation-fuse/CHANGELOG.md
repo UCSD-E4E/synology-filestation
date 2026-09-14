@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.7.0](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-fuse-v0.6.0...synology-filestation-fuse-v0.7.0) (2026-09-14)
+
+
+### Features
+
+* **fuse:** keep the log after the machine goes down ([64cfabe](https://github.com/UCSD-E4E/synology-filestation/commit/64cfabe9f850d55f3d9e9e0fbaefaaa5442ab171))
+
+
+### Bug Fixes
+
+* **fuse:** three ways the new log file could still let you down ([a2cd804](https://github.com/UCSD-E4E/synology-filestation/commit/a2cd8043f6105dc87a42e35501e39a782447bfd4))
+
 ## [0.6.0](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-fuse-v0.5.5...synology-filestation-fuse-v0.6.0) (2026-09-12)
 
 
