@@ -5,7 +5,6 @@
 
 ### Features
 
-* **fuse:** keep the log after the machine goes down ([1412770](https://github.com/UCSD-E4E/synology-filestation/commit/141277065150eef4bcc6a515a8f4fcb882a5c533))
 * **fuse:** keep the log after the machine goes down ([64cfabe](https://github.com/UCSD-E4E/synology-filestation/commit/64cfabe9f850d55f3d9e9e0fbaefaaa5442ab171))
 
 
