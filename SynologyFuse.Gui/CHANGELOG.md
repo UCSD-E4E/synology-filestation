@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.7.0](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-gui-v0.6.0...synology-filestation-gui-v0.7.0) (2026-09-14)
+
+
+### Features
+
+* **fuse:** keep the log after the machine goes down ([1412770](https://github.com/UCSD-E4E/synology-filestation/commit/141277065150eef4bcc6a515a8f4fcb882a5c533))
+* **fuse:** keep the log after the machine goes down ([64cfabe](https://github.com/UCSD-E4E/synology-filestation/commit/64cfabe9f850d55f3d9e9e0fbaefaaa5442ab171))
+
+
+### Bug Fixes
+
+* drop the retired apple_sdk framework path from the flake ([27b58a7](https://github.com/UCSD-E4E/synology-filestation/commit/27b58a7daaffde5e2f7eb4948b7cba718f65a88f))
+* drop the retired apple_sdk framework path from the flake ([151a98b](https://github.com/UCSD-E4E/synology-filestation/commit/151a98b2a9b221120426c1b1475a56971582dc27))
+* **fuse:** three ways the new log file could still let you down ([a2cd804](https://github.com/UCSD-E4E/synology-filestation/commit/a2cd8043f6105dc87a42e35501e39a782447bfd4))
+
 ## [0.6.0](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-gui-v0.5.5...synology-filestation-gui-v0.6.0) (2026-09-12)
 
 
