@@ -116,23 +116,23 @@
   },
   {
     "pname": "Microsoft.CodeCoverage",
-    "version": "18.10.0",
-    "hash": "sha256-CruHCbs9PzO3m2/lyhjZbjDfMVNcO99bdMohchvvhI4="
+    "version": "18.10.1",
+    "hash": "sha256-j6kLSrn2sJA6sUf+tcDAfwI9maDTjU5+xZl7qd+5pEA="
   },
   {
     "pname": "Microsoft.NET.Test.Sdk",
-    "version": "18.10.0",
-    "hash": "sha256-BAdT4MCcuW/lgVokaiDKk+V2b6w+/l3bMfKEsWLhXvU="
+    "version": "18.10.1",
+    "hash": "sha256-12rO5bWnSE7xdrZg4zgRxu8/M4vUdR46ov0xiz2y/P4="
   },
   {
     "pname": "Microsoft.TestPlatform.ObjectModel",
-    "version": "18.10.0",
-    "hash": "sha256-ftoPwkiJ+AUG0G8t3VtUwhNLEUP7+mQAoykw0QFPEJw="
+    "version": "18.10.1",
+    "hash": "sha256-rtEsNPmOjjL1VCi6CRCLROMsbIia6sv6rGYciKUkbW8="
   },
   {
     "pname": "Microsoft.TestPlatform.TestHost",
-    "version": "18.10.0",
-    "hash": "sha256-RBdFb7uMIgpK3Omt4zf8nBSBMmafSNjtoK2BRDwvLkY="
+    "version": "18.10.1",
+    "hash": "sha256-1lLjkHDqSCMGjopGg0KwaNnztQrh/aP7V7E+ydtkgiw="
   },
   {
     "pname": "NWayland",
