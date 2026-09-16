@@ -8,7 +8,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.10.0" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.10.1" />
     <!-- Headless Avalonia: lays the windows out with no display, for the
          layout tests. The xUnit adapter package is v3-only, so only the
          session type is used; see TestAppBuilder. -->
