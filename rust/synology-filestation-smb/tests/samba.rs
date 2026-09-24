@@ -207,7 +207,9 @@ async fn a_better_session_replaces_a_working_one() {
     let _servers = TestServers::start().await.expect("docker compose up");
     let smb = adopted().await;
     let path = "/private/moved.txt";
-    smb.write_atomic(path, b"written on the first").await.unwrap();
+    smb.write_atomic(path, b"written on the first")
+        .await
+        .unwrap();
     // A read handle cached on the first session, which has to be let go of.
     assert_eq!(smb.read(path, 0, 5).await.unwrap().as_ref(), b"writt");
 

@@ -378,6 +378,43 @@ impl SmbConfig {
         cfg
     }
 
+    /// The config for an account, as [`auto_connect_as`] would build it:
+    /// [`from_login`](Self::from_login), then the domain the caller chose,
+    /// then the deploy overrides in the environment (see [`auto_connect`]).
+    ///
+    /// For a caller that builds its transport itself — one attached before
+    /// SMB is reachable, say — and wants it authenticated exactly as the
+    /// automatic path would authenticate it.
+    ///
+    /// An explicit domain wins over `SYNOLOGY_FS_SMB_DOMAIN`, which wins over
+    /// the one parsed from the username. `Some("")` is an explicit answer, not
+    /// an absent one: an empty domain is how a local DSM user is named, so it
+    /// has to be able to override the environment back to none.
+    pub fn for_account(host: &str, username: &str, password: &str, domain: Option<&str>) -> Self {
+        let mut cfg = SmbConfig::from_login(host, username, password);
+        match domain {
+            Some(domain) => cfg.domain = domain.to_string(),
+            None => {
+                if let Ok(domain) = std::env::var("SYNOLOGY_FS_SMB_DOMAIN") {
+                    cfg.domain = domain;
+                }
+            }
+        }
+        if let Some(port) = std::env::var("SYNOLOGY_FS_SMB_PORT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+        {
+            cfg.port = port;
+        }
+        cfg.timeout = Duration::from_millis(
+            std::env::var("SYNOLOGY_FS_SMB_TIMEOUT_MS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(2000),
+        );
+        cfg
+    }
+
     /// The address this config names, port included.
     ///
     /// Public because a caller writing a redial closure for
@@ -426,30 +463,7 @@ pub async fn auto_connect_as(
     if std::env::var_os("SYNOLOGY_FS_SMB_DISABLE").is_some() {
         return None;
     }
-    let mut cfg = SmbConfig::from_login(host, username, password);
-    // `Some("")` is an explicit answer, not an absent one: an empty domain is
-    // how a local DSM user is named, so it has to be able to override an
-    // environment variable back to none.
-    match domain {
-        Some(domain) => cfg.domain = domain.to_string(),
-        None => {
-            if let Ok(domain) = std::env::var("SYNOLOGY_FS_SMB_DOMAIN") {
-                cfg.domain = domain;
-            }
-        }
-    }
-    if let Some(port) = std::env::var("SYNOLOGY_FS_SMB_PORT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-    {
-        cfg.port = port;
-    }
-    cfg.timeout = Duration::from_millis(
-        std::env::var("SYNOLOGY_FS_SMB_TIMEOUT_MS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(2000),
-    );
+    let cfg = SmbConfig::for_account(host, username, password, domain);
 
     match SmbTransport::connect(&cfg).await {
         Ok(transport) => {
@@ -1506,7 +1520,9 @@ mod tests {
         // rejected password into `Io` there hid the one failure that must not
         // be retried behind the kind that always is.
         assert!(is_refusal(&redial_failed(SynoFsError::PermissionDenied)));
-        assert!(!is_refusal(&redial_failed(SynoFsError::Io("no route".into()))));
+        assert!(!is_refusal(&redial_failed(SynoFsError::Io(
+            "no route".into()
+        ))));
     }
 
     // ── A transport with no session yet ───────────────────────────────────────
@@ -1534,14 +1550,18 @@ mod tests {
         let outcomes: Vec<(&str, Result<(), SynoFsError>)> = vec![
             (
                 "read",
-                ReadTransport::read(&smb, "/share/f", 0, 10).await.map(|_| ()),
+                ReadTransport::read(&smb, "/share/f", 0, 10)
+                    .await
+                    .map(|_| ()),
             ),
             ("read whole", smb.read_full("/share/f").await.map(|_| ())),
             ("read to path", smb.read_to_path("/share/f", &local).await),
             ("write", smb.write_atomic("/share/f", b"x").await),
             (
                 "list",
-                MetadataTransport::list_dir(&smb, "/share").await.map(|_| ()),
+                MetadataTransport::list_dir(&smb, "/share")
+                    .await
+                    .map(|_| ()),
             ),
             (
                 "shares",
@@ -1549,7 +1569,9 @@ mod tests {
             ),
             (
                 "info",
-                MetadataTransport::get_info(&smb, "/share/f").await.map(|_| ()),
+                MetadataTransport::get_info(&smb, "/share/f")
+                    .await
+                    .map(|_| ()),
             ),
             (
                 "open for writing",

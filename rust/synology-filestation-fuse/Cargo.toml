@@ -53,3 +53,5 @@ wiremock = "0.6"
 tempfile = "3"
 # Test-only: the fake write sink implements a core trait that is async.
 async-trait = "0.1"
+# Paused time, so the leg watch's interval is tested without waiting it out.
+tokio = { version = "1", features = ["full", "test-util"] }

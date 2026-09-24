@@ -21,15 +21,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use synology_filestation_connect::{
-    profile::ProfileSource, Chain, Endpoints, NoTunnel, OpenVpnTunnel, SmbRoute, TcpProber,
-    Transport, TransportPolicy, Tunnel, DEFAULT_RECHECK,
+    profile::ProfileSource, Chain, Endpoints, NoTunnel, OpenVpnTunnel, TcpProber, Transport,
+    TransportPolicy, Tunnel, DEFAULT_RECHECK,
 };
 use synology_filestation_core::client::SynologyClient;
 use synology_filestation_core::error::SynoFsError;
 use synology_filestation_core::types::SynoFileInfo;
 use synology_filestation_core::ThrottleConfig;
-use synology_filestation_fuse::{is_otp_required, reopen_through, spawn_mount, MountOptions};
-use synology_filestation_smb::{SmbConfig, SmbTransport};
+use synology_filestation_fuse::legs::{Legs, DEFAULT_WATCH_INTERVAL};
+use synology_filestation_fuse::{is_otp_required, spawn_mount, MountOptions};
+use synology_filestation_smb::SmbConfig;
 use tokio::runtime::Runtime;
 use tracing::{info, warn};
 
@@ -253,8 +254,26 @@ unsafe fn emit_json(out: *mut *mut c_char, value: &serde_json::Value, err: *mut 
 pub struct SynoClient {
     inner: Arc<SynologyClient>,
     runtime: Arc<Runtime>,
-    /// Which leg this connection ended up on, for [`syno_transport`].
-    transport: SynoTransport,
+    /// The SMB session and the chain that moves it between legs, for
+    /// [`syno_transport`]. `None` only when SMB is not allowed at all.
+    legs: Option<Arc<Legs>>,
+    /// Looks for a better leg while the handle lives; aborted when it goes.
+    watching: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for SynoClient {
+    fn drop(&mut self) {
+        // Before the runtime goes, so a look in progress is not what the
+        // runtime's shutdown waits on.
+        if let Some(watching) = self.watching.take() {
+            watching.abort();
+        }
+    }
+}
+
+/// The leg `legs` is on now, as the C ABI names it.
+fn transport_of(legs: Option<&Legs>) -> SynoTransport {
+    legs.map_or(SynoTransport::Https, |legs| legs.current().into())
 }
 
 /// Which leg a connection is using, as the GUI's badge shows it.
@@ -285,15 +304,20 @@ impl From<Transport> for SynoTransport {
 
 /// Which leg `client` is using: 0 HTTP, 1 SMB through a tunnel, 2 SMB direct.
 ///
-/// `-1` for a null handle. Settled at connect time and does not change for the
-/// life of the handle, so a consumer can read it once and show it.
+/// `-1` for a null handle.
+///
+/// **Live**, and it changes: a connection that started on HTTP moves to SMB
+/// when SMB becomes reachable, one through the tunnel moves to a direct
+/// connection when that answers, and one whose SMB session died reports HTTP
+/// until it is back. A consumer showing it should read it again rather than
+/// keep the first answer. Cheap — it never touches the network.
 ///
 /// # Safety
 /// `client` must be a handle from `syno_connect`, or null.
 #[no_mangle]
 pub unsafe extern "C" fn syno_transport(client: *const SynoClient) -> i32 {
     match client.as_ref() {
-        Some(client) => client.transport as i32,
+        Some(client) => transport_of(client.legs.as_deref()) as i32,
         None => -1,
     }
 }
@@ -318,12 +342,19 @@ struct Reachable<'a> {
     vpn_profile_remote: Option<&'a str>,
 }
 
-/// Put SMB in front of the HTTP client if SMB can be reached.
+/// Put SMB in front of the HTTP client, on the best leg that answers now.
 ///
 /// The same three legs the CLI has, in the same order, deciding the same way:
 /// this consumer had its own shortened version that only ever tried SMB at the
 /// public host, so a NAS reachable only through a tunnel was invisible to it.
-async fn reach(client: SynologyClient, settings: Reachable<'_>) -> (SynologyClient, SynoTransport) {
+///
+/// SMB is attached even when no leg answers, with no session, so the
+/// connection can move to it later; the legs that come back are what watches
+/// for that.
+async fn reach(
+    client: SynologyClient,
+    settings: Reachable<'_>,
+) -> (SynologyClient, Option<Arc<Legs>>) {
     // Fetched before anything asks for a tunnel, over the session just
     // authenticated — which is what lets somebody outside the NAS's network
     // get the file that gets them inside it.
@@ -367,78 +398,39 @@ async fn reach(client: SynologyClient, settings: Reachable<'_>) -> (SynologyClie
         )),
         None => Box::new(NoTunnel),
     };
-    // Shared rather than owned: a tunnelled transport keeps a handle to it so
-    // a dead stream can be reopened long after this call returned.
+    // The one leg this consumer lets be switched off, and only from the
+    // environment — the escape hatch `auto_connect` has always honoured.
+    let smb_disabled = std::env::var_os("SYNOLOGY_FS_SMB_DISABLE").is_some();
+    let policy = TransportPolicy::from_flags(smb_disabled, false, false)
+        .expect("HTTP is never disabled here, so something is always allowed");
+    // Shared rather than owned: the SMB transport keeps a handle to it so a
+    // dead stream can be reopened long after this call returned, and the leg
+    // watch asks it for better ones.
     let chain = Arc::new(Chain::new(
-        TransportPolicy::default(),
+        policy,
         endpoints,
         Box::new(TcpProber::new(SMB_PROBE_TIMEOUT)),
         tunnel,
         DEFAULT_RECHECK,
     ));
 
-    match chain.reach_smb().await {
-        Ok(SmbRoute::Direct { host }) => {
-            // Reachable is not the same as usable: the port answers, and the
-            // session on top of it can still be refused — which is exactly what
-            // an AD account with no domain does. Reporting `SmbDirect` on the
-            // strength of the probe would put "SMB" on the badge while every
-            // transfer went over HTTP, which is the bug this whole change
-            // exists to stop happening quietly.
-            match synology_filestation_smb::auto_connect_as(
-                &host,
-                settings.username,
-                settings.password,
-                settings.domain,
-            )
-            .await
-            {
-                Some(smb) => {
-                    info!("Transport: SMB, direct to {host}");
-                    (
-                        synology_filestation_smb::attach(client, smb),
-                        SynoTransport::SmbDirect,
-                    )
-                }
-                None => {
-                    warn!(
-                        "Transport: {host} answers on 445 but the SMB session was refused; \
-                         using the HTTP API. An AD account needs its domain set."
-                    );
-                    (client, SynoTransport::Https)
-                }
-            }
-        }
-        Ok(SmbRoute::Tunnelled { host, connection }) => {
-            info!("Transport: SMB, through a tunnel to {host}");
-            let mut cfg = SmbConfig::new(&host, settings.username, settings.password);
-            cfg.domain = settings.domain.unwrap_or_default().to_string();
-            match SmbTransport::over_with_redial(connection, &cfg, reopen_through(chain.clone()))
-                .await
-            {
-                Ok(smb) => (
-                    synology_filestation_smb::attach(client, Arc::new(smb)),
-                    SynoTransport::SmbOverVpn,
-                ),
-                // The tunnel carried a connection and SMB behind it would not
-                // talk. Not a reason to fail the connection: HTTP is there, and
-                // which of the two failed is what a user needs to know.
-                Err(e) => {
-                    warn!("SMB through the tunnel: {e}; using the HTTP API");
-                    (client, SynoTransport::Https)
-                }
-            }
-        }
-        Ok(SmbRoute::Unavailable) => {
-            info!("Transport: the HTTP API");
-            (client, SynoTransport::Https)
-        }
-        // Every leg forbidden is a configuration this consumer cannot produce,
-        // since it never disables any of them.
-        Err(e) => {
-            warn!("Transport: no leg is available ({e}); using the HTTP API");
-            (client, SynoTransport::Https)
-        }
+    // Reachable is not the same as usable: the port can answer and the
+    // session on top of it still be refused — which is exactly what an AD
+    // account with no domain does. So what the badge reports is the session,
+    // not the probe; `Legs` says which, and says so in the log when it
+    // changes.
+    let cfg = SmbConfig::for_account(
+        settings.host,
+        settings.username,
+        settings.password,
+        settings.domain,
+    );
+    match Legs::start(chain, &cfg).await {
+        Some(legs) => (
+            synology_filestation_smb::attach(client, legs.session().clone()),
+            Some(legs),
+        ),
+        None => (client, None),
     }
 }
 
@@ -584,8 +576,9 @@ pub unsafe extern "C" fn syno_connect(
                 // raises, or the HTTP API. The GUI's downloads and a
                 // GUI-initiated mount both ride whatever this attaches, so the
                 // choice is worth logging — the log pane is where a user finds
-                // out they are on the slow path.
-                let (client, transport) = runtime.block_on(reach(
+                // out they are on the slow path. And it is looked at again
+                // while the handle lives, so the slow path is not for good.
+                let (client, legs) = runtime.block_on(reach(
                     client,
                     Reachable {
                         host,
@@ -597,10 +590,14 @@ pub unsafe extern "C" fn syno_connect(
                         vpn_profile_remote,
                     },
                 ));
+                let watching = legs
+                    .as_ref()
+                    .map(|legs| legs.watch(runtime.handle(), DEFAULT_WATCH_INTERVAL));
                 let handle = Box::new(SynoClient {
                     inner: Arc::new(client),
                     runtime,
-                    transport,
+                    legs,
+                    watching,
                 });
                 *out = Box::into_raw(handle);
                 SynoStatus::Ok as i32
@@ -1605,7 +1602,7 @@ mod tests {
         // the HTTP path: SMB unreachable, and no profile with which to escalate.
         let client = SynologyClient::new(NOWHERE, 5001, true);
 
-        let (_client, transport) = reach(
+        let (_client, legs) = reach(
             client,
             Reachable {
                 host: NOWHERE,
@@ -1623,7 +1620,13 @@ mod tests {
         )
         .await;
 
-        assert_eq!(transport, SynoTransport::Https);
+        assert_eq!(transport_of(legs.as_deref()), SynoTransport::Https);
+        // And SMB is attached anyway, with no session, so that the connection
+        // can move to it when it answers. This used to be decided once: a GUI
+        // that connected while SMB was unreachable stayed on HTTP, with its
+        // badge saying so, until the user disconnected and connected again.
+        let legs = legs.expect("a place for SMB to go");
+        assert!(!legs.session().is_connected());
     }
 
     #[test]
