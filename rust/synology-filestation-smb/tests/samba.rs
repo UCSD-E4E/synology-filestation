@@ -9,8 +9,11 @@
 //! `#[ignore]`d because they need Docker, which CI does not have. Run them with:
 //!
 //! ```text
-//! cargo test -p synology-filestation-smb --test samba -- --ignored --nocapture
+//! cargo test -p synology-filestation-smb --test samba -- --ignored --test-threads=1
 //! ```
+//!
+//! One at a time: every test in the process names its compose project after
+//! the process id, so two starting together collide on container names.
 //!
 //! The containers are Samba, not DSM, so they prove the operations are correct
 //! SMB — not that this particular NAS accepts them. That still wants the live
@@ -134,4 +137,155 @@ async fn closing_a_handle_nothing_was_written_to_still_creates_the_file() {
     assert_eq!(meta.size, 0, "created, and empty");
 
     smb.delete(path).await.ok();
+}
+
+// ── A session handed over later ──────────────────────────────────────────────
+
+/// The auth container's config, with the password of our choosing.
+fn config_with(password: &str) -> SmbConfig {
+    SmbConfig {
+        host: "127.0.0.1".to_string(),
+        port: smb2::testing::auth_port(),
+        username: "testuser".to_string(),
+        password: password.to_string(),
+        domain: String::new(),
+        timeout: Duration::from_secs(10),
+    }
+}
+
+async fn a_stream_to_the_server() -> tokio::net::TcpStream {
+    tokio::net::TcpStream::connect(("127.0.0.1", smb2::testing::auth_port()))
+        .await
+        .expect("the auth container listens")
+}
+
+fn no_redial() -> impl Fn() -> synology_filestation_smb::RedialFuture + Send + Sync + 'static {
+    || {
+        Box::pin(async {
+            Err(synology_filestation_core::SynoFsError::Io(
+                "not in this test".into(),
+            ))
+        })
+    }
+}
+
+/// A transport that has been handed one session.
+async fn adopted() -> SmbTransport {
+    let smb = SmbTransport::unconnected(&config_with("testpass"), no_redial());
+    smb.adopt(Box::new(a_stream_to_the_server().await), "127.0.0.1")
+        .await
+        .expect("the session is built on the stream it was given");
+    smb
+}
+
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn a_transport_attached_without_a_session_serves_once_it_is_given_one() {
+    // The mount that came up while SMB was unreachable. It carries on over
+    // HTTP, and when SMB answers it is handed a session — it must then serve
+    // exactly as a transport that had one from the start.
+    let _servers = TestServers::start().await.expect("docker compose up");
+    let smb = SmbTransport::unconnected(&config_with("testpass"), no_redial());
+    assert!(!smb.is_connected());
+
+    smb.adopt(Box::new(a_stream_to_the_server().await), "127.0.0.1")
+        .await
+        .expect("adopted");
+
+    assert!(smb.is_connected());
+    let path = "/private/adopted.txt";
+    smb.write_atomic(path, b"over smb").await.expect("write");
+    assert_eq!(&smb.read_full(path).await.unwrap()[..], b"over smb");
+    smb.delete(path).await.ok();
+}
+
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn a_better_session_replaces_a_working_one() {
+    // The laptop walking from the tunnel back onto campus: the old session
+    // works, and the new one takes over without anything being remounted.
+    let _servers = TestServers::start().await.expect("docker compose up");
+    let smb = adopted().await;
+    let path = "/private/moved.txt";
+    smb.write_atomic(path, b"written on the first").await.unwrap();
+    // A read handle cached on the first session, which has to be let go of.
+    assert_eq!(smb.read(path, 0, 5).await.unwrap().as_ref(), b"writt");
+
+    smb.adopt(Box::new(a_stream_to_the_server().await), "127.0.0.1")
+        .await
+        .expect("the second session");
+
+    assert_eq!(
+        &smb.read_full(path).await.unwrap()[..],
+        b"written on the first"
+    );
+    assert_eq!(smb.read(path, 8, 2).await.unwrap().as_ref(), b"on");
+    smb.delete(path).await.ok();
+}
+
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn a_write_open_across_the_handover_finishes_where_it_started() {
+    // A transfer running when the better leg arrives finishes on the leg it
+    // began on, rather than being torn between two sessions.
+    use synology_filestation_core::transport::{OpenWriteTransport, WriteOpen};
+
+    let _servers = TestServers::start().await.expect("docker compose up");
+    let smb = adopted().await;
+    let path = "/private/across.bin";
+    smb.delete(path).await.ok();
+
+    let mut handle = smb
+        .open_write(path, WriteOpen::CreateNew)
+        .await
+        .expect("open");
+    handle.write_at(0, b"first half, ").await.expect("before");
+
+    smb.adopt(Box::new(a_stream_to_the_server().await), "127.0.0.1")
+        .await
+        .expect("the second session");
+
+    handle.write_at(12, b"second half").await.expect("after");
+    handle.close().await.expect("close");
+
+    assert_eq!(
+        &smb.read_full(path).await.unwrap()[..],
+        b"first half, second half"
+    );
+    smb.delete(path).await.ok();
+}
+
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn a_refused_session_is_not_asked_for_again() {
+    // A wrong password — or an AD account with no domain set — handed a
+    // stream every minute would lock the address out of the NAS for good.
+    let _servers = TestServers::start().await.expect("docker compose up");
+    let smb = SmbTransport::unconnected(&config_with("not the password"), no_redial());
+
+    let refused = smb
+        .adopt(Box::new(a_stream_to_the_server().await), "127.0.0.1")
+        .await
+        .expect_err("the server turns it down");
+    assert_eq!(
+        refused.category(),
+        synology_filestation_core::error::ErrorCategory::PermissionDenied,
+        "{refused:?}"
+    );
+    assert!(smb.refused().is_some());
+
+    // Handed a stream nobody is on the other end of: if it tried, it would
+    // hang or fail differently. It must not try.
+    let (ours, _theirs) = tokio::io::duplex(1024);
+    let again = tokio::time::timeout(
+        Duration::from_secs(2),
+        smb.adopt(Box::new(ours), "127.0.0.1"),
+    )
+    .await
+    .expect("answered at once")
+    .expect_err("still refused");
+    assert_eq!(
+        again.category(),
+        synology_filestation_core::error::ErrorCategory::PermissionDenied
+    );
 }
