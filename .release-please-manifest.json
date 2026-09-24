@@ -1,6 +1,3 @@
 {
-  ".": "0.7.0",
-  "rust/synology-filestation-core": "0.7.0",
-  "rust/synology-filestation-fuse": "0.7.0",
-  "python/synology_filestation": "0.7.0"
+  ".": "0.7.0"
 }

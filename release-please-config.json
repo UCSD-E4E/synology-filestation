@@ -1,30 +1,14 @@
 {
   "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
   "bootstrap-sha": "381d1b8eaa5a87f621350a19b1ecda07b5db5320",
-  "plugins": [
-    {
-      "type": "linked-versions",
-      "groupName": "synology-filestation",
-      "components": [
-        "synology-filestation-core",
-        "synology-filestation-fuse",
-        "synology-filestation-gui",
-        "synology_filestation"
-      ],
-      "merge": false
-    }
-  ],
   "packages": {
     ".": {
       "release-type": "simple",
-      "package-name": "synology-filestation-gui",
-      "changelog-path": "SynologyFuse.Gui/CHANGELOG.md",
+      "package-name": "synology-filestation-fuse",
+      "changelog-path": "CHANGELOG.md",
       "bump-minor-pre-major": true,
       "bump-patch-for-minor-pre-major": false,
       "exclude-paths": [
-        "rust/synology-filestation-core",
-        "rust/synology-filestation-fuse",
-        "python/synology_filestation",
         ".github",
         "nix"
       ],
@@ -32,26 +16,28 @@
         {
           "type": "generic",
           "path": "SynologyFuse.Gui/SynologyFuse.Gui.csproj"
+        },
+        {
+          "type": "toml",
+          "path": "rust/synology-filestation-core/Cargo.toml",
+          "jsonpath": "$.package.version"
+        },
+        {
+          "type": "toml",
+          "path": "rust/synology-filestation-fuse/Cargo.toml",
+          "jsonpath": "$.package.version"
+        },
+        {
+          "type": "toml",
+          "path": "python/synology_filestation/Cargo.toml",
+          "jsonpath": "$.package.version"
+        },
+        {
+          "type": "toml",
+          "path": "Cargo.lock",
+          "jsonpath": "$.package[?(@.name.value == 'synology-filestation-core' || @.name.value == 'synology-filestation-fuse' || @.name.value == 'synology_filestation')].version"
         }
       ]
-    },
-    "rust/synology-filestation-core": {
-      "release-type": "rust",
-      "package-name": "synology-filestation-core",
-      "bump-minor-pre-major": true,
-      "bump-patch-for-minor-pre-major": false
-    },
-    "rust/synology-filestation-fuse": {
-      "release-type": "rust",
-      "package-name": "synology-filestation-fuse",
-      "bump-minor-pre-major": true,
-      "bump-patch-for-minor-pre-major": false
-    },
-    "python/synology_filestation": {
-      "release-type": "rust",
-      "package-name": "synology_filestation",
-      "bump-minor-pre-major": true,
-      "bump-patch-for-minor-pre-major": false
     }
   }
 }

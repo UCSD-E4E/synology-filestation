@@ -1,5 +1,7 @@
 # Changelog
 
+Releases after 0.7.0 are recorded in the [repository changelog](../../CHANGELOG.md): every component now ships in a single release.
+
 ## [0.7.0](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-core-v0.6.0...synology-filestation-core-v0.7.0) (2026-09-14)
 
 
