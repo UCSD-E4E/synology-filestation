@@ -1997,11 +1997,11 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "reqwest"
-version = "0.13.4"
+version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "219c5811de6525e5416c7d5d53bb656d3afdbc6c5af816e0802bcfa42dbdc1c3"
+checksum = "16a1cfa75cc186dd73d5818e510e042e40927bccc9c236b061cea97e1eb08029"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "bytes",
  "futures-core",
  "futures-util",
@@ -2523,7 +2523,7 @@ dependencies = [
 
 [[package]]
 name = "synology-filestation-core"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2558,7 +2558,7 @@ dependencies = [
 
 [[package]]
 name = "synology-filestation-fuse"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2625,7 +2625,7 @@ dependencies = [
 
 [[package]]
 name = "synology_filestation"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "pyo3",
  "pyo3-async-runtimes",
