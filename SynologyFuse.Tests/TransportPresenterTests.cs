@@ -44,6 +44,18 @@ public class TransportPresenterTests
     }
 
     [Fact]
+    public void TheSlowLegSaysItWillNotLastIfItNeedNot()
+    {
+        // A connection on the HTTP API moves to SMB by itself once SMB
+        // answers. Without saying so, the natural reading of the slow badge is
+        // "disconnect and try again", which interrupts the very transfers the
+        // move exists to protect.
+        var detail = TransportPresenter.Detail(SynoTransport.Https);
+
+        Assert.Contains("by itself", detail);
+    }
+
+    [Fact]
     public void TheTunnelledLegSaysWhatItDidToTheMachine()
     {
         // Which is nothing, and that is the reassurance worth giving: a VPN

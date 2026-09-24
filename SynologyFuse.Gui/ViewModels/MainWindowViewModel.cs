@@ -315,6 +315,7 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
                 StatusText = $"Volume ready at {config.Mountpoint}";
                 AppendLog($"Volume ready, using {TransportBadge}.");
                 _pending = PendingAction.None;
+                WatchTransport();
             }
         }
         catch (OtpRequiredException)
@@ -327,6 +328,7 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
         }
         catch (Exception ex)
         {
+            StopWatchingTransport();
             IsConnected = false;
             Report(ex);
         }
@@ -334,6 +336,38 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
         {
             IsConnecting = false;
         }
+    }
+
+    /// <summary>Re-reads the badge every <see cref="TransportWatch.Interval"/>
+    /// while a volume is up, because the leg can change under it: a connection
+    /// that came up on the HTTP API moves to SMB when SMB answers, and one
+    /// whose SMB session dies is on HTTP until it is back. The native log says
+    /// so too; this is what keeps the badge from contradicting it.</summary>
+    private DispatcherTimer? _transportTimer;
+
+    private void WatchTransport()
+    {
+        StopWatchingTransport();
+        var watch = new TransportWatch(() => _mountService.Transport, Transport);
+        _transportTimer = new DispatcherTimer { Interval = TransportWatch.Interval };
+        _transportTimer.Tick += (_, _) =>
+        {
+            if (watch.Poll() is { } now)
+            {
+                Transport = now;
+                AppendLog($"Now using {TransportBadge}.");
+            }
+        };
+        _transportTimer.Start();
+    }
+
+    /// <summary>Stopped on the UI thread before anything releases the native
+    /// client: ticks run on the UI thread too, so none can then be reading a
+    /// handle another thread is freeing.</summary>
+    private void StopWatchingTransport()
+    {
+        _transportTimer?.Stop();
+        _transportTimer = null;
     }
 
     private bool CanConnect() =>
@@ -346,6 +380,7 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
     [RelayCommand(CanExecute = nameof(CanDisconnect))]
     private async Task Disconnect()
     {
+        StopWatchingTransport();
         AppendLog("Disconnecting…");
         StatusText = "Disconnecting…";
         ShowOtpPrompt = false;
@@ -499,6 +534,7 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
 
     public void Dispose()
     {
+        StopWatchingTransport();
         _mountService.OutputReceived -= OnOutput;
         _mountService.Dispose();
     }
