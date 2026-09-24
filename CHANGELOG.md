@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.17 – 0.7.0
+
+From 0.1.17 through 0.7.0 each component was released separately, with its own changelog and its own GitHub release:
+
+* [GUI and installers](SynologyFuse.Gui/CHANGELOG.md)
+* [FUSE driver and CLI](rust/synology-filestation-fuse/CHANGELOG.md)
+* [Core HTTP client](rust/synology-filestation-core/CHANGELOG.md)
+* [Python bindings](python/synology_filestation/CHANGELOG.md)
+
+From 0.8.0 on, everything ships as a single release and is recorded here.
+
 ## [0.1.16](https://github.com/UCSD-E4E/synology-filestation-fuse/compare/synology-filestation-fuse-v0.1.15...synology-filestation-fuse-v0.1.16) (2026-04-27)
 
 

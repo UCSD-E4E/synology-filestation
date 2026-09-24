@@ -18,12 +18,12 @@ public sealed record UpdateInfo(Version Latest, string TagName, string HtmlUrl);
 /// </summary>
 public static class UpdateCheckService
 {
-    // We list releases instead of hitting /releases/latest because the repo
-    // contains three release-please packages (the FUSE crate, the Rust core
-    // library, and the Python bindings). /releases/latest returns whichever
-    // of the three was most recently published — so a Python wheel bump
-    // would trigger a "GUI update available" prompt even when the FUSE
-    // installer hasn't moved. We list and filter to FUSE-prefixed tags.
+    // We list releases instead of hitting /releases/latest because until
+    // 0.7.0 every version was published as four releases (GUI, FUSE crate,
+    // Rust core, Python bindings), and /releases/latest returned whichever
+    // was published last. From 0.8.0 there is one release per version, but
+    // its tag keeps the FUSE prefix precisely so that GUIs already installed
+    // — which filter on it — still see updates. Do not change the prefix.
     private const string ReleasesUrl =
         "https://api.github.com/repos/UCSD-E4E/synology-filestation/releases?per_page=20";
 

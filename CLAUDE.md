@@ -256,16 +256,19 @@ This cannot be fixed with a repository setting, though this file long claimed it
 
 Release-please logs `commit could not be parsed` for each merge subject (`Merge pull request #N from …`). That noise is expected and is the system working.
 
-The repo has **four release-please packages** linked together via the `linked-versions` plugin (so they always bump to the same version, but each ships its own changelog and tag):
+The repo is **one release-please package**, keyed `"."`: every version is one tag, one GitHub release carrying every artifact, and one changelog (`CHANGELOG.md` at the root).
 
-| Package | Tag prefix | Artifacts on release |
-|---|---|---|
-| `.` (GUI + installers)            | `synology-filestation-gui-v...`   | (changelog + `SynologyFuse.Gui.csproj` `<Version>` bump) |
-| `rust/synology-filestation-core`  | `synology-filestation-core-v...`  | (Cargo.toml bump only) |
-| `rust/synology-filestation-fuse`  | `synology-filestation-fuse-v...`  | `.deb`, `.pkg`, `*-Setup.exe` (the MSI is built but ships inside the bundle, not as its own asset — checked against 0.5.5, 0.6.0 and 0.7.0) |
-| `python/synology_filestation`     | `synology_filestation-v...`       | `*.whl` (manylinux 2_34, x86_64) |
+| Tag | Artifacts on release |
+|---|---|
+| `synology-filestation-fuse-v...` | `.deb`, `.pkg`, `*-Setup.exe` (the MSI is built but ships inside the bundle, not as its own asset), `*.whl` (manylinux 2_34, x86_64) |
 
-**Why a root package exists.** release-please attributes a commit to a package by *path*, and the .NET projects (`SynologyFuse.Gui/`, `SynologyFuse.Tests/`, `SynologyFuse.*Installer/`) live at the repo root — outside every `rust/` and `python/` package. Without a package keyed `"."` those commits are "homeless": no package sees them, so no release PR is opened at all. (`include-paths` is *not* a release-please option — only `exclude-paths` is — so an earlier attempt to attribute them to the fuse package was a silent no-op.) The root package is given all commits and then filtered by `exclude-paths`, which lists **the paths another package already owns** — `rust/synology-filestation-core`, `rust/synology-filestation-fuse`, `python/synology_filestation` — plus `.github/` and `nix/`, which should not bump anything. It deliberately does *not* exclude `rust/` wholesale: the crates with no package of their own (`smb`, `connect`, `openvpn`, `ffi`) ship inside the released binary, and excluding their whole tree made every commit to them homeless — no changelog line, no version bump, for code that goes out in the artifact. Since it is in the linked-versions group, a GUI-only change still bumps the fuse package and ships the installers. Note `exclude-paths` matches directories only, so a commit touching just a root-level *file* (`flake.nix`, `README.md`) lands in the GUI package; only `feat`/`fix` types actually trigger a bump. `extra-files` paths are resolved **relative to the package path**, which is why the `SynologyFuse.Gui.csproj` version bump belongs to the root package, not the fuse package.
+Until 0.7.0 it was four packages (GUI, core, fuse, Python) tied together with `linked-versions`, which put four releases with the same version on the Releases page, three of them near-empty. Their changelogs stay where they were as history; the root changelog points at them.
+
+**The tag keeps the `synology-filestation-fuse-v` prefix on purpose.** Installed GUIs find updates by filtering releases on exactly that prefix (`UpdateCheckService.FuseTagPrefix`). A cleaner `v0.8.0` would leave every GUI already in the field believing it is up to date, forever. The prefix comes from `package-name`, so do not rename it.
+
+**How versions are bumped.** The package is `release-type: simple`, not `rust`: the `rust` strategy at a workspace root also rewrites the root `Cargo.toml`, which has no `[package]`, and release-please refuses that ("is not a package manifest"). So `extra-files` does it by hand — a `toml` updater on each released crate's `$.package.version` (core, fuse, python), one on `Cargo.lock` for the same three names, and the generic marker in `SynologyFuse.Gui.csproj`. The `Cargo.lock` JSONPath compares `@.name.value`, not `@.name`: release-please parses TOML into `{start, end, value}` nodes so it can edit in place, and a filter on `@.name` silently matches nothing. A crate added to the release set needs an entry in both places. The old per-package setup never touched `Cargo.lock` at all, which is why it said 0.6.0 at 0.7.0.
+
+Every commit belongs to the one package; `exclude-paths` drops only `.github/` and `nix/`, which should not bump anything. Only `feat`/`fix` types trigger a bump.
 
 CI workflows:
 
@@ -275,4 +278,4 @@ CI workflows:
 | `.github/workflows/python.yml`         | every push             | pytest matrix (Python 3.10–3.13) for the bindings |
 | `.github/workflows/maturin.yml`        | every push             | manylinux wheel smoke build |
 | `.github/workflows/nix.yml`            | push to main / PR      | `nix flake check` — CLI + GUI builds, clippy, rustfmt, GUI tests |
-| `.github/workflows/release-please.yml` | tag (or workflow_dispatch) | release-please PRs and per-package artifact uploads |
+| `.github/workflows/release-please.yml` | push to main (or workflow_dispatch with `tag`) | release-please PR, then every artifact uploaded to the one release |
