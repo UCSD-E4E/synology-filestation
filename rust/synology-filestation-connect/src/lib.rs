@@ -414,6 +414,9 @@ pub struct Chain {
     /// recent thing it did. Cleared by an open that works, and by
     /// [`reconsider`](Chain::reconsider).
     tunnel_failed_at: Mutex<Option<Instant>>,
+    /// The port SMB listens on, asked of the tunnel; see
+    /// [`with_smb_port`](Chain::with_smb_port).
+    smb_port: u16,
 }
 
 impl Chain {
@@ -436,7 +439,20 @@ impl Chain {
             refused: Mutex::new(None),
             tunnel_recheck: DEFAULT_TUNNEL_RECHECK,
             tunnel_failed_at: Mutex::new(None),
+            smb_port: SMB_PORT,
         }
+    }
+
+    /// Reach SMB on `port` through the tunnel, rather than 445.
+    ///
+    /// For an appliance whose SMB listens elsewhere — what
+    /// `SYNOLOGY_FS_SMB_PORT` says. The tunnel lands on the same appliance the
+    /// direct leg dials, so it has to ask the same port, or the tunnel leg
+    /// fails on exactly the deployments that set the override. The direct
+    /// probe's port belongs to the [`Prober`]: see [`TcpProber::on_port`].
+    pub fn with_smb_port(mut self, port: u16) -> Self {
+        self.smb_port = port;
+        self
     }
 
     /// Leave a failed tunnel alone for `interval` rather than
@@ -539,7 +555,7 @@ impl Chain {
                 return None;
             }
         }
-        match self.tunnel.open(inside, SMB_PORT).await {
+        match self.tunnel.open(inside, self.smb_port).await {
             Ok(connection) => {
                 *self.tunnel_failed_at.lock().unwrap() = None;
                 info!("transport: SMB reachable through the tunnel at {inside}");
@@ -606,7 +622,7 @@ impl Chain {
                 Transport::Https => return Ok(SmbRoute::Unavailable),
                 Transport::SmbOverVpn => {
                     if let Some(host) = cached.smb_host.clone() {
-                        match self.tunnel.open(&host, SMB_PORT).await {
+                        match self.tunnel.open(&host, self.smb_port).await {
                             Ok(connection) => return Ok(SmbRoute::Tunnelled { host, connection }),
                             // What was remembered no longer holds. Falling
                             // through re-decides rather than reporting a
@@ -1462,6 +1478,30 @@ mod tests {
 
         assert!(chain.better_than(Transport::Https).await.is_none());
         assert_eq!(tunnel.opens(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_tunnel_is_asked_for_the_configured_port() {
+        // `SYNOLOGY_FS_SMB_PORT` names where SMB listens, and the tunnel lands
+        // on the same appliance. Asking it for 445 regardless made the tunnel
+        // leg fail on exactly the deployments that set the override. Both
+        // ways of opening through it — deciding afresh, and reopening a
+        // remembered tunnel route — have to ask the same port.
+        let prober = FakeProber::nothing_answers();
+        let tunnel = FakeTunnel::reaching();
+        let chain =
+            chain(TransportPolicy::default(), prober.clone(), tunnel.clone()).with_smb_port(1445);
+
+        chain.reach_smb().await.unwrap();
+        chain.reach_smb().await.unwrap();
+        chain.reconsider_the_decision_only();
+        chain.better_than(Transport::Https).await;
+
+        assert_eq!(
+            tunnel.asked(),
+            vec![format!("{INSIDE}:1445"); 3],
+            "decided, remembered, and looked for — all on the configured port"
+        );
     }
 
     #[tokio::test]

@@ -436,16 +436,19 @@ fn run(args: Args) -> anyhow::Result<()> {
     // Shared rather than owned: the SMB transport keeps a handle to it so a
     // dead tunnel can be asked for a new connection long after the mount
     // started, and the leg watch below asks it for better ones.
-    let chain = Arc::new(Chain::new(
-        policy,
-        endpoints,
-        Box::new(TcpProber::on_port(
-            smb_cfg.port,
-            probe_timeout(std::env::var(SMB_TIMEOUT_ENV).ok()),
-        )),
-        tunnel_from(&args, &args.username, &password),
-        DEFAULT_RECHECK,
-    ));
+    let chain = Arc::new(
+        Chain::new(
+            policy,
+            endpoints,
+            Box::new(TcpProber::on_port(
+                smb_cfg.port,
+                probe_timeout(std::env::var(SMB_TIMEOUT_ENV).ok()),
+            )),
+            tunnel_from(&args, &args.username, &password),
+            DEFAULT_RECHECK,
+        )
+        .with_smb_port(smb_cfg.port),
+    );
 
     // The profile is fetched before anything asks for a tunnel, over the
     // session just authenticated — which is what lets somebody outside the

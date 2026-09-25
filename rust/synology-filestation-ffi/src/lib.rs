@@ -414,13 +414,16 @@ async fn reach(
     // Shared rather than owned: the SMB transport keeps a handle to it so a
     // dead stream can be reopened long after this call returned, and the leg
     // watch asks it for better ones.
-    let chain = Arc::new(Chain::new(
-        policy,
-        endpoints,
-        Box::new(TcpProber::on_port(cfg.port, SMB_PROBE_TIMEOUT)),
-        tunnel,
-        DEFAULT_RECHECK,
-    ));
+    let chain = Arc::new(
+        Chain::new(
+            policy,
+            endpoints,
+            Box::new(TcpProber::on_port(cfg.port, SMB_PROBE_TIMEOUT)),
+            tunnel,
+            DEFAULT_RECHECK,
+        )
+        .with_smb_port(cfg.port),
+    );
 
     // Reachable is not the same as usable: the port can answer and the
     // session on top of it still be refused — which is exactly what an AD
