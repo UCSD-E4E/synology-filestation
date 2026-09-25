@@ -832,3 +832,117 @@ fn creating_a_file_and_writing_nothing_still_puts_it_on_the_nas() {
     let bodies = posted_bodies(&f);
     assert_eq!(bodies.len(), 1, "the empty file was uploaded");
 }
+
+/// An open-write backend whose `open_write` stays on the wire until the test
+/// lets it go: an SMB CREATE through a tunnel with a 110 ms round trip, held
+/// open for as long as the test needs to look at what else is stuck.
+struct GatedSink {
+    started: StdMutex<Option<std::sync::mpsc::Sender<()>>>,
+    gate: tokio::sync::Semaphore,
+}
+
+#[async_trait::async_trait]
+impl synology_filestation_core::transport::OpenWriteTransport for GatedSink {
+    async fn open_write(
+        &self,
+        _path: &str,
+        _mode: WriteOpen,
+    ) -> Result<Box<dyn WriteHandle>, SynoFsError> {
+        if let Some(started) = self.started.lock().unwrap().take() {
+            let _ = started.send(());
+        }
+        let _ = self.gate.acquire().await.expect("the gate is never closed");
+        Ok(Box::new(RecordingHandle {
+            writes: SeenWrites::default(),
+            closed: Arc::default(),
+            fails_from: None,
+            seen: 0,
+        }))
+    }
+}
+
+fn gated_fixture() -> (Fixture, Arc<GatedSink>) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let server = rt.block_on(MockServer::start());
+    let sink = Arc::new(GatedSink {
+        started: StdMutex::new(None),
+        gate: tokio::sync::Semaphore::new(0),
+    });
+    let client = client_for(&server).with_open_write_transport(sink.clone());
+    let fs = SynologyFS::new(
+        Arc::new(client),
+        Arc::new(InodeCache::new(30)),
+        Arc::new(DirCache::new(30)),
+        Arc::new(ReadCache::new(BLOCK, 64)),
+        rt.handle().clone(),
+        Ownership {
+            uid: 1000,
+            gid: 1000,
+            umask: 0o022,
+        },
+        DEFAULT_PREFETCH_BLOCKS,
+    );
+    (Fixture { fs, server, rt }, sink)
+}
+
+#[test]
+fn an_open_waiting_on_the_nas_does_not_hold_every_other_handle() {
+    // The wedge of 2026-09-25. `open` held the write-buffer map's lock across
+    // its `open_write` round trip, and every close's upload task takes that
+    // lock on a runtime worker. The round trip needed a worker, the workers
+    // waited for the lock, and the whole mount stopped — the tunnel's packet
+    // loop included, since it runs on the same two workers.
+    let (f, sink) = gated_fixture();
+    let (started, open_is_on_the_wire) = std::sync::mpsc::channel();
+    *sink.started.lock().unwrap() = Some(started);
+
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            f.fs.add_write_buffer(1, "/share/slow.bin".into(), 42, false, true)
+        });
+        open_is_on_the_wire
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the open reached the backend");
+
+        let (looked_up, lookup_done) = std::sync::mpsc::channel();
+        let fs = &f.fs;
+        s.spawn(move || {
+            let _ = fs.transfers().buffer(2);
+            let _ = looked_up.send(());
+        });
+        let answered = lookup_done.recv_timeout(Duration::from_secs(2)).is_ok();
+
+        // Let the open finish whatever happened, so the scope can join.
+        sink.gate.add_permits(1);
+        assert!(
+            answered,
+            "another handle's buffer lookup waited on an open's network round trip"
+        );
+    });
+}
+
+#[test]
+fn a_read_only_open_does_not_open_the_file_for_writing_on_the_nas() {
+    // Every `open` used to call `open_write`, `O_RDONLY` included: an SMB
+    // CREATE for write access on the NAS — 110 ms through the tunnel — paid by
+    // a reader that can never write, since the kernel refuses a write on a
+    // read-only descriptor before it reaches us.
+    let (f, sink) = gated_fixture();
+    let (started, opened_for_write) = std::sync::mpsc::channel();
+    *sink.started.lock().unwrap() = Some(started);
+    sink.gate.add_permits(1);
+
+    f.fs.add_write_buffer(1, "/share/read-me.bin".into(), 42, false, false);
+
+    assert!(
+        opened_for_write.try_recv().is_err(),
+        "a read-only open asked the NAS for a write handle"
+    );
+    let handle =
+        f.fs.transfers()
+            .buffer(1)
+            .expect("the handle is registered");
+    let buffer = handle.try_lock().expect("nothing else holds the buffer");
+    assert!(matches!(buffer.sink, WriteSink::Buffered(_)));
+    assert!(!buffer.dirty, "a read-only handle has nothing to upload");
+}
