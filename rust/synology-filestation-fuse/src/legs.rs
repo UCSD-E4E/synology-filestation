@@ -77,7 +77,7 @@ pub struct Legs<S: Session = SmbTransport> {
     dial: Dial,
     /// The leg last reported, so a change is logged once rather than every
     /// time the watch looks.
-    reported: Mutex<Option<Transport>>,
+    reported: Mutex<Option<String>>,
 }
 
 impl Legs<SmbTransport> {
@@ -185,13 +185,27 @@ impl<S: Session> Legs<S> {
 
     /// Log the leg when it differs from the one last logged.
     fn report(&self, now: Transport) {
+        let now = self.described(now);
         let mut reported = self.reported.lock().unwrap_or_else(|e| e.into_inner());
-        match *reported {
+        match reported.as_deref() {
             None => info!("Transport: {now}"),
             Some(was) if was != now => info!("Transport: now {now}, was {was}"),
             Some(_) => {}
         }
         *reported = Some(now);
+    }
+
+    /// The leg as the log names it: which transport, and for SMB which host —
+    /// the appliance on the direct leg, the address inside the tunnel on the
+    /// other. "Now SMB" alone does not say which of those it moved to.
+    fn described(&self, leg: Transport) -> String {
+        match self.chain.current() {
+            Some(Route {
+                smb_host: Some(host),
+                ..
+            }) if leg != Transport::Https => format!("{leg} at {host}"),
+            _ => leg.to_string(),
+        }
     }
 
     /// Look again every `every`, for as long as the returned task runs.
@@ -507,10 +521,22 @@ mod tests {
 
     #[tokio::test]
     async fn a_change_of_leg_is_logged_once() {
+        // Its own host, because the capture is shared by the whole binary: a
+        // test running alongside logs the same move, and counting a line
+        // every such test writes failed about one run in ten. The host is
+        // also what a person reading the log needs — which appliance, and on
+        // the tunnel, which address inside it.
+        const HERE: &str = "logged-once.example";
         let logs = LogCapture::at_the_default_level();
         let prober = FakeProber::answering(false);
-        let tunnel = FakeTunnel::new(false);
-        let (legs, _session, _chain) = legs(&prober, &tunnel);
+        let chain = Arc::new(Chain::new(
+            TransportPolicy::default(),
+            Endpoints::public_only(HERE),
+            Box::new(prober.clone()),
+            Box::new(FakeTunnel::new(false)),
+            DEFAULT_RECHECK,
+        ));
+        let legs = Legs::new(chain, Arc::new(FakeSession::default()), TEST_DIAL);
 
         legs.step().await;
         prober.starts_answering();
@@ -519,7 +545,8 @@ mod tests {
 
         let text = logs.text();
         assert_eq!(
-            text.matches("Transport: now SMB, was HTTPS").count(),
+            text.matches(&format!("Transport: now SMB at {HERE}, was HTTPS"))
+                .count(),
             1,
             "said when it happened, and not again: {text}"
         );
