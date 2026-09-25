@@ -4,17 +4,27 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use synology_filestation_connect::{
-    profile::ProfileSource, Chain, Endpoints, NoTunnel, OpenVpnTunnel, SmbRoute, TcpProber,
-    TransportPolicy, Tunnel, DEFAULT_RECHECK,
+    profile::ProfileSource, Chain, Endpoints, NoTransport, NoTunnel, OpenVpnTunnel, TcpProber,
+    Transport, TransportPolicy, Tunnel, DEFAULT_RECHECK,
 };
-use synology_filestation_smb::{SmbConfig, SmbTransport};
+use synology_filestation_smb::SmbConfig;
 
 use clap::Parser;
 use tracing::{info, warn};
 
 use synology_filestation_core::client::SynologyClient;
+use synology_filestation_fuse::legs::{Legs, DEFAULT_WATCH_INTERVAL};
 use synology_filestation_fuse::logfile::{self, LogFile};
-use synology_filestation_fuse::{is_otp_required, reopen_through, spawn_mount, MountOptions};
+use synology_filestation_fuse::{is_otp_required, spawn_mount, MountOptions};
+
+/// Aborts a background task when it goes out of scope.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -403,8 +413,8 @@ fn run(args: Args) -> anyhow::Result<()> {
     info!("Logged in successfully");
 
     // Which way to reach the NAS: SMB, SMB through a tunnel, or the HTTP API.
-    // The chain decides once and the mount lives with it; `--disable-*` says
-    // which legs it may consider at all.
+    // The chain decides which leg reaches the NAS, and is asked again while
+    // the mount runs; `--disable-*` says which legs it may consider at all.
     let policy = TransportPolicy::from_flags(
         smb_disabled(args.disable_smb, std::env::var_os(SMB_DISABLE_ENV)),
         args.disable_vpn,
@@ -417,7 +427,7 @@ fn run(args: Args) -> anyhow::Result<()> {
     };
     // Shared rather than owned: the SMB transport keeps a handle to it so a
     // dead tunnel can be asked for a new connection long after the mount
-    // started. See `SmbTransport::over_with_redial` below.
+    // started, and the leg watch below asks it for better ones.
     let chain = Arc::new(Chain::new(
         policy,
         endpoints,
@@ -443,49 +453,33 @@ fn run(args: Args) -> anyhow::Result<()> {
         }
     }
 
-    // SMB is reached by whichever leg answers. Direct is an address to dial;
-    // through the tunnel it is a connection already open, because opening it
-    // was the only way to know the leg works — and because nothing on this
-    // machine has a route to the address at the far end of it.
-    let reached = rt
-        .block_on(chain.reach_smb())
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let client = Arc::new(match reached {
-        SmbRoute::Direct { host } => {
-            info!("Transport: SMB, direct to {host}");
-            rt.block_on(synology_filestation_smb::auto_attach_as(
-                client,
-                &host,
-                &args.username,
-                &password,
-                args.domain.as_deref(),
-            ))
-        }
-        SmbRoute::Tunnelled { host, connection } => {
-            info!("Transport: SMB, through a tunnel to {host}");
-            let mut cfg = SmbConfig::new(&host, &args.username, &password);
-            cfg.domain = args.domain.clone().unwrap_or_default();
-            match rt.block_on(SmbTransport::over_with_redial(
-                connection,
-                &cfg,
-                reopen_through(chain.clone()),
-            )) {
-                Ok(smb) => synology_filestation_smb::attach(client, Arc::new(smb)),
-                // The tunnel carried a connection and SMB behind it would not
-                // talk. Not a reason to fail the mount: the HTTP leg is there,
-                // and saying which of the two failed is the difference between
-                // a fix and a shrug.
-                Err(e) => {
-                    warn!("SMB through the tunnel: {e}; using the HTTP API");
-                    client
-                }
-            }
-        }
-        SmbRoute::Unavailable => {
-            info!("Transport: the HTTP API");
-            client
-        }
+    // SMB goes on the best leg that answers now, and the mount keeps looking
+    // for a better one for as long as it is up: one that came up on HTTP moves
+    // to SMB when SMB becomes reachable, and one that came up through the
+    // tunnel moves to a direct connection when that answers. The transport is
+    // attached whether or not a leg answered — without a session it stands
+    // aside for HTTP — so there is somewhere for the session to go.
+    let smb_cfg = SmbConfig::for_account(
+        &args.host,
+        &args.username,
+        &password,
+        args.domain.as_deref(),
+    );
+    let legs = rt.block_on(Legs::start(chain.clone(), &smb_cfg));
+    let on = legs
+        .as_ref()
+        .map_or(Transport::Https, |legs| legs.current());
+    if on == Transport::Https && !policy.allows_https() {
+        return Err(anyhow::anyhow!("{NoTransport}"));
+    }
+    let client = Arc::new(match &legs {
+        Some(legs) => synology_filestation_smb::attach(client, legs.session().clone()),
+        None => client,
     });
+    // Aborted when it is dropped at the end of `main`, after the unmount.
+    let _watching = legs
+        .as_ref()
+        .map(|legs| AbortOnDrop(legs.watch(rt.handle(), DEFAULT_WATCH_INTERVAL)));
 
     let opts = MountOptions {
         cache_ttl: args.cache_ttl,

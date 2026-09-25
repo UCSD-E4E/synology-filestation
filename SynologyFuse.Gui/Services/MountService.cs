@@ -65,13 +65,17 @@ public sealed class MountService : IDisposable
         }
     }
 
-    /// <summary>Which leg the last connection reached the NAS by.
+    /// <summary>Which leg the mounted connection is on now, or — with nothing
+    /// mounted — the one the last connection test reached the NAS by.
     ///
     /// <see cref="SynoTransport.Unknown"/> until something has connected. Worth
     /// showing: the difference between SMB and the HTTP API is the difference
     /// between a transfer that resumes where it stopped and one that starts
-    /// again, and nothing else tells a user which they got.</summary>
-    public SynoTransport Transport { get; private set; } = SynoTransport.Unknown;
+    /// again, and nothing else tells a user which they got. Live while mounted,
+    /// because the leg can change while the volume is up.</summary>
+    public SynoTransport Transport => _client?.Transport ?? _tested;
+
+    private SynoTransport _tested = SynoTransport.Unknown;
 
     /// <summary>An empty setting means "not set", which the native side spells
     /// null. A blank string would be a domain of "" and a profile path of "".</summary>
@@ -139,7 +143,6 @@ public sealed class MountService : IDisposable
             return;
         }
         _client = client;
-        Transport = client.Transport;
     }
 
     /// <summary>
@@ -159,7 +162,7 @@ public sealed class MountService : IDisposable
                 vpnProfile: VpnProfileFor(config),
                 vpnHost: Blank(config.VpnHost),
                 vpnProfileRemote: Blank(config.VpnProfileNas));
-            Transport = client.Transport;
+            _tested = client.Transport;
             // Dispose logs out immediately; reaching here means success.
         });
     }

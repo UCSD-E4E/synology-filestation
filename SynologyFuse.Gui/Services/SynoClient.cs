@@ -66,8 +66,12 @@ public sealed class SynoClient : IDisposable
         return new SynoClient(handle);
     }
 
-    /// <summary>Which leg this connection is using. Settled when it was made.</summary>
-    public SynoTransport Transport => (SynoTransport)syno_transport(_client);
+    /// <summary>Which leg this connection is using <em>now</em>. It changes while
+    /// the connection lives — see <see cref="TransportWatch"/> — and reading it
+    /// never touches the network. <see cref="SynoTransport.Unknown"/> once
+    /// disposed.</summary>
+    public SynoTransport Transport =>
+        _disposed ? SynoTransport.Unknown : (SynoTransport)syno_transport(_client);
 
     // ── Browse ─────────────────────────────────────────────────────────────────
 

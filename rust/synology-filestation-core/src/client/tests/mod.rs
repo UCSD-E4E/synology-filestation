@@ -63,6 +63,7 @@ enum Behave {
     NotFound,        // definitive → propagate, no fallback
     Exists,          // the create-new case: the name is taken
     CannotCreateNew, // capability gap, not a failure
+    Declines,        // cannot serve anything right now: no session yet
 }
 
 struct FakeBackend {
@@ -93,7 +94,7 @@ impl FakeBackend {
             Behave::Transient => Err(SynoFsError::Io("backend down".into())),
             Behave::NotFound => Err(SynoFsError::NotFound),
             Behave::Exists => Err(SynoFsError::AlreadyExists),
-            Behave::CannotCreateNew => Err(SynoFsError::NotSupported),
+            Behave::CannotCreateNew | Behave::Declines => Err(SynoFsError::NotSupported),
         }
     }
     fn outcome_unit(&self) -> Result<(), SynoFsError> {
@@ -140,7 +141,9 @@ impl StreamReadTransport for FakeBackend {
             Behave::Transient => Err(SynoFsError::Io("backend down".into())),
             Behave::NotFound => Err(SynoFsError::NotFound),
             // Write-side behaviours; a read never sees them.
-            Behave::Exists | Behave::CannotCreateNew => Err(SynoFsError::NotSupported),
+            Behave::Exists | Behave::CannotCreateNew | Behave::Declines => {
+                Err(SynoFsError::NotSupported)
+            }
         }
     }
 }
@@ -207,7 +210,7 @@ impl FakeMeta {
             Behave::Transient => Err(SynoFsError::Io("backend down".into())),
             Behave::NotFound => Err(SynoFsError::NotFound),
             Behave::Exists => Err(SynoFsError::AlreadyExists),
-            Behave::CannotCreateNew => Err(SynoFsError::NotSupported),
+            Behave::CannotCreateNew | Behave::Declines => Err(SynoFsError::NotSupported),
         }
     }
 }

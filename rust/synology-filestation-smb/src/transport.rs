@@ -68,6 +68,18 @@ struct ReconnectState {
     /// `reconnect_if_needed` re-sets it on that refusal. Every later operation
     /// then fails on a session that was never actually dead.
     possible: bool,
+    /// Why the server turned the credentials down, once it has.
+    ///
+    /// A dropped link is worth retrying on the next operation; a rejected
+    /// login is not. Every attempt is a real authentication, DSM blocks an
+    /// address after three failures, and that block does not expire — so once
+    /// this is set nothing here builds a session again. A remount is what
+    /// clears it, because that is when the credentials can have changed.
+    refused: std::sync::Mutex<Option<String>>,
+    /// Whether a session has ever been built. Kept here rather than read off
+    /// the session slot so that asking never waits on the lock an operation
+    /// holds.
+    has_session: AtomicBool,
 }
 
 impl Default for ReconnectState {
@@ -75,6 +87,8 @@ impl Default for ReconnectState {
         Self {
             needs: AtomicBool::new(false),
             possible: true,
+            refused: std::sync::Mutex::new(None),
+            has_session: AtomicBool::new(true),
         }
     }
 }
@@ -88,9 +102,45 @@ impl ReconnectState {
     /// HTTP fallback for the rest of the session.
     fn for_supplied_stream(can_redial: bool) -> Self {
         Self {
-            needs: AtomicBool::new(false),
             possible: can_redial,
+            ..Self::default()
         }
+    }
+
+    /// Why the credentials were refused, if they have been.
+    fn refused(&self) -> Option<String> {
+        self.refused
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Remember that the credentials were refused, and say so once.
+    fn refuse(&self, why: String) {
+        tracing::warn!(
+            "SMB: the server refused the login ({why}); not trying again until the \
+             share is reconnected. An AD account needs its domain set."
+        );
+        *self.refused.lock().unwrap_or_else(|e| e.into_inner()) = Some(why);
+    }
+
+    /// For a transport that starts with no session at all.
+    fn without_a_session() -> Self {
+        Self {
+            has_session: AtomicBool::new(false),
+            ..Self::default()
+        }
+    }
+
+    /// A fresh session is in place; nothing is owed.
+    fn settled(&self) {
+        self.has_session.store(true, Ordering::SeqCst);
+        self.needs.store(false, Ordering::SeqCst);
+    }
+
+    /// A session exists and nothing has found it dead.
+    fn is_live(&self) -> bool {
+        self.has_session.load(Ordering::SeqCst) && !self.needs.load(Ordering::SeqCst)
     }
 
     /// Flag for reconnect if `kind` means the link is dead.
@@ -112,14 +162,39 @@ impl ReconnectState {
         if !self.possible || !self.needs.swap(false, Ordering::SeqCst) {
             return Ok(false);
         }
+        if let Some(why) = self.refused() {
+            self.needs.store(true, Ordering::SeqCst);
+            return Err(smb2::Error::Auth { message: why });
+        }
         match reconnect().await {
             Ok(()) => Ok(true),
             Err(e) => {
+                if is_refusal(&e) {
+                    self.refuse(e.to_string());
+                }
                 self.needs.store(true, Ordering::SeqCst);
                 Err(e)
             }
         }
     }
+}
+
+/// Whether building a session failed because the server turned the
+/// credentials down, rather than because the link did.
+fn is_refusal(e: &smb2::Error) -> bool {
+    to_syno_error(e).category() == synology_filestation_core::error::ErrorCategory::PermissionDenied
+}
+
+/// What an operation gets from a transport that has no session to serve it
+/// on: not this backend, not now.
+///
+/// `NotSupported` rather than a transport failure, because nothing failed. A
+/// transport attached before SMB was reachable — or after its login was
+/// refused — is doing exactly what it should by standing aside, and a
+/// failure would trip its breaker and log a warning on every call for an
+/// outcome everyone expected. The caller goes to HTTP either way.
+fn declined() -> SynoFsError {
+    SynoFsError::NotSupported
 }
 
 /// Map a **local** filesystem error to a *definitive* [`SynoFsError`] (never
@@ -158,13 +233,13 @@ pub type BoxedStream = Box<dyn SmbStream>;
 pub type RedialFuture =
     Pin<Box<dyn Future<Output = Result<BoxedStream, SynoFsError>> + Send + 'static>>;
 
-/// How to reopen the stream this transport runs on, and what to authenticate
-/// on the new one. The config is kept because rebuilding the session needs the
-/// same credentials and server name the first one used.
+/// How to reopen the stream this transport runs on. What to authenticate on
+/// the new one is the transport's own config, which follows the session: a
+/// transport handed a session on another leg names that leg's server from
+/// then on.
 #[derive(Clone)]
 struct Redialer {
     open: Arc<dyn Fn() -> RedialFuture + Send + Sync>,
-    cfg: SmbConfig,
 }
 
 /// Negotiate and authenticate an SMB session on `stream`.
@@ -216,8 +291,19 @@ where
 /// only re-flag what is already flagged. What it does buy is the reason —
 /// "reopening the stream: …" says the tunnel would not come back, where a
 /// bare `Disconnected` said only that the old one had gone.
+///
+/// Except for a refused login, which stays one. Folded into `Io` it looked
+/// like every other failure to reopen, and was retried on the next operation
+/// like one — against an appliance that blocks an address for good after
+/// three.
 fn redial_failed(e: SynoFsError) -> smb2::Error {
-    smb2::Error::Io(std::io::Error::other(format!("reopening the stream: {e}")))
+    let message = format!("reopening the stream: {e}");
+    match e.category() {
+        synology_filestation_core::error::ErrorCategory::PermissionDenied => {
+            smb2::Error::Auth { message }
+        }
+        _ => smb2::Error::Io(std::io::Error::other(message)),
+    }
 }
 
 /// Connection parameters for [`SmbTransport::connect`].
@@ -292,6 +378,43 @@ impl SmbConfig {
         cfg
     }
 
+    /// The config for an account, as [`auto_connect_as`] would build it:
+    /// [`from_login`](Self::from_login), then the domain the caller chose,
+    /// then the deploy overrides in the environment (see [`auto_connect`]).
+    ///
+    /// For a caller that builds its transport itself — one attached before
+    /// SMB is reachable, say — and wants it authenticated exactly as the
+    /// automatic path would authenticate it.
+    ///
+    /// An explicit domain wins over `SYNOLOGY_FS_SMB_DOMAIN`, which wins over
+    /// the one parsed from the username. `Some("")` is an explicit answer, not
+    /// an absent one: an empty domain is how a local DSM user is named, so it
+    /// has to be able to override the environment back to none.
+    pub fn for_account(host: &str, username: &str, password: &str, domain: Option<&str>) -> Self {
+        let mut cfg = SmbConfig::from_login(host, username, password);
+        match domain {
+            Some(domain) => cfg.domain = domain.to_string(),
+            None => {
+                if let Ok(domain) = std::env::var("SYNOLOGY_FS_SMB_DOMAIN") {
+                    cfg.domain = domain;
+                }
+            }
+        }
+        if let Some(port) = std::env::var("SYNOLOGY_FS_SMB_PORT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+        {
+            cfg.port = port;
+        }
+        cfg.timeout = Duration::from_millis(
+            std::env::var("SYNOLOGY_FS_SMB_TIMEOUT_MS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(2000),
+        );
+        cfg
+    }
+
     /// The address this config names, port included.
     ///
     /// Public because a caller writing a redial closure for
@@ -340,30 +463,7 @@ pub async fn auto_connect_as(
     if std::env::var_os("SYNOLOGY_FS_SMB_DISABLE").is_some() {
         return None;
     }
-    let mut cfg = SmbConfig::from_login(host, username, password);
-    // `Some("")` is an explicit answer, not an absent one: an empty domain is
-    // how a local DSM user is named, so it has to be able to override an
-    // environment variable back to none.
-    match domain {
-        Some(domain) => cfg.domain = domain.to_string(),
-        None => {
-            if let Ok(domain) = std::env::var("SYNOLOGY_FS_SMB_DOMAIN") {
-                cfg.domain = domain;
-            }
-        }
-    }
-    if let Some(port) = std::env::var("SYNOLOGY_FS_SMB_PORT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-    {
-        cfg.port = port;
-    }
-    cfg.timeout = Duration::from_millis(
-        std::env::var("SYNOLOGY_FS_SMB_TIMEOUT_MS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(2000),
-    );
+    let cfg = SmbConfig::for_account(host, username, password, domain);
 
     match SmbTransport::connect(&cfg).await {
         Ok(transport) => {
@@ -434,14 +534,29 @@ pub struct FileMeta {
 }
 
 struct Inner {
-    client: SmbClient,
+    /// `None` until a session has been handed over, for a transport attached
+    /// before SMB could be reached. See [`SmbTransport::unconnected`].
+    client: Option<SmbClient>,
     /// One attached `Tree` per share name, connected lazily on first use.
     trees: HashMap<String, Tree>,
+}
+
+impl Inner {
+    fn with(client: SmbClient) -> Self {
+        Self {
+            client: Some(client),
+            trees: HashMap::new(),
+        }
+    }
 }
 
 /// An authenticated SMB connection that reads NAS files.
 pub struct SmbTransport {
     inner: Arc<Mutex<Inner>>,
+    /// What the session is authenticated with and which server it names.
+    /// Follows the session: [`adopt`](Self::adopt) on another leg updates the
+    /// host, and a later redial rebuilds on the host the session is on.
+    cfg: Arc<std::sync::Mutex<SmbConfig>>,
     /// Open read handles, so a block read is one round trip rather than a
     /// CREATE, a READ and a CLOSE. See [`crate::handles`].
     handles: Arc<HandleCache<FileReader>>,
@@ -471,16 +586,160 @@ impl SmbTransport {
         })
         .await
         .map_err(|e| to_syno_error(&e))?;
-        Ok(Self {
-            inner: Arc::new(Mutex::new(Inner {
-                client,
+        // This one dialled its own address, so `SmbClient` can redial it.
+        Ok(Self::built(
+            Inner::with(client),
+            cfg,
+            ReconnectState::default(),
+            None,
+        ))
+    }
+
+    /// A transport with no session yet, for a mount that came up while SMB
+    /// could not be reached.
+    ///
+    /// Attached anyway, so that there is somewhere for a session to go once
+    /// SMB answers: the client's transport list is fixed when it is built, and
+    /// a mount attached with HTTP alone stayed on HTTP until it was remounted.
+    /// Until [`adopt`](Self::adopt) hands it one, every operation is declined
+    /// at once — no dial, no wait — so the call goes on to HTTP exactly as if
+    /// nothing were attached.
+    ///
+    /// It never dials on its own. Deciding *when* SMB is worth trying again
+    /// belongs to whoever watches the legs, not to whichever file operation
+    /// happened to arrive; one that did would hold the transport's lock
+    /// through a probe, or through raising a tunnel.
+    ///
+    /// `reopen` is what [`over_with_redial`](Self::over_with_redial) takes,
+    /// and serves the same purpose once a session exists.
+    pub fn unconnected<F>(cfg: &SmbConfig, reopen: F) -> Self
+    where
+        F: Fn() -> RedialFuture + Send + Sync + 'static,
+    {
+        Self::built(
+            Inner {
+                client: None,
                 trees: HashMap::new(),
-            })),
+            },
+            cfg,
+            ReconnectState::without_a_session(),
+            Some(Redialer {
+                open: Arc::new(reopen),
+            }),
+        )
+    }
+
+    fn built(
+        inner: Inner,
+        cfg: &SmbConfig,
+        reconnect: ReconnectState,
+        redial: Option<Redialer>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(inner)),
+            cfg: Arc::new(std::sync::Mutex::new(cfg.clone())),
             handles: Arc::new(HandleCache::new(MAX_CACHED_HANDLES)),
-            reconnect: Arc::new(ReconnectState::default()),
-            // This one dialled its own address, so `SmbClient` can redial it.
-            redial: None,
-        })
+            reconnect: Arc::new(reconnect),
+            redial,
+        }
+    }
+
+    /// Another handle on this same transport — the same session, lock and
+    /// caches. For a write handle, which has to reach the session the
+    /// transport is on *now*, not the one it was opened on.
+    fn alias(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            cfg: Arc::clone(&self.cfg),
+            handles: Arc::clone(&self.handles),
+            reconnect: Arc::clone(&self.reconnect),
+            redial: self.redial.clone(),
+        }
+    }
+
+    fn config(&self) -> SmbConfig {
+        self.cfg.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Whether there is a session that operations can use: one has been
+    /// built, and nothing has found it dead since.
+    ///
+    /// Cheap, and never touches the network — it is what a status badge
+    /// reads.
+    pub fn is_connected(&self) -> bool {
+        self.reconnect.is_live()
+    }
+
+    /// How long a caller dialling this transport's server should wait for it:
+    /// the config's `timeout`, which [`SmbConfig::for_account`] takes from
+    /// `SYNOLOGY_FS_SMB_TIMEOUT_MS`. A transport handed its streams does no
+    /// dialling of its own, so whoever dials for it needs the number.
+    pub fn dial_patience(&self) -> Duration {
+        self.cfg.lock().unwrap_or_else(|e| e.into_inner()).timeout
+    }
+
+    /// Why the server refused the login, if it has. Once it has, this
+    /// transport builds no session again: see [`adopt`](Self::adopt).
+    pub fn refused(&self) -> Option<String> {
+        self.reconnect.refused()
+    }
+
+    /// Build a session on `stream` and make it the one every later operation
+    /// uses.
+    ///
+    /// How a transport attached without one gets its first, and how a mount
+    /// moves to a better leg: `host` names the server on that leg, which from
+    /// the tunnel is an address inside it and from campus is the public name.
+    ///
+    /// The new session is negotiated and authenticated before anything is
+    /// locked, so operations carry on over the old one — or decline, if there
+    /// is none — while the handshake runs. Then the swap:
+    ///
+    /// * Cached read handles are closed on the session they were opened on.
+    /// * A write handle that is open keeps its writer, and finishes on the
+    ///   session it started on: a transfer is not torn between two. Its next
+    ///   reopen, if it needs one, lands on the new session.
+    /// * The old session goes when the last thing using it lets go of it.
+    ///
+    /// A **refused login is final.** It is remembered, and every later call
+    /// returns `PermissionDenied` without touching the stream. The appliance
+    /// blocks an address after three failures and the block never expires,
+    /// so a caller asking again on a timer — which is how this is called —
+    /// would turn one typo into a lockout.
+    pub async fn adopt<S>(&self, stream: S, host: &str) -> Result<(), SynoFsError>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static,
+    {
+        if let Some(why) = self.reconnect.refused() {
+            tracing::debug!("SMB: not building a session; the login was refused ({why})");
+            return Err(SynoFsError::PermissionDenied);
+        }
+        let mut cfg = self.config();
+        cfg.host = host.to_string();
+        let fresh = match client_over(stream, &cfg).await {
+            Ok(client) => client,
+            Err(e) => {
+                if e.category() == synology_filestation_core::error::ErrorCategory::PermissionDenied
+                {
+                    self.reconnect.refuse(format!("{e} at {host}"));
+                }
+                return Err(e);
+            }
+        };
+
+        let (stale, _previous) = {
+            let mut inner = self.inner.lock().await;
+            let previous = inner.client.replace(fresh);
+            // The trees belonged to the old session, and so did the handles.
+            inner.trees.clear();
+            *self.cfg.lock().unwrap_or_else(|e| e.into_inner()) = cfg;
+            self.reconnect.settled();
+            (self.handles.clear(), previous)
+        };
+        // Outside the lock: closing is a round trip on the old session, and
+        // the new one has operations to get on with.
+        self.close_handles(stale).await;
+        Ok(())
     }
 
     /// Connect + authenticate over a stream the caller opened.
@@ -546,7 +805,6 @@ impl SmbTransport {
     {
         let redialer = Redialer {
             open: Arc::new(reopen),
-            cfg: cfg.clone(),
         };
         Self::over_stream(stream, cfg, Some(redialer)).await
     }
@@ -571,17 +829,10 @@ impl SmbTransport {
 
         let client = client_over(stream, cfg).await?;
 
-        Ok(Self {
-            inner: Arc::new(Mutex::new(Inner {
-                client,
-                trees: HashMap::new(),
-            })),
-            handles: Arc::new(HandleCache::new(MAX_CACHED_HANDLES)),
-            // Only a caller that can reopen the stream makes recovery
-            // possible; without one, nothing here will pretend it might.
-            reconnect: Arc::new(ReconnectState::for_supplied_stream(redial.is_some())),
-            redial,
-        })
+        // Only a caller that can reopen the stream makes recovery possible;
+        // without one, nothing here will pretend it might.
+        let reconnect = ReconnectState::for_supplied_stream(redial.is_some());
+        Ok(Self::built(Inner::with(client), cfg, reconnect, redial))
     }
 
     /// Map an `smb2::Error`, flagging the connection for reconnect when the
@@ -599,17 +850,24 @@ impl SmbTransport {
         }
     }
 
-    /// Reconnect if a prior operation flagged the SMB link dead, then attach the
-    /// share. This is what lets a long-lived mount recover after a network flap:
-    /// once the network is back, the next operation (e.g. a circuit-breaker
+    /// The session to run an operation on, reconnecting first if a prior
+    /// operation flagged the link dead.
+    ///
+    /// This is what lets a long-lived mount recover after a network flap: once
+    /// the network is back, the next operation (e.g. a circuit-breaker
     /// half-open probe) rebuilds the session here and succeeds, closing the
     /// breaker — instead of degrading to HTTP for the rest of the session.
-    async fn ensure_ready(
+    ///
+    /// Declines when there is nothing to run on: no session has been handed
+    /// over yet, or the login was refused and none will be.
+    async fn session<'a>(
         &self,
-        client: &mut SmbClient,
+        client: &'a mut Option<SmbClient>,
         trees: &mut HashMap<String, Tree>,
-        share: &str,
-    ) -> Result<(), SynoFsError> {
+    ) -> Result<&'a mut SmbClient, SynoFsError> {
+        let Some(live) = client.as_mut() else {
+            return Err(declined());
+        };
         // Two ways back, depending on who owns the link. A transport that
         // dialled its own address lets `SmbClient` redial it; one running on a
         // supplied stream asks the caller for a new stream and rebuilds the
@@ -617,34 +875,52 @@ impl SmbTransport {
         // reachable only from inside that tunnel.
         let reconnected = match &self.redial {
             Some(redialer) => {
-                let redialer = redialer.clone();
+                let open = Arc::clone(&redialer.open);
+                let cfg = self.config();
                 // Reborrowed, so the session slot is only lent to the redial
                 // for as long as the redial runs.
-                let slot = &mut *client;
+                let slot = &mut *live;
                 self.reconnect
                     .reconnect_if_needed(move || async move {
-                        let stream = (redialer.open)().await.map_err(redial_failed)?;
-                        *slot = client_over(stream, &redialer.cfg)
-                            .await
-                            .map_err(redial_failed)?;
+                        let stream = open().await.map_err(redial_failed)?;
+                        *slot = client_over(stream, &cfg).await.map_err(redial_failed)?;
                         Ok(())
                     })
                     .await
             }
             None => {
                 self.reconnect
-                    .reconnect_if_needed(|| client.reconnect())
+                    .reconnect_if_needed(|| live.reconnect())
                     .await
             }
+        };
+        match reconnected {
+            Ok(true) => {
+                // The cached trees belonged to the dead session, and so did
+                // every open file handle on it. Dropping rather than closing
+                // them is right here: the session they belonged to is gone,
+                // so there is nothing left to close them against.
+                trees.clear();
+                drop(self.handles.clear());
+            }
+            Ok(false) => {}
+            // Refused: this operation, and every one after it, goes to HTTP.
+            // A `PermissionDenied` here would reach the caller as "you may not
+            // read this file", which is not what happened.
+            Err(_) if self.reconnect.refused().is_some() => return Err(declined()),
+            Err(e) => return Err(self.mark_and_map(&e)),
         }
-        .map_err(|e| self.mark_and_map(&e))?;
-        if reconnected {
-            trees.clear(); // the cached trees belonged to the dead session
-                           // and so did every open file handle on it. Dropping rather than
-                           // closing them is right here: the session they belonged to is
-                           // gone, so there is nothing left to close them against.
-            drop(self.handles.clear());
-        }
+        Ok(live)
+    }
+
+    /// The session and the attached share an operation on `share` runs on.
+    async fn ready<'a>(
+        &self,
+        inner: &'a mut Inner,
+        share: &str,
+    ) -> Result<(&'a mut SmbClient, &'a mut Tree), SynoFsError> {
+        let Inner { client, trees } = inner;
+        let client = self.session(client, trees).await?;
         if !trees.contains_key(share) {
             let tree = client
                 .connect_share(share)
@@ -652,7 +928,8 @@ impl SmbTransport {
                 .map_err(|e| self.mark_and_map(&e))?;
             trees.insert(share.to_string(), tree);
         }
-        Ok(())
+        let tree = trees.get_mut(share).expect("tree just ensured");
+        Ok((client, tree))
     }
 
     /// Commit a fully-written temp file onto `target` with an **old-or-new**
@@ -700,9 +977,7 @@ impl SmbTransport {
     pub async fn stat(&self, logical: &str) -> Result<FileMeta, SynoFsError> {
         let loc = SmbPath::from_logical(logical)?;
         let mut guard = self.inner.lock().await;
-        let Inner { client, trees } = &mut *guard;
-        self.ensure_ready(client, trees, &loc.share).await?;
-        let tree = trees.get_mut(&loc.share).expect("tree just ensured");
+        let (client, tree) = self.ready(&mut guard, &loc.share).await?;
         let info = client
             .stat(tree, &loc.path)
             .await
@@ -734,9 +1009,8 @@ impl SmbTransport {
 
         let (conn, tree) = {
             let mut guard = self.inner.lock().await;
-            let Inner { client, trees } = &mut *guard;
-            self.ensure_ready(client, trees, &loc.share).await?;
-            let tree = trees.get(&loc.share).expect("tree just ensured").clone();
+            let (client, tree) = self.ready(&mut guard, &loc.share).await?;
+            let tree = tree.clone();
             (client.connection_mut().clone(), tree)
         };
 
@@ -823,9 +1097,7 @@ impl SmbTransport {
         self.forget_handles_under(logical).await;
         let loc = SmbPath::from_logical(logical)?;
         let mut guard = self.inner.lock().await;
-        let Inner { client, trees } = &mut *guard;
-        self.ensure_ready(client, trees, &loc.share).await?;
-        let tree = trees.get_mut(&loc.share).expect("tree just ensured");
+        let (client, tree) = self.ready(&mut guard, &loc.share).await?;
         client
             .delete_file(tree, &loc.path)
             .await
@@ -837,9 +1109,7 @@ impl SmbTransport {
     pub async fn read_full(&self, logical: &str) -> Result<Bytes, SynoFsError> {
         let loc = SmbPath::from_logical(logical)?;
         let mut guard = self.inner.lock().await;
-        let Inner { client, trees } = &mut *guard;
-        self.ensure_ready(client, trees, &loc.share).await?;
-        let tree = trees.get_mut(&loc.share).expect("tree just ensured");
+        let (client, tree) = self.ready(&mut guard, &loc.share).await?;
         let data = client
             .read_file_pipelined(tree, &loc.path)
             .await
@@ -861,17 +1131,13 @@ impl SmbTransport {
 
         let result: Result<(), SynoFsError> = async {
             let mut guard = self.inner.lock().await;
-            let Inner { client, trees } = &mut *guard;
-            self.ensure_ready(client, trees, &loc.share).await?;
+            let (client, tree) = self.ready(&mut guard, &loc.share).await?;
 
             // Streaming download handle (owned; retains no borrow of client).
-            let mut download = {
-                let tree = trees.get(&loc.share).expect("tree just ensured");
-                client
-                    .download(tree, &loc.path)
-                    .await
-                    .map_err(|e| self.mark_and_map(&e))?
-            };
+            let mut download = client
+                .download(tree, &loc.path)
+                .await
+                .map_err(|e| self.mark_and_map(&e))?;
 
             // Pump SMB → local temp in bounded chunks (constant memory).
             let mut file = tokio::fs::File::create(&tmp)
@@ -923,9 +1189,7 @@ impl SmbTransport {
         let tmp = part_name(&loc.path, seq);
 
         let mut guard = self.inner.lock().await;
-        let Inner { client, trees } = &mut *guard;
-        self.ensure_ready(client, trees, &loc.share).await?;
-        let tree = trees.get_mut(&loc.share).expect("tree just ensured");
+        let (client, tree) = self.ready(&mut guard, &loc.share).await?;
 
         // New contents → temp file adjacent to the target (pipelined, so files
         // past the server's MaxWriteSize go in chunks).
@@ -964,18 +1228,14 @@ impl SmbTransport {
             .map_err(|e| local_fs_error(&format!("open {}", local.display()), &e))?;
 
         let mut guard = self.inner.lock().await;
-        let Inner { client, trees } = &mut *guard;
-        self.ensure_ready(client, trees, &loc.share).await?;
+        let (client, tree) = self.ready(&mut guard, &loc.share).await?;
 
         // Exclusive create: an existing name comes back as
         // STATUS_OBJECT_NAME_COLLISION, which maps to AlreadyExists — the
         // caller's cue that this is an answer, not a transport failure.
-        let mut writer = {
-            let tree = trees.get(&loc.share).expect("tree just ensured");
-            match client.create_file_writer_exclusive(tree, &loc.path).await {
-                Ok(w) => w,
-                Err(e) => return Err(self.mark_and_map(&e)),
-            }
+        let mut writer = match client.create_file_writer_exclusive(tree, &loc.path).await {
+            Ok(w) => w,
+            Err(e) => return Err(self.mark_and_map(&e)),
         };
 
         let mut buf = vec![0u8; 1 << 20];
@@ -1003,7 +1263,6 @@ impl SmbTransport {
             // We created this name, so removing it is ours to do — leaving a
             // truncated file where the caller asked for a whole one is worse
             // than leaving nothing.
-            let tree = trees.get_mut(&loc.share).expect("tree just ensured");
             self.note_cleanup(client.delete_file(tree, &loc.path).await);
             return Err(e);
         }
@@ -1021,16 +1280,12 @@ impl SmbTransport {
             .map_err(|e| local_fs_error(&format!("open {}", local.display()), &e))?;
 
         let mut guard = self.inner.lock().await;
-        let Inner { client, trees } = &mut *guard;
-        self.ensure_ready(client, trees, &loc.share).await?;
+        let (client, tree) = self.ready(&mut guard, &loc.share).await?;
 
         // Streaming writer to the temp file (owned; retains no borrow of client).
-        let mut writer = {
-            let tree = trees.get(&loc.share).expect("tree just ensured");
-            match client.create_file_writer(tree, &tmp).await {
-                Ok(w) => w,
-                Err(e) => return Err(self.mark_and_map(&e)),
-            }
+        let mut writer = match client.create_file_writer(tree, &tmp).await {
+            Ok(w) => w,
+            Err(e) => return Err(self.mark_and_map(&e)),
         };
 
         // Pump disk → SMB in bounded chunks (constant memory, ~1 MiB).
@@ -1058,12 +1313,10 @@ impl SmbTransport {
         }
 
         if let Some(e) = stream_err {
-            let tree = trees.get_mut(&loc.share).expect("tree just ensured");
             self.note_cleanup(client.delete_file(tree, &tmp).await); // best-effort cleanup
             return Err(e);
         }
 
-        let tree = trees.get_mut(&loc.share).expect("tree just ensured");
         self.commit_temp(client, tree, &tmp, &loc.path, seq).await
     }
 }
@@ -1225,6 +1478,127 @@ mod tests {
         assert!(!ran);
     }
 
+    // ── A login that was refused ──────────────────────────────────────────────
+
+    /// A refused login is not a network blip. Every attempt is a real
+    /// authentication, DSM blocks an address after three failures, and the
+    /// block does not expire — so the reconnect that retries a dropped link on
+    /// the next operation must not retry a rejected password on it. An AD
+    /// account whose domain was never set is exactly this, every time.
+    #[tokio::test]
+    async fn a_refused_login_is_not_tried_again() {
+        let state = ReconnectState::default();
+        state.flag_if_lost(smb2::ErrorKind::ConnectionLost);
+
+        let first = state
+            .reconnect_if_needed(|| async {
+                Err(smb2::Error::Auth {
+                    message: "logon failure".into(),
+                })
+            })
+            .await;
+        assert!(first.is_err());
+        assert!(state.refused().is_some(), "and it is remembered");
+
+        let second = state
+            .reconnect_if_needed(|| async { panic!("asked again after a refusal") })
+            .await;
+        assert!(second.is_err(), "still refused, without asking");
+    }
+
+    #[tokio::test]
+    async fn a_dropped_link_is_still_retried() {
+        // The other half: only a refusal is final.
+        let state = ReconnectState::default();
+        state.flag_if_lost(smb2::ErrorKind::ConnectionLost);
+        let _ = state
+            .reconnect_if_needed(|| async { Err(smb2::Error::Disconnected) })
+            .await;
+
+        assert!(state.refused().is_none());
+        assert!(state
+            .reconnect_if_needed(|| async { Ok(()) })
+            .await
+            .unwrap());
+    }
+
+    #[test]
+    fn a_redial_that_was_refused_still_says_so() {
+        // The redial carries its failure back as an `smb2::Error`. Folding a
+        // rejected password into `Io` there hid the one failure that must not
+        // be retried behind the kind that always is.
+        assert!(is_refusal(&redial_failed(SynoFsError::PermissionDenied)));
+        assert!(!is_refusal(&redial_failed(SynoFsError::Io(
+            "no route".into()
+        ))));
+    }
+
+    // ── A transport with no session yet ───────────────────────────────────────
+
+    fn a_config() -> SmbConfig {
+        SmbConfig::new("nas.example", "user", "hunter2")
+    }
+
+    fn never_redialled() -> impl Fn() -> RedialFuture + Send + Sync + 'static {
+        || Box::pin(async { panic!("a transport with no session dialled on its own") })
+    }
+
+    /// Attached when SMB is unreachable at connect, so there is somewhere for
+    /// a session to go once it is. Until then it has to be free: every
+    /// operation on the mount passes through it on the way to HTTP, so it
+    /// declines at once rather than dialling, waiting or failing — a failure
+    /// would trip its breaker and log a warning per call for an outcome
+    /// everyone expected.
+    #[tokio::test]
+    async fn a_transport_with_no_session_declines_and_dials_nothing() {
+        let smb = SmbTransport::unconnected(&a_config(), never_redialled());
+        assert!(!smb.is_connected());
+
+        let local = std::env::temp_dir().join("smb-unconnected-test");
+        let outcomes: Vec<(&str, Result<(), SynoFsError>)> = vec![
+            (
+                "read",
+                ReadTransport::read(&smb, "/share/f", 0, 10)
+                    .await
+                    .map(|_| ()),
+            ),
+            ("read whole", smb.read_full("/share/f").await.map(|_| ())),
+            ("read to path", smb.read_to_path("/share/f", &local).await),
+            ("write", smb.write_atomic("/share/f", b"x").await),
+            (
+                "list",
+                MetadataTransport::list_dir(&smb, "/share")
+                    .await
+                    .map(|_| ()),
+            ),
+            (
+                "shares",
+                MetadataTransport::list_shares(&smb).await.map(|_| ()),
+            ),
+            (
+                "info",
+                MetadataTransport::get_info(&smb, "/share/f")
+                    .await
+                    .map(|_| ()),
+            ),
+            (
+                "open for writing",
+                smb.open_write("/share/f", WriteOpen::CreateNew)
+                    .await
+                    .map(|_| ()),
+            ),
+        ];
+
+        for (what, outcome) in outcomes {
+            let e = outcome.expect_err(what);
+            assert_eq!(
+                e.category(),
+                synology_filestation_core::error::ErrorCategory::NotSupported,
+                "{what}: {e:?}"
+            );
+        }
+    }
+
     #[test]
     fn part_name_is_adjacent_and_unique_per_seq() {
         let pid = std::process::id();
@@ -1336,16 +1710,10 @@ impl MetadataTransport for SmbTransport {
     async fn list_shares(&self) -> Result<Vec<SynoFileInfo>, SynoFsError> {
         let mut guard = self.inner.lock().await;
         let Inner { client, trees } = &mut *guard;
-        // No share to attach for an enumeration, so reconnect handling is done
-        // by hand rather than through `ensure_ready`.
-        if self
-            .reconnect
-            .reconnect_if_needed(|| client.reconnect())
-            .await
-            .map_err(|e| self.mark_and_map(&e))?
-        {
-            trees.clear();
-        }
+        // No share to attach for an enumeration, so only the session. This
+        // used to call `SmbClient::reconnect` directly, which a transport on a
+        // supplied stream cannot do: the enumeration alone bypassed the redial.
+        let client = self.session(client, trees).await?;
         let shares = client
             .list_shares()
             .await
@@ -1363,9 +1731,7 @@ impl MetadataTransport for SmbTransport {
     async fn list_dir(&self, folder_path: &str) -> Result<Vec<SynoFileInfo>, SynoFsError> {
         let loc = SmbPath::from_logical(folder_path)?;
         let mut guard = self.inner.lock().await;
-        let Inner { client, trees } = &mut *guard;
-        self.ensure_ready(client, trees, &loc.share).await?;
-        let tree = trees.get_mut(&loc.share).expect("tree just ensured");
+        let (client, tree) = self.ready(&mut guard, &loc.share).await?;
         let entries = client
             .list_directory(tree, &loc.path)
             .await
@@ -1395,9 +1761,7 @@ impl MetadataTransport for SmbTransport {
     async fn get_info(&self, path: &str) -> Result<SynoFileInfo, SynoFsError> {
         let loc = SmbPath::from_logical(path)?;
         let mut guard = self.inner.lock().await;
-        let Inner { client, trees } = &mut *guard;
-        self.ensure_ready(client, trees, &loc.share).await?;
-        let tree = trees.get_mut(&loc.share).expect("tree just ensured");
+        let (client, tree) = self.ready(&mut guard, &loc.share).await?;
         let info = client
             .stat(tree, &loc.path)
             .await
@@ -1421,9 +1785,7 @@ impl MetadataTransport for SmbTransport {
         let full = format!("{}/{}", parent.trim_end_matches('/'), name);
         let loc = SmbPath::from_logical(&full)?;
         let mut guard = self.inner.lock().await;
-        let Inner { client, trees } = &mut *guard;
-        self.ensure_ready(client, trees, &loc.share).await?;
-        let tree = trees.get_mut(&loc.share).expect("tree just ensured");
+        let (client, tree) = self.ready(&mut guard, &loc.share).await?;
         client
             .create_directory(tree, &loc.path)
             .await
@@ -1445,9 +1807,7 @@ impl MetadataTransport for SmbTransport {
         }
 
         let mut guard = self.inner.lock().await;
-        let Inner { client, trees } = &mut *guard;
-        self.ensure_ready(client, trees, &from.share).await?;
-        let tree = trees.get_mut(&from.share).expect("tree just ensured");
+        let (client, tree) = self.ready(&mut guard, &from.share).await?;
         client
             .rename(tree, &from.path, &to.path)
             .await
@@ -1470,9 +1830,7 @@ impl MetadataTransport for SmbTransport {
     async fn delete(&self, path: &str) -> Result<(), SynoFsError> {
         let loc = SmbPath::from_logical(path)?;
         let mut guard = self.inner.lock().await;
-        let Inner { client, trees } = &mut *guard;
-        self.ensure_ready(client, trees, &loc.share).await?;
-        let tree = trees.get_mut(&loc.share).expect("tree just ensured");
+        let (client, tree) = self.ready(&mut guard, &loc.share).await?;
         // SMB deletes files and directories through different calls, so ask
         // first. FileStation's delete takes either.
         let info = client
@@ -1491,9 +1849,7 @@ impl MetadataTransport for SmbTransport {
         self.forget_handle(path).await;
         let loc = SmbPath::from_logical(path)?;
         let mut guard = self.inner.lock().await;
-        let Inner { client, trees } = &mut *guard;
-        self.ensure_ready(client, trees, &loc.share).await?;
-        let tree = trees.get_mut(&loc.share).expect("tree just ensured");
+        let (client, tree) = self.ready(&mut guard, &loc.share).await?;
         // SET_INFO with FileEndOfFileInformation: the file's length is a
         // number the server sets, so the bytes past it are never read and
         // never rewritten — regardless of how many there are.
@@ -1557,8 +1913,10 @@ mod metadata_tests {
 /// writer and opens another at the offset asked for, which is a reopen a
 /// sequential copy never pays.
 pub struct SmbWriteHandle {
-    inner: Arc<Mutex<Inner>>,
-    reconnect: Arc<ReconnectState>,
+    /// The transport it was opened on, for the session it is on *now*: a
+    /// writer is reopened on whatever session the transport has, which after
+    /// a move to a better leg is not the one this handle started on.
+    transport: SmbTransport,
     loc: SmbPath,
     writer: Option<smb2::FileWriter>,
     /// Where the open writer will put the next chunk.
@@ -1574,14 +1932,13 @@ impl SmbWriteHandle {
     /// caller only meant to patch.
     async fn reopen_at(&mut self, offset: u64) -> Result<(), SynoFsError> {
         self.finish_writer().await?;
-        let mut guard = self.inner.lock().await;
-        let Inner { client, trees } = &mut *guard;
-        ensure_share(client, trees, &self.reconnect, &self.loc.share).await?;
-        let tree = trees.get(&self.loc.share).expect("share just ensured");
+        let transport = &self.transport;
+        let mut guard = transport.inner.lock().await;
+        let (client, tree) = transport.ready(&mut guard, &self.loc.share).await?;
         let writer = client
             .create_file_writer_at(tree, &self.loc.path, offset)
             .await
-            .map_err(|e| map_smb_error(&self.reconnect, &e))?;
+            .map_err(|e| transport.mark_and_map(&e))?;
         self.writer = Some(writer);
         self.next = offset;
         Ok(())
@@ -1596,7 +1953,7 @@ impl SmbWriteHandle {
                 .finish()
                 .await
                 .map(|_| ())
-                .map_err(|e| map_smb_error(&self.reconnect, &e)),
+                .map_err(|e| self.transport.mark_and_map(&e)),
             None => Ok(()),
         }
     }
@@ -1612,7 +1969,7 @@ impl WriteHandle for SmbWriteHandle {
         writer
             .write_chunk(data)
             .await
-            .map_err(|e| map_smb_error(&self.reconnect, &e))?;
+            .map_err(|e| self.transport.mark_and_map(&e))?;
         self.next = offset + data.len() as u64;
         Ok(())
     }
@@ -1639,8 +1996,7 @@ impl OpenWriteTransport for SmbTransport {
         self.forget_handle(path).await;
         let loc = SmbPath::from_logical(path)?;
         let mut handle = SmbWriteHandle {
-            inner: Arc::clone(&self.inner),
-            reconnect: Arc::clone(&self.reconnect),
+            transport: self.alias(),
             loc: loc.clone(),
             writer: None,
             next: 0,
@@ -1652,9 +2008,7 @@ impl OpenWriteTransport for SmbTransport {
             // than from the first write.
             WriteOpen::CreateNew => {
                 let mut guard = self.inner.lock().await;
-                let Inner { client, trees } = &mut *guard;
-                self.ensure_ready(client, trees, &loc.share).await?;
-                let tree = trees.get(&loc.share).expect("tree just ensured");
+                let (client, tree) = self.ready(&mut guard, &loc.share).await?;
                 let writer = client
                     .create_file_writer_exclusive(tree, &loc.path)
                     .await
@@ -1677,37 +2031,6 @@ impl OpenWriteTransport for SmbTransport {
 /// their own offset and the writer's is set when it opens.
 fn needs_reopen(has_writer: bool, next_offset: u64, write_offset: u64) -> bool {
     !has_writer || write_offset != next_offset
-}
-
-/// `SmbTransport::ensure_ready` without a `&self`, for the write handle — which
-/// owns the pieces rather than the transport.
-async fn ensure_share(
-    client: &mut SmbClient,
-    trees: &mut HashMap<String, Tree>,
-    reconnect: &ReconnectState,
-    share: &str,
-) -> Result<(), SynoFsError> {
-    if reconnect
-        .reconnect_if_needed(|| client.reconnect())
-        .await
-        .map_err(|e| map_smb_error(reconnect, &e))?
-    {
-        trees.clear();
-    }
-    if !trees.contains_key(share) {
-        let tree = client
-            .connect_share(share)
-            .await
-            .map_err(|e| map_smb_error(reconnect, &e))?;
-        trees.insert(share.to_string(), tree);
-    }
-    Ok(())
-}
-
-/// `SmbTransport::mark_and_map` without a `&self`, for the same reason.
-fn map_smb_error(reconnect: &ReconnectState, e: &smb2::Error) -> SynoFsError {
-    reconnect.flag_if_lost(e.kind());
-    to_syno_error(e)
 }
 
 #[cfg(test)]

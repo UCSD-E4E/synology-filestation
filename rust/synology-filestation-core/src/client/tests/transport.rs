@@ -128,3 +128,81 @@ async fn upload_overwrite_false_bypasses_write_backend() {
         "overwrite=false must skip the replacing write backend"
     );
 }
+
+// ── a backend that declines ──────────────────────────────────────────────
+//
+// `NotSupported` means "not this one, ask the next", and the metadata and
+// open-write paths have always read it that way. The byte paths did not: they
+// handed it to the caller as a definitive answer. That was harmless while no
+// backend ever declined a read, but an SMB transport attached before it has a
+// session — so that it can be given one later, when SMB becomes reachable —
+// declines everything until then, and every read on such a mount would fail
+// rather than go over HTTP.
+
+/// An HTTP server that serves one download body.
+async fn http_serving(body: &'static [u8]) -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/webapi/entry.cgi"))
+        .and(query_param("method", "download"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body.to_vec()))
+        .mount(&server)
+        .await;
+    server
+}
+
+#[tokio::test]
+async fn download_passes_over_a_backend_that_declines() {
+    let server = http_serving(b"from-http").await;
+    let backend = FakeBackend::new(Behave::Declines);
+    let client = client_for(&server).with_read_transport(backend.clone());
+
+    for _ in 0..3 {
+        assert_eq!(
+            client.download("/share/f", 0, 0).await.unwrap().as_ref(),
+            b"from-http"
+        );
+    }
+    assert_eq!(
+        backend.call_count(),
+        3,
+        "declining is an answer, not a failure: the breaker stays closed, so \
+         the backend is asked again and can serve as soon as it is able to"
+    );
+}
+
+#[tokio::test]
+async fn download_to_path_passes_over_a_backend_that_declines() {
+    let server = http_serving(b"from-http").await;
+    let backend = FakeBackend::new(Behave::Declines);
+    let client = client_for(&server).with_stream_read_transport(backend.clone());
+    let local = unique_tmp_path("declined-download");
+
+    client.download_to_path("/share/f", &local).await.unwrap();
+
+    assert_eq!(std::fs::read(&local).unwrap(), b"from-http");
+    assert_eq!(backend.call_count(), 1);
+    let _ = std::fs::remove_file(&local);
+}
+
+#[tokio::test]
+async fn upload_passes_over_a_backend_that_declines() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/webapi/entry.cgi"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true, "data": {"blks": null}
+        })))
+        .mount(&server)
+        .await;
+    let backend = FakeBackend::new(Behave::Declines);
+    let client = client_for(&server).with_write_transport(backend.clone());
+
+    for _ in 0..3 {
+        client
+            .upload("/share", "f.bin", b"data".to_vec(), true)
+            .await
+            .expect("HTTP carries it");
+    }
+    assert_eq!(backend.call_count(), 3, "asked every time, never tripped");
+}

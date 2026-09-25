@@ -138,6 +138,14 @@ impl SynologyClient {
                         entry.breaker.lock().unwrap().on_success();
                         return Ok(());
                     }
+                    // Not this backend, not now — an SMB transport with no
+                    // session yet says so. An answer, so the breaker stays
+                    // shut and it is asked again next time.
+                    Err(e) if e.category() == ErrorCategory::NotSupported => {
+                        debug!("write backend declined, using HTTP: {e}");
+                        entry.answered();
+                        continue;
+                    }
                     Err(e) if e.category() == ErrorCategory::Transport => {
                         warn!("write backend failed (transient), falling back: {e}");
                         entry.breaker.lock().unwrap().on_failure(Instant::now());
@@ -209,7 +217,7 @@ impl SynologyClient {
                     // leave the breaker shut so this backend still gets the
                     // writes it can serve.
                     Err(e) if e.category() == ErrorCategory::NotSupported => {
-                        debug!("stream write backend cannot create new files, using HTTP: {e}");
+                        debug!("stream write backend declined, using HTTP: {e}");
                         entry.answered();
                         continue;
                     }

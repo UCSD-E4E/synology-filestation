@@ -43,6 +43,20 @@ use tracing::{debug, info, warn};
 /// interval so much as "how stale may a workaround get".
 pub const DEFAULT_RECHECK: Duration = Duration::from_secs(60);
 
+/// How long a tunnel that failed is left alone before it is raised again.
+///
+/// Separate from [`DEFAULT_RECHECK`] because the two legs cost different
+/// things to ask about. The direct probe is one bounded TCP connect; raising
+/// the tunnel is a full OpenVPN handshake and a real authentication against
+/// the directory. Asking about the first every minute is cheap; asking about
+/// the second that often, against a tunnel that comes up with a NAS silent
+/// inside it, is a handshake a minute for the life of the mount.
+///
+/// A cost of *failing*: a tunnel whose stream merely ended is raised again at
+/// once. A refusal is not governed by this at all — it is never retried on a
+/// timer.
+pub const DEFAULT_TUNNEL_RECHECK: Duration = Duration::from_secs(10 * 60);
+
 /// What is carrying the data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Transport {
@@ -387,6 +401,12 @@ pub struct Chain {
     /// [`reconsider`](Chain::reconsider), which is what a caller says when the
     /// thing that was refused has changed.
     refused: Mutex<Option<String>>,
+    /// How long a failed tunnel is left alone; see [`DEFAULT_TUNNEL_RECHECK`].
+    tunnel_recheck: Duration,
+    /// When the tunnel last failed to open, while that is still the most
+    /// recent thing it did. Cleared by an open that works, and by
+    /// [`reconsider`](Chain::reconsider).
+    tunnel_failed_at: Mutex<Option<Instant>>,
 }
 
 impl Chain {
@@ -407,6 +427,142 @@ impl Chain {
             recheck,
             decision: Mutex::new(None),
             refused: Mutex::new(None),
+            tunnel_recheck: DEFAULT_TUNNEL_RECHECK,
+            tunnel_failed_at: Mutex::new(None),
+        }
+    }
+
+    /// Leave a failed tunnel alone for `interval` rather than
+    /// [`DEFAULT_TUNNEL_RECHECK`].
+    pub fn with_tunnel_recheck(mut self, interval: Duration) -> Self {
+        self.tunnel_recheck = interval;
+        self
+    }
+
+    /// Whether SMB may be used at all. When it may not, there is nothing for
+    /// a caller to attach and nothing to look for later.
+    pub fn may_use_smb(&self) -> bool {
+        self.policy.allows_smb()
+    }
+
+    /// A leg strictly better than `current` that answers now, if there is one.
+    ///
+    /// For a caller already carrying data on `current` and asking, on a timer,
+    /// whether it could do better. So it differs from
+    /// [`reach_smb`](Self::reach_smb) in what it will spend:
+    ///
+    /// * On the best leg it does nothing at all, which keeps the promise that
+    ///   a mount on direct SMB causes no traffic of its own.
+    /// * From the tunnel only the direct leg is better, so only the direct
+    ///   probe is made — a second tunnel to ask would be a handshake for
+    ///   nothing.
+    /// * A tunnel is raised only if it has not refused, and not failed within
+    ///   its own interval.
+    ///
+    /// It decides nothing. A leg that answers a probe is not yet a leg anyone
+    /// is on — the session on it can still be refused — so the caller says
+    /// which one it settled on with [`settle`](Self::settle).
+    pub async fn better_than(&self, current: Transport) -> Option<SmbRoute> {
+        if current.is_best() || !self.policy.allows_smb() {
+            return None;
+        }
+        let public = &self.endpoints.public_host;
+        if self.prober.smb_reachable(public).await {
+            return Some(SmbRoute::Direct {
+                host: public.clone(),
+            });
+        }
+        if current >= Transport::SmbOverVpn {
+            return None;
+        }
+        let inside = self.endpoints.tunnel_host.as_ref()?;
+        let connection = self.raise_tunnel(inside).await?;
+        Some(SmbRoute::Tunnelled {
+            host: inside.clone(),
+            connection,
+        })
+    }
+
+    /// Record that `route` is the leg now in use.
+    ///
+    /// For a caller that found a better leg with
+    /// [`better_than`](Self::better_than) and got a session on it: from here
+    /// on the chain answers as though it had decided this itself, including
+    /// never re-probing it if it is the best there is.
+    pub fn settle(&self, route: Route) {
+        self.remember(route, Instant::now());
+    }
+
+    /// Record that a connection through the tunnel opened, but nothing could
+    /// be built on it.
+    ///
+    /// The tunnel opening proves the tunnel; it does not prove the session a
+    /// caller builds on top. Without this a tunnel that came up and carried
+    /// nothing looked like one that worked, so the interval a failure earns
+    /// never applied — and a caller looking for a better leg every minute
+    /// raised a fresh tunnel, handshake and directory login included, every
+    /// minute. A refused login is not this: the caller latches that itself.
+    pub fn tunnel_carried_nothing(&self, why: &str) {
+        self.tunnel_failed(&TunnelUnavailable::Transient(format!(
+            "it opened, but carried no session: {why}"
+        )));
+    }
+
+    /// Open a connection through the tunnel to `inside`, unless asking is
+    /// pointless or too soon.
+    ///
+    /// The one place the tunnel is asked, so its two rules — a refusal is
+    /// final, and a failure buys it [`DEFAULT_TUNNEL_RECHECK`] of quiet — hold
+    /// on every path that could raise one.
+    async fn raise_tunnel(&self, inside: &str) -> Option<Connection> {
+        if !self.policy.allows_vpn() {
+            return None;
+        }
+        // A tunnel that refused is not asked again. The chain re-decides on a
+        // timer, and a timer is exactly the wrong thing to point at a
+        // credential: every attempt is a real authentication, and enough of
+        // them lock the account.
+        if let Some(why) = self.was_refused() {
+            debug!("transport: not asking the tunnel again ({why})");
+            return None;
+        }
+        if let Some(at) = *self.tunnel_failed_at.lock().unwrap() {
+            if Instant::now() < at + self.tunnel_recheck {
+                debug!("transport: the tunnel failed recently; not raising it again yet");
+                return None;
+            }
+        }
+        match self.tunnel.open(inside, SMB_PORT).await {
+            Ok(connection) => {
+                *self.tunnel_failed_at.lock().unwrap() = None;
+                info!("transport: SMB reachable through the tunnel at {inside}");
+                Some(connection)
+            }
+            Err(e) => {
+                self.tunnel_failed(&e);
+                None
+            }
+        }
+    }
+
+    /// Note a tunnel that would not open, in whichever of the two ways it
+    /// failed.
+    fn tunnel_failed(&self, e: &TunnelUnavailable) {
+        match e {
+            TunnelUnavailable::Refused(why) => {
+                warn!("transport: the tunnel refused, and will not be asked again until something changes ({why})");
+                *self.refused.lock().unwrap() = Some(why.clone());
+            }
+            // Not routine, and not `debug`: reaching here means a tunnel was
+            // configured, SMB did not answer directly, and the escalation
+            // that exists for exactly that case did not work. Left at `debug`
+            // this was invisible at the level people run, so a mount that
+            // tried and failed looked identical to one with no tunnel at all
+            // — the fallback line, and nothing above it.
+            TunnelUnavailable::Transient(_) => {
+                warn!("transport: no SMB through the tunnel ({e})");
+                *self.tunnel_failed_at.lock().unwrap() = Some(Instant::now());
+            }
         }
     }
 
@@ -456,6 +612,7 @@ impl Chain {
                             // answer already given.
                             Err(e) => {
                                 debug!("transport: the remembered tunnel no longer opens ({e})");
+                                self.tunnel_failed(&e);
                                 self.forget(&cached);
                                 let (chosen, _) = self.decide_without_the_tunnel().await?;
                                 self.remember(chosen.clone(), Instant::now());
@@ -491,6 +648,7 @@ impl Chain {
     pub fn reconsider(&self) {
         *self.decision.lock().unwrap() = None;
         *self.refused.lock().unwrap() = None;
+        *self.tunnel_failed_at.lock().unwrap() = None;
     }
 
     /// Drop a remembered decision, but only if it is still the one we acted
@@ -581,40 +739,15 @@ impl Chain {
                 // SMB and one that never comes up are now the same answer
                 // here — the error says which, and it is the tunnel's to
                 // explain rather than this layer's to guess.
-                // A tunnel that refused is not asked again. The chain
-                // re-decides on a timer, and a timer is exactly the wrong
-                // thing to point at a credential: every attempt is a real
-                // authentication, and enough of them lock the account.
-                (true, Some(_)) if self.was_refused().is_some() => {
-                    debug!(
-                        "transport: not asking the tunnel again ({})",
-                        self.was_refused().unwrap_or_default()
-                    );
-                }
                 (true, Some(inside)) if may_open => {
-                    match self.tunnel.open(inside, SMB_PORT).await {
-                        Ok(connection) => {
-                            info!("transport: SMB reachable through the tunnel at {inside}");
-                            return Ok((
-                                Route {
-                                    transport: Transport::SmbOverVpn,
-                                    smb_host: Some(inside.clone()),
-                                },
-                                Some(connection),
-                            ));
-                        }
-                        Err(TunnelUnavailable::Refused(why)) => {
-                            warn!("transport: the tunnel refused, and will not be asked again until something changes ({why})");
-                            *self.refused.lock().unwrap() = Some(why);
-                        }
-                        // Not routine, and not `debug`: reaching here means a
-                        // tunnel was configured, SMB did not answer directly,
-                        // and the escalation that exists for exactly that case
-                        // did not work. Left at `debug` this was invisible at
-                        // the level people run, so a mount that tried and
-                        // failed looked identical to one with no tunnel at all
-                        // — the fallback line, and nothing above it.
-                        Err(e) => warn!("transport: no SMB through the tunnel ({e})"),
+                    if let Some(connection) = self.raise_tunnel(inside).await {
+                        return Ok((
+                            Route {
+                                transport: Transport::SmbOverVpn,
+                                smb_host: Some(inside.clone()),
+                            },
+                            Some(connection),
+                        ));
                     }
                 }
                 // Just tried, and it did not open. Asking again in the same
@@ -1132,6 +1265,208 @@ mod tests {
             _ => panic!("SMB answers directly"),
         }
         assert_eq!(tunnel.opens(), 0);
+    }
+
+    // ── The tunnel's own interval ─────────────────────────────────────────────
+
+    #[tokio::test(start_paused = true)]
+    async fn a_tunnel_that_failed_waits_out_its_own_interval() {
+        // The direct probe is one bounded TCP connect; raising the tunnel is a
+        // full OpenVPN handshake and a real authentication. Re-deciding every
+        // minute is right for the first and wrong for the second — the case
+        // that found this is a tunnel that comes up and a NAS silent inside it,
+        // which would have been a handshake a minute for as long as the mount
+        // stayed up.
+        let prober = FakeProber::nothing_answers();
+        let tunnel = FakeTunnel::absent();
+        let chain = chain(TransportPolicy::default(), prober.clone(), tunnel.clone());
+
+        assert_eq!(chain.route().await.unwrap().transport, Transport::Https);
+        assert_eq!(tunnel.opens(), 1);
+
+        tokio::time::advance(DEFAULT_RECHECK + Duration::from_secs(1)).await;
+        assert_eq!(chain.route().await.unwrap().transport, Transport::Https);
+        assert_eq!(prober.probes(), 2, "the cheap leg is looked at again");
+        assert_eq!(tunnel.opens(), 1, "the expensive one is not, yet");
+
+        tokio::time::advance(DEFAULT_TUNNEL_RECHECK).await;
+        chain.route().await.unwrap();
+        assert_eq!(tunnel.opens(), 2, "and once its own interval is up, it is");
+    }
+
+    #[tokio::test]
+    async fn reconsidering_forgets_that_the_tunnel_failed() {
+        // `reconsider` is the caller saying something has changed; a failed
+        // tunnel is as much a stale conclusion as a refused one.
+        let prober = FakeProber::nothing_answers();
+        let tunnel = FakeTunnel::absent();
+        let chain = chain(TransportPolicy::default(), prober.clone(), tunnel.clone());
+
+        chain.route().await.unwrap();
+        chain.reconsider();
+        chain.route().await.unwrap();
+
+        assert_eq!(tunnel.opens(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_tunnel_that_worked_is_not_held_to_the_interval() {
+        // The interval is a cost of failing. A tunnel whose stream ended is
+        // one the caller wants back now, and has every reason to expect.
+        let prober = FakeProber::nothing_answers();
+        let tunnel = FakeTunnel::reaching();
+        let chain = chain(TransportPolicy::default(), prober.clone(), tunnel.clone());
+
+        chain.reach_smb().await.unwrap();
+        chain.reconsider_the_decision_only();
+        assert!(matches!(
+            chain.reach_smb().await.unwrap(),
+            SmbRoute::Tunnelled { .. }
+        ));
+        assert_eq!(tunnel.opens(), 2);
+    }
+
+    // ── Looking for something better ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn nothing_is_better_than_the_best_leg() {
+        // `is_best` is the contract that a mount on direct SMB causes no
+        // traffic of its own. Looking for better must keep it.
+        let prober = FakeProber::answering(&[PUBLIC]);
+        let tunnel = FakeTunnel::reaching();
+        let chain = chain(TransportPolicy::default(), prober.clone(), tunnel.clone());
+
+        assert!(chain.better_than(Transport::SmbDirect).await.is_none());
+        assert_eq!(prober.probes(), 0);
+        assert_eq!(tunnel.opens(), 0);
+    }
+
+    #[tokio::test]
+    async fn from_http_a_direct_answer_is_better() {
+        let prober = FakeProber::answering(&[PUBLIC]);
+        let tunnel = FakeTunnel::reaching();
+        let chain = chain(TransportPolicy::default(), prober.clone(), tunnel.clone());
+
+        match chain.better_than(Transport::Https).await {
+            Some(SmbRoute::Direct { host }) => assert_eq!(host, PUBLIC),
+            _ => panic!("SMB answers directly"),
+        }
+        assert_eq!(tunnel.opens(), 0, "nothing to escalate to");
+    }
+
+    #[tokio::test]
+    async fn from_http_the_tunnel_is_better_than_nothing() {
+        let prober = FakeProber::nothing_answers();
+        let tunnel = FakeTunnel::reaching();
+        let chain = chain(TransportPolicy::default(), prober.clone(), tunnel.clone());
+
+        match chain.better_than(Transport::Https).await {
+            Some(SmbRoute::Tunnelled { host, .. }) => assert_eq!(host, INSIDE),
+            _ => panic!("the tunnel reaches SMB"),
+        }
+    }
+
+    #[tokio::test]
+    async fn from_the_tunnel_only_direct_is_better() {
+        // A laptop on the tunnel that walks back onto campus. The tunnel is
+        // working; the question is only whether the direct leg now answers,
+        // and raising a second tunnel to ask would be a handshake for nothing.
+        let prober = FakeProber::nothing_answers();
+        let tunnel = FakeTunnel::reaching();
+        let chain = chain(TransportPolicy::default(), prober.clone(), tunnel.clone());
+
+        assert!(chain.better_than(Transport::SmbOverVpn).await.is_none());
+        assert_eq!(prober.asked(), vec![PUBLIC]);
+        assert_eq!(tunnel.opens(), 0);
+
+        prober.starts_answering(PUBLIC);
+        assert!(matches!(
+            chain.better_than(Transport::SmbOverVpn).await,
+            Some(SmbRoute::Direct { .. })
+        ));
+        assert_eq!(tunnel.opens(), 0);
+    }
+
+    #[tokio::test]
+    async fn looking_for_better_never_asks_a_tunnel_that_refused() {
+        // The reason this is not a plain timer around `reach_smb`. DSM blocks
+        // an address after three failed logins, and the block does not expire.
+        let prober = FakeProber::nothing_answers();
+        let tunnel = FakeTunnel::refuses();
+        let chain = chain(TransportPolicy::default(), prober.clone(), tunnel.clone());
+
+        chain.route().await.unwrap();
+        for _ in 0..5 {
+            assert!(chain.better_than(Transport::Https).await.is_none());
+        }
+        assert_eq!(tunnel.opens(), 1, "asked once, and believed");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn looking_for_better_keeps_to_the_tunnel_interval() {
+        let prober = FakeProber::nothing_answers();
+        let tunnel = FakeTunnel::absent();
+        let chain = chain(TransportPolicy::default(), prober.clone(), tunnel.clone());
+
+        assert!(chain.better_than(Transport::Https).await.is_none());
+        assert!(chain.better_than(Transport::Https).await.is_none());
+        assert_eq!(tunnel.opens(), 1);
+        assert_eq!(prober.probes(), 2, "the direct probe is not rationed");
+
+        tokio::time::advance(DEFAULT_TUNNEL_RECHECK + Duration::from_secs(1)).await;
+        assert!(chain.better_than(Transport::Https).await.is_none());
+        assert_eq!(tunnel.opens(), 2);
+    }
+
+    #[tokio::test]
+    async fn looking_for_better_decides_nothing_until_told() {
+        // A better leg that answers a probe is not yet a leg the mount is on:
+        // the SMB session on it can still be refused. Remembering it early
+        // would report a transport nothing is using.
+        let prober = FakeProber::answering(&[PUBLIC]);
+        let tunnel = FakeTunnel::absent();
+        let chain = chain(TransportPolicy::default(), prober.clone(), tunnel.clone());
+
+        chain.better_than(Transport::Https).await.expect("better");
+        assert_eq!(chain.current(), None);
+
+        let direct = Route {
+            transport: Transport::SmbDirect,
+            smb_host: Some(PUBLIC.into()),
+        };
+        chain.settle(direct.clone());
+        assert_eq!(chain.current(), Some(direct));
+    }
+
+    #[tokio::test]
+    async fn a_tunnel_that_carried_nothing_counts_as_one_that_failed() {
+        // Opening a connection through the tunnel proves the tunnel, not the
+        // session on top of it. A caller that could not build one says so,
+        // and the tunnel then keeps to the interval any failure would earn it.
+        let prober = FakeProber::nothing_answers();
+        let tunnel = FakeTunnel::reaching();
+        let chain = chain(TransportPolicy::default(), prober.clone(), tunnel.clone());
+
+        assert!(matches!(
+            chain.better_than(Transport::Https).await,
+            Some(SmbRoute::Tunnelled { .. })
+        ));
+        chain.tunnel_carried_nothing("the session setup timed out");
+
+        assert!(chain.better_than(Transport::Https).await.is_none());
+        assert_eq!(tunnel.opens(), 1);
+    }
+
+    #[tokio::test]
+    async fn with_smb_disabled_nothing_is_better() {
+        let prober = FakeProber::answering(&[PUBLIC]);
+        let tunnel = FakeTunnel::reaching();
+        let policy = TransportPolicy::from_flags(true, false, false).unwrap();
+        let chain = chain(policy, prober.clone(), tunnel.clone());
+
+        assert!(!chain.may_use_smb());
+        assert!(chain.better_than(Transport::Https).await.is_none());
+        assert_eq!(prober.probes(), 0);
     }
 
     // ── What reaches the user ─────────────────────────────────────────────────

@@ -29,6 +29,12 @@ impl SynologyClient {
                     entry.breaker.lock().unwrap().on_success();
                     return Ok(());
                 }
+                // Not this backend, not now; see `download`.
+                Err(e) if e.category() == ErrorCategory::NotSupported => {
+                    debug!("stream read backend declined {remote_path}, using HTTP: {e}");
+                    entry.answered();
+                    continue;
+                }
                 Err(e) if e.category() == ErrorCategory::Transport => {
                     warn!("stream read backend failed for {remote_path} (transient), falling back: {e}");
                     entry.breaker.lock().unwrap().on_failure(Instant::now());
@@ -111,6 +117,15 @@ impl SynologyClient {
                 Ok(bytes) => {
                     entry.breaker.lock().unwrap().on_success();
                     return Ok(bytes);
+                }
+                // Not this backend, not now — an SMB transport attached before
+                // it has a session says so until it gets one. An answer rather
+                // than a failure, so the breaker stays shut and the backend is
+                // asked again the moment it can serve.
+                Err(e) if e.category() == ErrorCategory::NotSupported => {
+                    debug!("read backend declined {path}, using HTTP: {e}");
+                    entry.answered();
+                    continue;
                 }
                 Err(e) if e.category() == ErrorCategory::Transport => {
                     warn!("read backend failed for {path} (transient), falling back: {e}");
