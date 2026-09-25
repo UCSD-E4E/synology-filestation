@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.8.2](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-fuse-v0.8.1...synology-filestation-fuse-v0.8.2) (2026-09-25)
+
+
+### Bug Fixes
+
+* **fuse:** let a read-only create skip the NAS write handle too ([4e17be2](https://github.com/UCSD-E4E/synology-filestation/commit/4e17be2d04bf15fc63d5df95782e16bc5a5c8889))
+* **fuse:** stop open from holding the write-buffer lock across a network call ([afbe321](https://github.com/UCSD-E4E/synology-filestation/commit/afbe3212bcbbe795e39c5f50ea107f2ee5b4235f))
+
 ## [0.8.1](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-fuse-v0.8.0...synology-filestation-fuse-v0.8.1) (2026-09-25)
 
 
