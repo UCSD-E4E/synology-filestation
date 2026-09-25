@@ -293,6 +293,11 @@ impl SynologyFS {
         }
     }
 
+    /// Whether `open(2)`/`create(2)` flags ask for write access.
+    pub(super) fn is_writable(flags: i32) -> bool {
+        flags & libc::O_ACCMODE != libc::O_RDONLY
+    }
+
     /// Give `fh` a write buffer for `nas_path`, as `open` and `create` do.
     ///
     /// A `new_file` is dirty from birth. `create(2)` is a request for a file

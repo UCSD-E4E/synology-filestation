@@ -325,8 +325,7 @@ impl Filesystem for SynologyFS {
         // to be a container that keeps its index at the end. A JPEG used to pay
         // for a 20-block media window it could never use.
         self.prime_open(fh, ino, &path);
-        let writable = flags.acc_mode() != fuser::OpenAccMode::O_RDONLY;
-        self.add_write_buffer(fh, path, ino, false, writable);
+        self.add_write_buffer(fh, path, ino, false, Self::is_writable(flags.0));
         // FOPEN_KEEP_CACHE: don't invalidate the kernel page cache between opens.
         reply.opened(FileHandle(fh), FopenFlags::FOPEN_KEEP_CACHE);
     }
@@ -429,7 +428,7 @@ impl Filesystem for SynologyFS {
         name: &OsStr,
         _mode: u32,
         _umask: u32,
-        _flags: i32,
+        flags: i32,
         reply: ReplyCreate,
     ) {
         let name_str = match name.to_str() {
@@ -471,7 +470,7 @@ impl Filesystem for SynologyFS {
         self.cache.insert(ino, synthetic_info);
 
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
-        self.add_write_buffer(fh, new_path, ino, true, true);
+        self.add_write_buffer(fh, new_path, ino, true, Self::is_writable(flags));
 
         reply.created(
             &TTL,

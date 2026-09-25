@@ -946,3 +946,38 @@ fn a_read_only_open_does_not_open_the_file_for_writing_on_the_nas() {
     assert!(matches!(buffer.sink, WriteSink::Buffered(_)));
     assert!(!buffer.dirty, "a read-only handle has nothing to upload");
 }
+
+#[test]
+fn only_write_access_modes_count_as_writable() {
+    // What `open` and `create` pass to `add_write_buffer`. The access mode is
+    // the low bits; the rest (O_CREAT, O_TRUNC, O_LARGEFILE…) says nothing
+    // about whether this descriptor may write.
+    assert!(!SynologyFS::is_writable(libc::O_RDONLY));
+    assert!(!SynologyFS::is_writable(libc::O_RDONLY | libc::O_LARGEFILE));
+    assert!(!SynologyFS::is_writable(libc::O_RDONLY | libc::O_CREAT));
+    assert!(SynologyFS::is_writable(libc::O_WRONLY));
+    assert!(SynologyFS::is_writable(
+        libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC
+    ));
+}
+
+#[test]
+fn a_read_only_create_still_puts_the_file_on_the_nas() {
+    // `open(path, O_CREAT | O_RDONLY)` makes an empty file this descriptor can
+    // only read. It skips the write handle like any read-only open, but the
+    // file must still exist once the handle closes.
+    let (f, sink) = gated_fixture();
+    let (started, opened_for_write) = std::sync::mpsc::channel();
+    *sink.started.lock().unwrap() = Some(started);
+    sink.gate.add_permits(1);
+    mount_upload_ok(&f);
+
+    f.fs.add_write_buffer(1, "/share/made-read-only.txt".into(), 7, true, false);
+    f.fs.finish_upload(1).expect("close");
+
+    assert!(
+        opened_for_write.try_recv().is_err(),
+        "a read-only create asked the NAS for a write handle"
+    );
+    assert_eq!(posted_bodies(&f).len(), 1, "the empty file was uploaded");
+}
