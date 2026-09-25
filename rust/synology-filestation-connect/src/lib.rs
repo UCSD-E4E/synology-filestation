@@ -1676,9 +1676,31 @@ mod tests {
             FakeTunnel::reaching(),
         );
 
-        chain.reach_smb().await.expect("SMB answers directly");
+        // Inside a span of its own, because the capture is shared by the whole
+        // binary and the tests beside this one warn on purpose: asserting that
+        // the capture held no warning at all failed about one run in forty.
+        // The subscriber prefixes every event with the spans it happened in,
+        // so a warning from *this* call carries this name.
+        use tracing::Instrument;
+        async {
+            chain.reach_smb().await.expect("SMB answers directly");
+            // Proof the filter below can see this span at all; without it an
+            // unlabelled capture would pass this test by matching nothing.
+            info!("reached");
+        }
+        .instrument(tracing::info_span!("leg_that_works"))
+        .await;
 
         let said = logs.text();
-        assert!(!said.contains("WARN"), "nothing went wrong. Got:\n{said}");
+        assert!(
+            said.lines()
+                .any(|line| line.contains("leg_that_works") && line.contains("reached")),
+            "events inside the span carry its name. Got:\n{said}"
+        );
+        let ours: Vec<&str> = said
+            .lines()
+            .filter(|line| line.contains("leg_that_works") && line.contains("WARN"))
+            .collect();
+        assert!(ours.is_empty(), "nothing went wrong. Got:\n{said}");
     }
 }

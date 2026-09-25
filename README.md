@@ -414,7 +414,7 @@ INFO synology_filestation_connect: transport: falling back to the HTTP API
 
 The first run downloads the profile over the session it has just authenticated — which is what lets somebody outside the NAS's network get the file that gets them inside it — and writes it readable only by its owner. Later runs use whatever is on disk, so `--vpn-profile-nas` can be dropped once the file is there.
 
-The chosen leg is logged at startup as `Transport: …`. Pass `--disable-https` to make a silent fall back to the API impossible, so a mount that expected SMB fails instead of running slowly.
+The chosen leg is logged at startup as `Transport: …` — `SMB at <host>`, `SMB via VPN at <address>`, or `HTTPS`. A running mount keeps looking for a better leg and moves to it without a remount, logging `Transport: now SMB at <host>, was HTTPS` when it does. Pass `--disable-https` to make a silent fall back to the API impossible, so a mount that expected SMB fails instead of running slowly.
 
 ### Examples
 
