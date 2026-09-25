@@ -15,6 +15,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use synology_filestation_connect::{Chain, SmbRoute};
 use synology_filestation_core::client::SynologyClient;
@@ -55,9 +56,13 @@ pub const DEFAULT_UMASK: u16 = 0o022;
 /// mount losing its stream hourly reported only "Disconnected from server",
 /// once per operation, which says that something ended but nothing about what.
 ///
+/// A direct dial gives up after `patience`, because the redial runs holding
+/// the transport's lock: see `dial_direct`.
+///
 /// Shared by the CLI and the FFI binding, which build the same transport.
 pub fn reopen_through(
     chain: Arc<Chain>,
+    patience: Duration,
 ) -> impl Fn() -> RedialFuture + Send + Sync + 'static + use<> {
     // When the stream being replaced was opened. Advanced only when a new one
     // is handed back, so a redial that fails and is retried still reports the
@@ -82,7 +87,7 @@ pub fn reopen_through(
                     Ok(Box::new(connection) as BoxedStream)
                 }
                 Ok(SmbRoute::Direct { host }) => {
-                    let stream = dial_direct(&host).await.inspect_err(|e| {
+                    let stream = dial_direct(&host, patience).await.inspect_err(|e| {
                         tracing::warn!(
                             "SMB: the stream lasted {lasted}s; {host} answers directly \
                              but would not connect: {e}"
@@ -109,22 +114,32 @@ pub fn reopen_through(
     }
 }
 
-/// Dial the SMB port on a host the chain says answers directly.
+/// Dial the SMB port on a host the chain says answers directly, giving up
+/// after `patience`.
 ///
 /// The port is appended only when the host does not already carry one, the
 /// same rule `SmbConfig::addr` follows — a route naming `host:port` means that
 /// port, and appending 445 to it produces an address that resolves to nothing.
-async fn dial_direct(host: &str) -> Result<BoxedStream, SynoFsError> {
+///
+/// Bounded because a redial runs holding the transport's lock, and a direct
+/// decision never expires: off campus, a bare connect to a port that drops
+/// packets waits out the kernel's own timeout — about two minutes on Linux —
+/// with every operation on the mount queued behind it rather than falling
+/// back to HTTP.
+async fn dial_direct(host: &str, patience: Duration) -> Result<BoxedStream, SynoFsError> {
     const SMB_PORT: u16 = 445;
     let addr = if host.contains(':') {
         host.to_string()
     } else {
         format!("{host}:{SMB_PORT}")
     };
-    tokio::net::TcpStream::connect(&addr)
-        .await
-        .map(|stream| Box::new(stream) as BoxedStream)
-        .map_err(|e| SynoFsError::Io(format!("dialling {addr}: {e}")))
+    match tokio::time::timeout(patience, tokio::net::TcpStream::connect(&addr)).await {
+        Ok(Ok(stream)) => Ok(Box::new(stream) as BoxedStream),
+        Ok(Err(e)) => Err(SynoFsError::Io(format!("dialling {addr}: {e}"))),
+        Err(_) => Err(SynoFsError::Io(format!(
+            "dialling {addr}: no answer within {patience:?}"
+        ))),
+    }
 }
 
 /// Default depth of the Linux backend's speculative read-ahead window, in
@@ -946,7 +961,7 @@ mod redial_tests {
             DEFAULT_RECHECK,
         ));
 
-        let reopened = reopen_through(chain)().await;
+        let reopened = reopen_through(chain, Duration::from_secs(5))().await;
 
         assert!(
             reopened.is_ok(),
@@ -982,7 +997,9 @@ mod redial_tests {
             Box::new(NoTunnel),
             DEFAULT_RECHECK,
         ));
-        reopen_through(chain)().await.expect("a stream");
+        reopen_through(chain, Duration::from_secs(5))()
+            .await
+            .expect("a stream");
         let _ = accepting.await;
 
         let text = logs.text();
@@ -994,6 +1011,50 @@ mod redial_tests {
             text.contains("directly"),
             "and so is which leg brought it back: {text}"
         );
+    }
+
+    /// Regression: a redial holds the transport's lock, and a direct decision
+    /// never expires, so a laptop carried off campus redialled the campus
+    /// address with a bare `TcpStream::connect` — about two minutes on Linux
+    /// against a port that drops packets, during which every operation on the
+    /// mount queued behind the lock instead of falling back to HTTP.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_direct_host_that_stopped_answering_is_given_up_on_in_time() {
+        // A listener whose accept queue is full drops new SYNs, which is what
+        // a firewall that silently drops 445 looks like from here.
+        let socket = tokio::net::TcpSocket::new_v4().expect("a socket");
+        socket.bind("127.0.0.1:0".parse().unwrap()).expect("bound");
+        let listener = socket.listen(1).expect("listening");
+        let host = listener.local_addr().expect("its address").to_string();
+        let mut queued = Vec::new();
+        for _ in 0..4 {
+            if let Ok(Ok(stream)) = tokio::time::timeout(
+                Duration::from_millis(200),
+                tokio::net::TcpStream::connect(&host),
+            )
+            .await
+            {
+                queued.push(stream);
+            }
+        }
+
+        let chain = Arc::new(Chain::new(
+            TransportPolicy::default(),
+            Endpoints::public_only(host),
+            Box::new(Answers),
+            Box::new(NoTunnel),
+            DEFAULT_RECHECK,
+        ));
+
+        let reopened = tokio::time::timeout(
+            Duration::from_secs(5),
+            reopen_through(chain, Duration::from_millis(500))(),
+        )
+        .await
+        .expect("gave up within its patience, rather than the kernel's");
+        assert!(reopened.is_err());
+        drop((listener, queued));
     }
 }
 

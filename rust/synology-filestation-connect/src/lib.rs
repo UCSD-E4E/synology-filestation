@@ -493,6 +493,21 @@ impl Chain {
         self.remember(route, Instant::now());
     }
 
+    /// Record that a connection through the tunnel opened, but nothing could
+    /// be built on it.
+    ///
+    /// The tunnel opening proves the tunnel; it does not prove the session a
+    /// caller builds on top. Without this a tunnel that came up and carried
+    /// nothing looked like one that worked, so the interval a failure earns
+    /// never applied — and a caller looking for a better leg every minute
+    /// raised a fresh tunnel, handshake and directory login included, every
+    /// minute. A refused login is not this: the caller latches that itself.
+    pub fn tunnel_carried_nothing(&self, why: &str) {
+        self.tunnel_failed(&TunnelUnavailable::Transient(format!(
+            "it opened, but carried no session: {why}"
+        )));
+    }
+
     /// Open a connection through the tunnel to `inside`, unless asking is
     /// pointless or too soon.
     ///
@@ -1421,6 +1436,25 @@ mod tests {
         };
         chain.settle(direct.clone());
         assert_eq!(chain.current(), Some(direct));
+    }
+
+    #[tokio::test]
+    async fn a_tunnel_that_carried_nothing_counts_as_one_that_failed() {
+        // Opening a connection through the tunnel proves the tunnel, not the
+        // session on top of it. A caller that could not build one says so,
+        // and the tunnel then keeps to the interval any failure would earn it.
+        let prober = FakeProber::nothing_answers();
+        let tunnel = FakeTunnel::reaching();
+        let chain = chain(TransportPolicy::default(), prober.clone(), tunnel.clone());
+
+        assert!(matches!(
+            chain.better_than(Transport::Https).await,
+            Some(SmbRoute::Tunnelled { .. })
+        ));
+        chain.tunnel_carried_nothing("the session setup timed out");
+
+        assert!(chain.better_than(Transport::Https).await.is_none());
+        assert_eq!(tunnel.opens(), 1);
     }
 
     #[tokio::test]

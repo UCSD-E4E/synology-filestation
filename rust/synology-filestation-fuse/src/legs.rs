@@ -56,7 +56,7 @@ impl Session for SmbTransport {
     async fn take(&self, route: SmbRoute) -> Result<(), SynoFsError> {
         match route {
             SmbRoute::Direct { host } => {
-                let stream = dial_direct(&host).await?;
+                let stream = dial_direct(&host, self.dial_patience()).await?;
                 self.adopt(stream, &host).await
             }
             SmbRoute::Tunnelled { host, connection } => self.adopt(connection, &host).await,
@@ -91,7 +91,7 @@ impl Legs<SmbTransport> {
         // straight back; the watch covers everything the redial cannot.
         let smb = Arc::new(SmbTransport::unconnected(
             cfg,
-            reopen_through(chain.clone()),
+            reopen_through(chain.clone(), cfg.timeout),
         ));
         let legs = Arc::new(Self::new(chain, smb));
         legs.step().await;
@@ -162,6 +162,12 @@ impl<S: Session> Legs<S> {
             }),
             // Said already, and in full, by the transport that was refused.
             Err(_) if self.session.is_refused() => {}
+            // The tunnel opened, so the chain counted it as working; it has to
+            // hear otherwise, or the next look raises another one.
+            Err(e) if leg == Transport::SmbOverVpn => {
+                self.chain.tunnel_carried_nothing(&e.to_string());
+                warn!("Transport: no SMB session through the tunnel ({e}); staying on {from}");
+            }
             Err(e) => warn!(
                 "Transport: {leg} answers at {host}, but no session could be built on it \
                  ({e}); staying on {from}"
@@ -442,6 +448,31 @@ mod tests {
             Some(Transport::SmbOverVpn),
             "not settled on a leg nothing is using"
         );
+    }
+
+    /// Regression: a tunnel that came up, and a 445 that answered inside it,
+    /// counted as a tunnel that worked — even when no session could be built
+    /// on what it carried. Nothing recorded the failure, so the tunnel's own
+    /// interval never applied, and every minute's look raised a fresh tunnel:
+    /// an OpenVPN handshake and a directory login each time, for the life of
+    /// the mount.
+    #[tokio::test(start_paused = true)]
+    async fn a_tunnel_that_carries_no_session_waits_out_its_interval() {
+        let prober = FakeProber::answering(false);
+        let tunnel = FakeTunnel::new(true);
+        let (legs, session, _chain) = legs(&prober, &tunnel);
+        session.fails.store(true, Ordering::SeqCst);
+
+        for _ in 0..3 {
+            assert_eq!(legs.step().await, Transport::Https);
+            tokio::time::advance(DEFAULT_WATCH_INTERVAL).await;
+        }
+        assert_eq!(tunnel.opens(), 1, "raised once, and not every minute");
+        assert_eq!(prober.probes(), 3, "while the cheap probe carries on");
+
+        tokio::time::advance(synology_filestation_connect::DEFAULT_TUNNEL_RECHECK).await;
+        legs.step().await;
+        assert_eq!(tunnel.opens(), 2, "and again once its interval is up");
     }
 
     #[tokio::test]
