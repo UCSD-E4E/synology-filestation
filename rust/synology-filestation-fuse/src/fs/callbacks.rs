@@ -6,7 +6,6 @@
 use std::ffi::OsStr;
 use std::io;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 use std::time::SystemTime;
 
 use fuser::{
@@ -17,7 +16,7 @@ use fuser::{
 use tracing::{debug, error, info, warn};
 
 use super::attr::{dir_open_flags, errno, file_attr};
-use super::transfer::{forget_parent_listing, WriteBuffer};
+use super::transfer::forget_parent_listing;
 use super::{SynologyFS, ROOT_INO, TTL};
 use synology_filestation_core::error::SynoFsError;
 use synology_filestation_core::types::{SynoFileInfo, VIRTUAL_ROOT_PATH};
@@ -326,18 +325,7 @@ impl Filesystem for SynologyFS {
         // to be a container that keeps its index at the end. A JPEG used to pay
         // for a 20-block media window it could never use.
         self.prime_open(fh, ino, &path);
-        self.write_buffers.lock().unwrap().insert(
-            fh,
-            Arc::new(tokio::sync::Mutex::new(WriteBuffer {
-                sink: self.open_sink(&path),
-                nas_path: path,
-                ino,
-                streamed: false,
-                dirty: false,
-                new_file: false,
-                broken: false,
-            })),
-        );
+        self.add_write_buffer(fh, path, ino, false, Self::is_writable(flags.0));
         // FOPEN_KEEP_CACHE: don't invalidate the kernel page cache between opens.
         reply.opened(FileHandle(fh), FopenFlags::FOPEN_KEEP_CACHE);
     }
@@ -440,7 +428,7 @@ impl Filesystem for SynologyFS {
         name: &OsStr,
         _mode: u32,
         _umask: u32,
-        _flags: i32,
+        flags: i32,
         reply: ReplyCreate,
     ) {
         let name_str = match name.to_str() {
@@ -482,24 +470,7 @@ impl Filesystem for SynologyFS {
         self.cache.insert(ino, synthetic_info);
 
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
-        self.write_buffers.lock().unwrap().insert(
-            fh,
-            Arc::new(tokio::sync::Mutex::new(WriteBuffer {
-                sink: self.open_sink(&new_path),
-                nas_path: new_path,
-                ino,
-                // Dirty from birth. `create(2)` is a request for a file to
-                // exist, and `touch` makes exactly this handle: opened,
-                // written to never, closed. Starting clean meant close saw
-                // nothing to do and the file never reached the NAS at all —
-                // it lived in the inode cache until the TTL expired and then
-                // vanished.
-                streamed: false,
-                dirty: true,
-                new_file: true,
-                broken: false,
-            })),
-        );
+        self.add_write_buffer(fh, new_path, ino, true, Self::is_writable(flags));
 
         reply.created(
             &TTL,

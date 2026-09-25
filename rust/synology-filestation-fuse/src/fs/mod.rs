@@ -293,6 +293,57 @@ impl SynologyFS {
         }
     }
 
+    /// Whether `open(2)`/`create(2)` flags ask for write access.
+    pub(super) fn is_writable(flags: i32) -> bool {
+        flags & libc::O_ACCMODE != libc::O_RDONLY
+    }
+
+    /// Give `fh` a write buffer for `nas_path`, as `open` and `create` do.
+    ///
+    /// A `new_file` is dirty from birth. `create(2)` is a request for a file
+    /// to exist, and `touch` makes exactly this handle: opened, written to
+    /// never, closed. Starting clean meant close saw nothing to do and the
+    /// file never reached the NAS at all — it lived in the inode cache until
+    /// the TTL expired and then vanished.
+    ///
+    /// The sink is opened *before* the map is locked, never inside the
+    /// `insert` call: a method's receiver is evaluated before its arguments,
+    /// so `lock().insert(.., open_sink(..))` held the lock across a network
+    /// round trip. Every close's upload task takes this lock on a runtime
+    /// worker, so both workers blocked on it while the round trip waited for a
+    /// worker — and the mount stopped, tunnel and all.
+    ///
+    /// Only a `writable` handle gets a sink from the NAS. The kernel refuses a
+    /// write on a read-only descriptor before it reaches us, so asking the NAS
+    /// for a write handle on every `O_RDONLY` open was a round trip — 110 ms
+    /// through the tunnel — that could never be used.
+    pub(super) fn add_write_buffer(
+        &self,
+        fh: u64,
+        nas_path: String,
+        ino: u64,
+        new_file: bool,
+        writable: bool,
+    ) {
+        let sink = if writable {
+            self.open_sink(&nas_path)
+        } else {
+            WriteSink::Buffered(SpillBuffer::new())
+        };
+        self.write_buffers.lock().unwrap().insert(
+            fh,
+            Arc::new(tokio::sync::Mutex::new(WriteBuffer {
+                sink,
+                nas_path,
+                ino,
+                streamed: false,
+                dirty: new_file,
+                new_file,
+                broken: false,
+            })),
+        );
+    }
+
     /// The buffer for `fh`, if the handle is still open. The map lock is only
     /// ever held long enough to clone the `Arc` — never across a transfer —
     /// so one handle's upload cannot stall lookups of another's.
