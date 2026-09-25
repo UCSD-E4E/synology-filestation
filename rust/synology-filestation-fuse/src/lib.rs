@@ -56,13 +56,13 @@ pub const DEFAULT_UMASK: u16 = 0o022;
 /// mount losing its stream hourly reported only "Disconnected from server",
 /// once per operation, which says that something ended but nothing about what.
 ///
-/// A direct dial gives up after `patience`, because the redial runs holding
-/// the transport's lock: see `dial_direct`.
+/// A direct dial goes to `dial.port` and gives up after `dial.patience`: see
+/// [`Dial`].
 ///
 /// Shared by the CLI and the FFI binding, which build the same transport.
 pub fn reopen_through(
     chain: Arc<Chain>,
-    patience: Duration,
+    dial: Dial,
 ) -> impl Fn() -> RedialFuture + Send + Sync + 'static + use<> {
     // When the stream being replaced was opened. Advanced only when a new one
     // is handed back, so a redial that fails and is retried still reports the
@@ -87,7 +87,7 @@ pub fn reopen_through(
                     Ok(Box::new(connection) as BoxedStream)
                 }
                 Ok(SmbRoute::Direct { host }) => {
-                    let stream = dial_direct(&host, patience).await.inspect_err(|e| {
+                    let stream = dial_direct(&host, dial).await.inspect_err(|e| {
                         tracing::warn!(
                             "SMB: the stream lasted {lasted}s; {host} answers directly \
                              but would not connect: {e}"
@@ -114,24 +114,51 @@ pub fn reopen_through(
     }
 }
 
-/// Dial the SMB port on a host the chain says answers directly, giving up
-/// after `patience`.
+/// How to dial a host the chain says answers directly: which port, and how
+/// long to wait.
+///
+/// Both come from the SMB config — [`SmbConfig::for_account`] reads
+/// `SYNOLOGY_FS_SMB_PORT` and `SYNOLOGY_FS_SMB_TIMEOUT_MS` — so the probe
+/// that chooses the leg, the dial that moves to it and the redial that brings
+/// it back all agree on where SMB is. They used to disagree: the port override
+/// reached only the old self-dialling path, and everything the chain drove
+/// dialled 445.
+///
+/// The wait is bounded because a redial runs holding the transport's lock,
+/// and a direct decision never expires: off campus, a bare connect to a port
+/// that drops packets waits out the kernel's own timeout — about two minutes
+/// on Linux — with every operation on the mount queued behind it rather than
+/// falling back to HTTP.
+///
+/// [`SmbConfig::for_account`]: synology_filestation_smb::SmbConfig::for_account
+#[derive(Debug, Clone, Copy)]
+pub struct Dial {
+    /// Used when the host carries no port of its own.
+    pub port: u16,
+    pub patience: Duration,
+}
+
+impl Dial {
+    pub fn for_config(cfg: &synology_filestation_smb::SmbConfig) -> Self {
+        Self {
+            port: cfg.port,
+            patience: cfg.timeout,
+        }
+    }
+}
+
+/// Dial a host the chain says answers directly, as `dial` says.
 ///
 /// The port is appended only when the host does not already carry one, the
 /// same rule `SmbConfig::addr` follows — a route naming `host:port` means that
-/// port, and appending 445 to it produces an address that resolves to nothing.
-///
-/// Bounded because a redial runs holding the transport's lock, and a direct
-/// decision never expires: off campus, a bare connect to a port that drops
-/// packets waits out the kernel's own timeout — about two minutes on Linux —
-/// with every operation on the mount queued behind it rather than falling
-/// back to HTTP.
-async fn dial_direct(host: &str, patience: Duration) -> Result<BoxedStream, SynoFsError> {
-    const SMB_PORT: u16 = 445;
+/// port, and appending another to it produces an address that resolves to
+/// nothing.
+async fn dial_direct(host: &str, dial: Dial) -> Result<BoxedStream, SynoFsError> {
+    let Dial { port, patience } = dial;
     let addr = if host.contains(':') {
         host.to_string()
     } else {
-        format!("{host}:{SMB_PORT}")
+        format!("{host}:{port}")
     };
     match tokio::time::timeout(patience, tokio::net::TcpStream::connect(&addr)).await {
         Ok(Ok(stream)) => Ok(Box::new(stream) as BoxedStream),
@@ -938,6 +965,40 @@ mod redial_tests {
         }
     }
 
+    /// Regression: `SYNOLOGY_FS_SMB_PORT` moves SMB off 445, and the redial
+    /// dialled 445 regardless — so a deployment on another port could reopen
+    /// nothing directly. The host here carries no port, so only the configured
+    /// one can reach the listener.
+    #[tokio::test]
+    async fn a_direct_redial_dials_the_configured_port() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a port to answer on");
+        let port = listener.local_addr().expect("its address").port();
+        let accepted = tokio::spawn(async move { listener.accept().await.map(|_| ()) });
+
+        let chain = Arc::new(Chain::new(
+            TransportPolicy::default(),
+            Endpoints::public_only("127.0.0.1"),
+            Box::new(Answers),
+            Box::new(NoTunnel),
+            DEFAULT_RECHECK,
+        ));
+        let dial = Dial {
+            port,
+            patience: Duration::from_secs(5),
+        };
+
+        let reopened = reopen_through(chain, dial)().await;
+
+        assert!(
+            reopened.is_ok(),
+            "{:?}",
+            reopened.err().map(|e| e.to_string())
+        );
+        assert!(accepted.await.expect("the accept task ran").is_ok());
+    }
+
     /// Regression: a mount whose tunnel is gone, on a machine that can now
     /// reach the NAS directly, refused to reopen at all. The redial reported
     /// that the leg had changed and gave up, so SMB stayed dead for the life
@@ -961,7 +1022,14 @@ mod redial_tests {
             DEFAULT_RECHECK,
         ));
 
-        let reopened = reopen_through(chain, Duration::from_secs(5))().await;
+        let reopened = reopen_through(
+            chain,
+            Dial {
+                port: 445,
+                patience: Duration::from_secs(5),
+            },
+        )()
+        .await;
 
         assert!(
             reopened.is_ok(),
@@ -997,9 +1065,15 @@ mod redial_tests {
             Box::new(NoTunnel),
             DEFAULT_RECHECK,
         ));
-        reopen_through(chain, Duration::from_secs(5))()
-            .await
-            .expect("a stream");
+        reopen_through(
+            chain,
+            Dial {
+                port: 445,
+                patience: Duration::from_secs(5),
+            },
+        )()
+        .await
+        .expect("a stream");
         let _ = accepting.await;
 
         let text = logs.text();
@@ -1049,7 +1123,13 @@ mod redial_tests {
 
         let reopened = tokio::time::timeout(
             Duration::from_secs(5),
-            reopen_through(chain, Duration::from_millis(500))(),
+            reopen_through(
+                chain,
+                Dial {
+                    port: 445,
+                    patience: Duration::from_millis(500),
+                },
+            )(),
         )
         .await
         .expect("gave up within its patience, rather than the kernel's");
