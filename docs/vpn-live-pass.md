@@ -113,8 +113,13 @@ this process and so is the TCP stack that speaks through it. What proves it
 worked is the line:
 
 ```
-Transport: SMB, through a tunnel to 10.90.24.1
+Transport: SMB via VPN at 10.90.24.1
 ```
+
+A mount that is already running on the HTTP API when the tunnel starts working
+does not need a remount: within a minute it logs
+`Transport: now SMB via VPN at 10.90.24.1, was HTTPS`. Back on campus it moves
+on again, to `Transport: now SMB at <nas>, was SMB via VPN at 10.90.24.1`.
 
 `--vpn-profile` is where the copy lives on *this machine*; `--vpn-profile-nas`
 is where it lives on the NAS. If the first does not exist yet it is fetched
@@ -160,8 +165,9 @@ running them in order is that the first one to fail is the one to fix.
 | `VPN profile: cannot read … ; the tunnel leg will not be available` | The profile is not where `--vpn-profile` says and could not be fetched. Check `--vpn-profile-nas`, and that the local path is one you can write to. The mount is on HTTP. |
 | `the vpn tunnel to … did not come up` | Our client could not do what step 2 did. That is a client bug, and step 2 passing is what makes it one. |
 | `the tunnel is up, but nothing answered at 10.90.24.1:445 inside it` | The tunnel carried packets and SMB did not answer through it. Different problem, deliberately worded to be a different sentence. |
-| `SMB through the tunnel: … ; using the HTTP API` | The connection was made and the SMB session failed on top of it — credentials, dialect, signing. |
-| `Transport: the HTTP API` with nothing above it | No leg was reachable, which is the fallback working. |
+| `Transport: no SMB session through the tunnel (…); staying on HTTPS` | The connection was made and the SMB session failed on top of it — dialect, signing. The tunnel is then left alone for ten minutes rather than raised every minute. |
+| `SMB: the server refused the login (…)` | The SMB login itself was rejected — usually an AD account with no domain set. It is not retried until the share is reconnected: DSM's auto-block would make a retry loop permanent. |
+| `Transport: HTTPS` with nothing above it | No leg was reachable, which is the fallback working. The mount keeps looking, and logs `Transport: now …, was HTTPS` when a leg answers. |
 
 ## Why this gated the in-process client
 

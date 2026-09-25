@@ -245,7 +245,7 @@ The chain's choice at connect used to be the choice for the life of the mount: o
 - **`Legs::watch` asks `Chain::better_than(current)` every 60 s.** On direct SMB that costs nothing (the `is_best` contract). From the tunnel only the direct probe runs; from HTTP, the direct probe and then the tunnel. The chain settles on a leg only once a session is up on it (`Chain::settle`).
 - **A tunnel that failed waits `DEFAULT_TUNNEL_RECHECK` (10 min)**, because raising one is a full OpenVPN handshake and a real login. A tunnel whose stream merely ended is raised again at once.
 - **A refused login is final, on both legs.** A tunnel refusal was already latched in `Chain`; an SMB one now is too (`ReconnectState::refuse`), and it is no longer folded into `Io` on the redial path, where it had been retried on the next operation. DSM's auto-block is 3 strikes and permanent. After a refusal the transport declines to HTTP rather than reporting `PermissionDenied` for files the account can read.
-- **The badge is live.** `syno_transport` reads `Legs::current()` — HTTP whenever the session is not up, otherwise the leg the chain settled on — and the GUI re-reads it every 5 s (`TransportWatch`). Each change is logged once as `Transport: now X, was Y`.
+- **The badge is live.** `syno_transport` reads `Legs::current()` — HTTP whenever the session is not up, otherwise the leg the chain settled on — and the GUI re-reads it every 5 s (`TransportWatch`). Each change is logged once, naming the host: `Transport: now SMB at <host>, was HTTPS` (the in-tunnel address on the VPN leg).
 
 ## Known Limitations
 
