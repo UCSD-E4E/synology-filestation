@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.1](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-fuse-v0.8.0...synology-filestation-fuse-v0.8.1) (2026-09-25)
+
+
+### Bug Fixes
+
+* **fuse:** name the host when the leg changes; test: stop two log tests flaking ([ece4646](https://github.com/UCSD-E4E/synology-filestation/commit/ece4646a7581f8414ad9d966f92a25b0375de65a))
+
 ## [0.8.0](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-fuse-v0.7.0...synology-filestation-fuse-v0.8.0) (2026-09-25)
 
 
