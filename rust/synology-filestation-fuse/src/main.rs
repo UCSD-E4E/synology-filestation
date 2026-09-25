@@ -425,15 +425,24 @@ fn run(args: Args) -> anyhow::Result<()> {
         Some(inside) => Endpoints::with_tunnel(&args.host, inside),
         None => Endpoints::public_only(&args.host),
     };
+    // Built before the chain: the probe has to ask the port this config will
+    // dial (`SYNOLOGY_FS_SMB_PORT`), or it decides the leg on one nothing uses.
+    let smb_cfg = SmbConfig::for_account(
+        &args.host,
+        &args.username,
+        &password,
+        args.domain.as_deref(),
+    );
     // Shared rather than owned: the SMB transport keeps a handle to it so a
     // dead tunnel can be asked for a new connection long after the mount
     // started, and the leg watch below asks it for better ones.
     let chain = Arc::new(Chain::new(
         policy,
         endpoints,
-        Box::new(TcpProber::new(probe_timeout(
-            std::env::var(SMB_TIMEOUT_ENV).ok(),
-        ))),
+        Box::new(TcpProber::on_port(
+            smb_cfg.port,
+            probe_timeout(std::env::var(SMB_TIMEOUT_ENV).ok()),
+        )),
         tunnel_from(&args, &args.username, &password),
         DEFAULT_RECHECK,
     ));
@@ -459,12 +468,6 @@ fn run(args: Args) -> anyhow::Result<()> {
     // tunnel moves to a direct connection when that answers. The transport is
     // attached whether or not a leg answered — without a session it stands
     // aside for HTTP — so there is somewhere for the session to go.
-    let smb_cfg = SmbConfig::for_account(
-        &args.host,
-        &args.username,
-        &password,
-        args.domain.as_deref(),
-    );
     let legs = rt.block_on(Legs::start(chain.clone(), &smb_cfg));
     let on = legs
         .as_ref()
@@ -476,8 +479,8 @@ fn run(args: Args) -> anyhow::Result<()> {
         Some(legs) => synology_filestation_smb::attach(client, legs.session().clone()),
         None => client,
     });
-    // Aborted when it is dropped at the end of `main`, after the unmount.
-    let _watching = legs
+    // Stopped explicitly before teardown, below; dropping it aborts it.
+    let watching = legs
         .as_ref()
         .map(|legs| AbortOnDrop(legs.watch(rt.handle(), DEFAULT_WATCH_INTERVAL)));
 
@@ -495,6 +498,10 @@ fn run(args: Args) -> anyhow::Result<()> {
     // Block until Ctrl-C, then unmount and log out — preserving the previous
     // foreground CLI behaviour now that the mount itself runs in the background.
     rt.block_on(tokio::signal::ctrl_c())?;
+    // Before anything is torn down. A look landing during the unmount or the
+    // logout could raise a tunnel — a real directory login — for a mount that
+    // is going away.
+    drop(watching);
     info!("Signal received, unmounting…");
     handle.stop();
 

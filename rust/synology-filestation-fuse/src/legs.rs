@@ -24,7 +24,7 @@ use synology_filestation_core::error::SynoFsError;
 use synology_filestation_smb::{SmbConfig, SmbTransport};
 use tracing::{info, warn};
 
-use crate::{dial_direct, reopen_through};
+use crate::{dial_direct, reopen_through, Dial};
 
 /// How often a mount on a degraded leg looks for a better one.
 ///
@@ -41,7 +41,11 @@ pub trait Session: Send + Sync + 'static {
     /// Whether the server has refused the login. Nothing asks again after.
     fn is_refused(&self) -> bool;
     /// Build a session on `route` and make it the one in use.
-    fn take(&self, route: SmbRoute) -> impl Future<Output = Result<(), SynoFsError>> + Send;
+    fn take(
+        &self,
+        route: SmbRoute,
+        dial: Dial,
+    ) -> impl Future<Output = Result<(), SynoFsError>> + Send;
 }
 
 impl Session for SmbTransport {
@@ -53,10 +57,10 @@ impl Session for SmbTransport {
         self.refused().is_some()
     }
 
-    async fn take(&self, route: SmbRoute) -> Result<(), SynoFsError> {
+    async fn take(&self, route: SmbRoute, dial: Dial) -> Result<(), SynoFsError> {
         match route {
             SmbRoute::Direct { host } => {
-                let stream = dial_direct(&host, self.dial_patience()).await?;
+                let stream = dial_direct(&host, dial).await?;
                 self.adopt(stream, &host).await
             }
             SmbRoute::Tunnelled { host, connection } => self.adopt(connection, &host).await,
@@ -69,6 +73,8 @@ impl Session for SmbTransport {
 pub struct Legs<S: Session = SmbTransport> {
     chain: Arc<Chain>,
     session: Arc<S>,
+    /// Where and how long to dial a direct leg — the same as the redial uses.
+    dial: Dial,
     /// The leg last reported, so a change is logged once rather than every
     /// time the watch looks.
     reported: Mutex<Option<Transport>>,
@@ -89,21 +95,23 @@ impl Legs<SmbTransport> {
         }
         // The redial is what a session that dies between looks uses to come
         // straight back; the watch covers everything the redial cannot.
+        let dial = Dial::for_config(cfg);
         let smb = Arc::new(SmbTransport::unconnected(
             cfg,
-            reopen_through(chain.clone(), cfg.timeout),
+            reopen_through(chain.clone(), dial),
         ));
-        let legs = Arc::new(Self::new(chain, smb));
+        let legs = Arc::new(Self::new(chain, smb, dial));
         legs.step().await;
         Some(legs)
     }
 }
 
 impl<S: Session> Legs<S> {
-    pub fn new(chain: Arc<Chain>, session: Arc<S>) -> Self {
+    pub fn new(chain: Arc<Chain>, session: Arc<S>, dial: Dial) -> Self {
         Self {
             chain,
             session,
+            dial,
             reported: Mutex::new(None),
         }
     }
@@ -155,7 +163,7 @@ impl<S: Session> Legs<S> {
             SmbRoute::Tunnelled { host, .. } => (Transport::SmbOverVpn, host.clone()),
             SmbRoute::Unavailable => return,
         };
-        match self.session.take(route).await {
+        match self.session.take(route, self.dial).await {
             Ok(()) => self.chain.settle(Route {
                 transport: leg,
                 smb_host: Some(host),
@@ -223,6 +231,10 @@ mod tests {
 
     use crate::log_capture::LogCapture;
 
+    const TEST_DIAL: Dial = Dial {
+        port: 445,
+        patience: Duration::from_secs(2),
+    };
     const PUBLIC: &str = "e4e-nas.ucsd.edu";
     const INSIDE: &str = "10.90.24.1";
 
@@ -314,7 +326,7 @@ mod tests {
         fn is_refused(&self) -> bool {
             self.refused.load(Ordering::SeqCst)
         }
-        async fn take(&self, route: SmbRoute) -> Result<(), SynoFsError> {
+        async fn take(&self, route: SmbRoute, _dial: Dial) -> Result<(), SynoFsError> {
             let what = match &route {
                 SmbRoute::Direct { host } => format!("direct {host}"),
                 SmbRoute::Tunnelled { host, .. } => format!("tunnel {host}"),
@@ -345,7 +357,7 @@ mod tests {
             DEFAULT_RECHECK,
         ));
         let session = Arc::new(FakeSession::default());
-        let legs = Arc::new(Legs::new(chain.clone(), session.clone()));
+        let legs = Arc::new(Legs::new(chain.clone(), session.clone(), TEST_DIAL));
         (legs, session, chain)
     }
 

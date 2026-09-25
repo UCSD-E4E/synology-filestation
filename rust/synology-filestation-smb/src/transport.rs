@@ -670,14 +670,6 @@ impl SmbTransport {
         self.reconnect.is_live()
     }
 
-    /// How long a caller dialling this transport's server should wait for it:
-    /// the config's `timeout`, which [`SmbConfig::for_account`] takes from
-    /// `SYNOLOGY_FS_SMB_TIMEOUT_MS`. A transport handed its streams does no
-    /// dialling of its own, so whoever dials for it needs the number.
-    pub fn dial_patience(&self) -> Duration {
-        self.cfg.lock().unwrap_or_else(|e| e.into_inner()).timeout
-    }
-
     /// Why the server refused the login, if it has. Once it has, this
     /// transport builds no session again: see [`adopt`](Self::adopt).
     pub fn refused(&self) -> Option<String> {

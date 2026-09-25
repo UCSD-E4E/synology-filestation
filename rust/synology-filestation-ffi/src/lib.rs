@@ -403,13 +403,21 @@ async fn reach(
     let smb_disabled = std::env::var_os("SYNOLOGY_FS_SMB_DISABLE").is_some();
     let policy = TransportPolicy::from_flags(smb_disabled, false, false)
         .expect("HTTP is never disabled here, so something is always allowed");
+    // Built before the chain: the probe has to ask the port this config will
+    // dial (`SYNOLOGY_FS_SMB_PORT`), or it decides the leg on one nothing uses.
+    let cfg = SmbConfig::for_account(
+        settings.host,
+        settings.username,
+        settings.password,
+        settings.domain,
+    );
     // Shared rather than owned: the SMB transport keeps a handle to it so a
     // dead stream can be reopened long after this call returned, and the leg
     // watch asks it for better ones.
     let chain = Arc::new(Chain::new(
         policy,
         endpoints,
-        Box::new(TcpProber::new(SMB_PROBE_TIMEOUT)),
+        Box::new(TcpProber::on_port(cfg.port, SMB_PROBE_TIMEOUT)),
         tunnel,
         DEFAULT_RECHECK,
     ));
@@ -419,12 +427,6 @@ async fn reach(
     // account with no domain does. So what the badge reports is the session,
     // not the probe; `Legs` says which, and says so in the log when it
     // changes.
-    let cfg = SmbConfig::for_account(
-        settings.host,
-        settings.username,
-        settings.password,
-        settings.domain,
-    );
     match Legs::start(chain, &cfg).await {
         Some(legs) => (
             synology_filestation_smb::attach(client, legs.session().clone()),
@@ -625,6 +627,13 @@ pub unsafe extern "C" fn syno_connect(
 pub unsafe extern "C" fn syno_logout(client: *mut SynoClient) {
     let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
         if let Some(c) = client.as_ref() {
+            // First, and not left to the free: the GUI logs out before it
+            // frees, and on a slow teardown the gap between them runs past
+            // twenty seconds. A look landing in it could raise a tunnel — a
+            // real directory login — for a connection that is going away.
+            if let Some(watching) = &c.watching {
+                watching.abort();
+            }
             info!("teardown: logging out");
             let _ = c.runtime.block_on(c.inner.logout());
             info!("teardown: logged out");
@@ -1627,6 +1636,42 @@ mod tests {
         // badge saying so, until the user disconnected and connected again.
         let legs = legs.expect("a place for SMB to go");
         assert!(!legs.session().is_connected());
+    }
+
+    /// Regression: the leg watch was stopped only when the handle was freed,
+    /// and the GUI logs out first — a gap that runs past twenty seconds when
+    /// teardown is slow. A look landing in it could raise a tunnel, which is a
+    /// real directory login, for a connection that was already going away.
+    #[test]
+    fn logging_out_stops_the_leg_watch() {
+        let runtime = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .expect("a runtime"),
+        );
+        let watching = runtime.spawn(std::future::pending::<()>());
+        let mut client = SynoClient {
+            // Refused at once, so the logout itself is quick.
+            inner: Arc::new(SynologyClient::new("127.0.0.1", 1, false)),
+            runtime: runtime.clone(),
+            legs: None,
+            watching: Some(watching),
+        };
+
+        unsafe { syno_logout(&mut client) };
+
+        let stopped = runtime.block_on(async {
+            for _ in 0..100 {
+                if client.watching.as_ref().is_none_or(|w| w.is_finished()) {
+                    return true;
+                }
+                tokio::task::yield_now().await;
+            }
+            false
+        });
+        assert!(stopped, "the watch is stopped by the logout, not the free");
     }
 
     #[test]

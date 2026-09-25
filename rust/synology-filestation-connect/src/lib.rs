@@ -317,7 +317,14 @@ impl TcpProber {
     /// is not used — the tunnel drops it by design, so a ping would report a
     /// working path as dead.
     pub fn new(timeout: Duration) -> Self {
-        Self { port: 445, timeout }
+        Self::on_port(SMB_PORT, timeout)
+    }
+
+    /// Probe `port` instead, for an appliance whose SMB is not on 445 — what
+    /// `SYNOLOGY_FS_SMB_PORT` says. The probe has to ask the port that will
+    /// be dialled, or it decides the leg on one nothing uses.
+    pub fn on_port(port: u16, timeout: Duration) -> Self {
+        Self { port, timeout }
     }
 }
 
@@ -1455,6 +1462,20 @@ mod tests {
 
         assert!(chain.better_than(Transport::Https).await.is_none());
         assert_eq!(tunnel.opens(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_prober_for_another_port_asks_that_port() {
+        // `SYNOLOGY_FS_SMB_PORT` moves SMB off 445. A probe that still asked
+        // 445 decided the leg on a port nothing would then dial.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a port to answer on");
+        let port = listener.local_addr().expect("its address").port();
+
+        let prober = TcpProber::on_port(port, Duration::from_secs(2));
+
+        assert!(prober.smb_reachable("127.0.0.1").await);
     }
 
     #[tokio::test]
