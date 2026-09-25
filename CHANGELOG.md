@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.8.0](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-fuse-v0.7.0...synology-filestation-fuse-v0.8.0) (2026-09-25)
+
+
+### Features
+
+* **connect:** look for a better leg, and ration the tunnel ([1eb97dc](https://github.com/UCSD-E4E/synology-filestation/commit/1eb97dc31b917f95244e8d8479f0675b7142b104))
+* **fuse:** a mount moves to a better leg while it runs ([c1f47b6](https://github.com/UCSD-E4E/synology-filestation/commit/c1f47b6da368997f6e4ff333d3dad341f7515657)), closes [#233](https://github.com/UCSD-E4E/synology-filestation/issues/233)
+* **gui:** keep the transport badge current ([a9eb1c6](https://github.com/UCSD-E4E/synology-filestation/commit/a9eb1c6939bc8606412fb8cc7b25c3b0791f484d))
+* **smb:** a transport that can be handed a session later ([74ee7eb](https://github.com/UCSD-E4E/synology-filestation/commit/74ee7eb6b9acc6090a70dcff6b1819559a458e07))
+
+
+### Bug Fixes
+
+* **connect:** ask the tunnel for SMB's configured port ([3e83c81](https://github.com/UCSD-E4E/synology-filestation/commit/3e83c815b38bec686eeb73b84f5342625f1b60fd))
+* **core:** a backend that declines a transfer hands it to HTTP ([acbceb5](https://github.com/UCSD-E4E/synology-filestation/commit/acbceb569c774c6e218510e5a17360bc9346cdee))
+* **fuse:** bound the direct dial, and ration a tunnel that carries nothing ([31e5be2](https://github.com/UCSD-E4E/synology-filestation/commit/31e5be23b6dd69329a9fa7f3740bacd3d4f3f703))
+* stop the leg watch before teardown, and dial SMB's configured port ([06b00cb](https://github.com/UCSD-E4E/synology-filestation/commit/06b00cbea5c424800257d135e7f61699a3ff7a7b))
+
 ## 0.1.17 – 0.7.0
 
 From 0.1.17 through 0.7.0 each component was released separately, with its own changelog and its own GitHub release:
