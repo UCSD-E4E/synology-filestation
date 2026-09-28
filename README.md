@@ -76,7 +76,7 @@ The repository ships a flake exposing both binaries as packages:
 |---|---|---|
 | `synology-filestation-fuse` (also `default`) | `synology-filestation-fuse` | The Rust CLI |
 | `synology-filestation-ffi` | *(library only)* | The native C ABI library (cdylib) the GUI loads |
-| `synologyfuse-gui` | **`SynologyFuse.Gui`** | The .NET 10 / Avalonia desktop GUI |
+| `synologyfuse-gui` | **`SynologyFuse.Gui`** | The .NET 10 / Avalonia desktop GUI — plus a desktop entry on Linux, or `Applications/SynologyFuse.app` on macOS |
 
 Note the GUI's package name and its command differ: you install `synologyfuse-gui` but you run `SynologyFuse.Gui`.
 
@@ -138,9 +138,45 @@ Then `sudo nixos-rebuild switch --flake .#YOUR_HOST`. For [Home Manager](https:/
 
 On NixOS the CLI mounts via a setuid `fusermount3`; if you hit `fusermount3: permission denied`, the `programs.fuse.userAllowOther = true` option above provides it (this is the NixOS equivalent of the [`/etc/fuse.conf` step](#linux-fuse-configuration-allow_other) below).
 
+### Declarative (nix-darwin / Home Manager on macOS)
+
+The same packages go in `environment.systemPackages` under [nix-darwin](https://github.com/nix-darwin/nix-darwin), or in `home.packages` under Home Manager:
+
+```nix
+{
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    synology-filestation.url = "github:UCSD-E4E/synology-filestation";
+    synology-filestation.inputs.nixpkgs.follows = "nixpkgs";
+  };
+
+  outputs = { self, nixpkgs, home-manager, synology-filestation, ... }: {
+    homeConfigurations.YOUR_USER = home-manager.lib.homeManagerConfiguration {
+      pkgs = nixpkgs.legacyPackages.aarch64-darwin;   # or x86_64-darwin
+      modules = [
+        ({ pkgs, ... }: {
+          home.packages = [
+            synology-filestation.packages.${pkgs.system}.synologyfuse-gui
+            synology-filestation.packages.${pkgs.system}.synology-filestation-fuse  # optional
+          ];
+        })
+      ];
+    };
+  };
+}
+```
+
+There is nothing to configure on the mount side: **no kernel extension and no FUSE settings.** `programs.fuse.userAllowOther` is a NixOS option with no macOS equivalent and no macOS purpose — the backend here is a WebDAV server on `127.0.0.1` that the OS mounts for you, so nothing is loaded into the kernel and nothing needs elevated rights. The one constraint is the mountpoint: **it must be under `/Volumes/`** (for example `/Volumes/nas`), because the volume is mounted through Finder.
+
+Three macOS-specific things worth knowing:
+
+- **The GUI installs an application bundle.** `synologyfuse-gui` places `SynologyFuse.app` in `$out/Applications`, which is where Home Manager's `targets.darwin.linkApps` (on by default) and nix-darwin's own app linking look. Home Manager links it into `~/Applications/Home Manager Apps`; nix-darwin links system packages into `/Applications/Nix Apps`.
+- **Spotlight may not index it.** Both mechanisms link the bundle rather than copying it, and Spotlight skips symlinked bundles. If **NAS Folder Access** launches from Finder but never appears in Spotlight or Launchpad, that is why, and the usual workaround is to have your configuration create real Finder aliases with `mkalias` instead of symlinks.
+- **The first mount asks permission.** Mounting sends an AppleScript `mount volume` to Finder, so macOS shows an automation consent prompt once, recorded under *System Settings → Privacy & Security → Automation*. The Nix bundle is not code-signed with a stable identity, so the grant is tied to the store path and macOS asks again after a version bump.
+
 ### Develop against the flake
 
-`nix develop` drops you into a shell with the Rust toolchain (clippy/rustfmt), `pkg-config` + `fuse3`, the Python binding toolchain (`uv`, `maturin`, `python3`), and the .NET 10 SDK — everything needed to build every component in this repo. `nix flake check` runs the CLI build, clippy, rustfmt, and the GUI build + test suite.
+`nix develop` drops you into a shell with the Rust toolchain (clippy/rustfmt), `pkg-config` + `fuse3`, the Python binding toolchain (`uv`, `maturin`, `python3`), and the .NET 10 SDK — everything needed to build every component in this repo. `nix flake check` runs the CLI build, clippy, rustfmt, and the GUI build + test suite; on macOS it also validates the GUI's `.app` bundle.
 
 Supported systems: `x86_64-linux`, `aarch64-linux`, `x86_64-darwin`, `aarch64-darwin`.
 

@@ -188,6 +188,20 @@
             startupWMClass = "SynologyFuse.Gui";
           };
 
+          # The GUI calls the Rust core directly through the native FFI library
+          # (no subprocess). The resolver in NativeMethods.cs honours
+          # SYNOFS_NATIVE_DIR, so point it at the cdylib's output dir to make
+          # `nix run .#gui` self-sufficient. The CLI is also placed on PATH for
+          # users who want the standalone terminal tool.
+          #
+          # Named once because darwin does not use the wrapper the dotnet fixup
+          # hook would put in $out/bin — it builds its own inside the .app (see
+          # postFixup) and the two must not drift.
+          guiWrapperArgs = [
+            "--set SYNOFS_NATIVE_DIR ${synology-filestation-ffi}/lib"
+            "--prefix PATH : ${lib.makeBinPath [ synology-filestation-fuse ]}"
+          ];
+
           synologyfuse-gui = pkgs.buildDotnetModule {
             pname = "synologyfuse-gui";
             inherit (crateName) version;
@@ -204,32 +218,76 @@
             dotnet-sdk = dotnet;
             dotnet-runtime = pkgs.dotnetCorePackages.runtime_10_0;
 
-            executables = [ "SynologyFuse.Gui" ];
+            # Declared-but-empty on darwin so the fixup hook writes no wrapper
+            # to $out/bin: the launcher has to live inside the bundle instead,
+            # and postFixup puts a symlink back in $out/bin.
+            executables = lib.optionals isLinux [ "SynologyFuse.Gui" ];
             selfContainedBuild = true;
             runtimeDeps = guiRuntimeDeps;
 
-            # Desktop entry + icon, so the app is discoverable in a launcher
-            # instead of terminal-only. Linux-only: on darwin the .app bundle
-            # built by SynologyFuse.MacInstaller carries this instead.
-            nativeBuildInputs = lib.optionals isLinux [ pkgs.copyDesktopItems ];
+            # Desktop entry + icon on Linux, .app bundle on darwin. Either way
+            # the point is the same: without one the package installs a bare
+            # executable with nothing in the application launcher, so the only
+            # way to start the GUI is to type its name in a terminal.
+            nativeBuildInputs =
+              lib.optionals isLinux [ pkgs.copyDesktopItems ]
+              # png2icns, because iconutil ships with the Xcode command line
+              # tools and does not exist in a Nix build. Not imagemagick: it
+              # would resize the source into the 16→512 ladder the .pkg builds
+              # with sips, and drag a 1.8 GB closure into a build whose CI cache
+              # is already the tight resource. png2icns takes the 1024×1024
+              # asset as a single ic10 element and lets macOS scale down, so
+              # this icon and the .pkg's are not byte-identical by design.
+              ++ lib.optionals isDarwin [ pkgs.libicns ];
             desktopItems = lib.optionals isLinux [ guiDesktopItem ];
 
-            postInstall = lib.optionalString isLinux ''
-              # The source asset is 1024×1024, so it goes in the directory that
-              # says so — icon themes scale down from the largest available.
-              install -Dm644 SynologyFuse.Gui/Assets/app.png \
-                "$out/share/icons/hicolor/1024x1024/apps/synologyfuse.png"
+            postInstall =
+              lib.optionalString isLinux ''
+                # The source asset is 1024×1024, so it goes in the directory that
+                # says so — icon themes scale down from the largest available.
+                install -Dm644 SynologyFuse.Gui/Assets/app.png \
+                  "$out/share/icons/hicolor/1024x1024/apps/synologyfuse.png"
+              ''
+              + lib.optionalString isDarwin ''
+                # macOS launches an application through its bundle and derives
+                # NSBundle.mainBundle from the path of the *running* executable.
+                # So the payload cannot stay in $out/lib with a launcher that
+                # execs into it: that process has no Info.plist, which costs the
+                # Dock icon and the display name even though the bundle itself
+                # is well formed. Move the publish output in and leave a symlink
+                # behind so the layout still reads the same as on Linux.
+                app="$out/Applications/SynologyFuse.app"
+                mkdir -p "$app/Contents/Resources"
+                mv "$out/lib/synologyfuse-gui" "$app/Contents/MacOS"
+                ln -s "$app/Contents/MacOS" "$out/lib/synologyfuse-gui"
+
+                # Shared with SynologyFuse.MacInstaller — the template, not the
+                # assembled bundle. This launcher hard-codes /nix/store paths,
+                # so a .pkg built from it would not run without Nix installed.
+                substitute SynologyFuse.MacInstaller/Info.plist "$app/Contents/Info.plist" \
+                  --replace-fail __VERSION__ "$version" \
+                  --replace-fail __GUI_BINARY__ SynologyFuse.Gui
+
+                png2icns "$app/Contents/Resources/AppIcon.icns" \
+                  SynologyFuse.Gui/Assets/app.png
+              '';
+
+            # Wrapping in place keeps the exec target inside Contents/MacOS:
+            # wrapProgram moves the apphost to .SynologyFuse.Gui-wrapped beside
+            # itself, and the apphost carries its managed assembly name
+            # internally, so the rename does not affect how it finds the DLL.
+            postFixup = lib.optionalString isDarwin ''
+              app="$out/Applications/SynologyFuse.app"
+              wrapProgram "$app/Contents/MacOS/SynologyFuse.Gui" \
+                ${lib.concatStringsSep " " guiWrapperArgs}
+
+              # One launcher, two entry points. $out/bin is what `nix run .#gui`,
+              # meta.mainProgram and a shell invocation all reach.
+              mkdir -p "$out/bin"
+              ln -s "$app/Contents/MacOS/SynologyFuse.Gui" "$out/bin/SynologyFuse.Gui"
             '';
 
-            # The GUI calls the Rust core directly through the native FFI
-            # library (no subprocess). The resolver in NativeMethods.cs honours
-            # SYNOFS_NATIVE_DIR, so point it at the cdylib's output dir to make
-            # `nix run .#gui` self-sufficient. The CLI is also placed on PATH for
-            # users who want the standalone terminal tool.
-            makeWrapperArgs = [
-              "--set SYNOFS_NATIVE_DIR ${synology-filestation-ffi}/lib"
-              "--prefix PATH : ${lib.makeBinPath [ synology-filestation-fuse ]}"
-            ];
+            makeWrapperArgs = guiWrapperArgs;
 
             meta = {
               description = "Desktop GUI for the Synology FileStation filesystem driver";
@@ -270,6 +328,17 @@
             );
 
             fmt = craneLib.cargoFmt { inherit (crateName) pname version; inherit src; };
+          }
+          // lib.optionalAttrs isDarwin {
+            # The darwin GUI output has to carry a bundle macOS will actually
+            # launch, and `nix build` cannot fail on that: a malformed bundle
+            # builds fine and simply never appears in Spotlight. Reached by
+            # `nix flake check` on a mac and by the darwin CI job.
+            gui-app-bundle = pkgs.runCommand "synologyfuse-gui-app-bundle" { } ''
+              ${pkgs.python3}/bin/python3 ${./nix/check-app-bundle.py} \
+                ${synologyfuse-gui} ${crateName.version}
+              touch "$out"
+            '';
           };
 
           devShells.default = craneLib.devShell {
