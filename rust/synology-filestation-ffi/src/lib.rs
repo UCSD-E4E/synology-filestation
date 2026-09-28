@@ -12,6 +12,7 @@
 //! Rust core (or, for the mount, the WinFsp worker thread) is converted to a
 //! `Panic` status rather than unwinding across the FFI boundary (UB).
 
+use std::any::Any;
 use std::ffi::{c_void, CStr, CString};
 use std::os::raw::c_char;
 use std::panic::AssertUnwindSafe;
@@ -159,11 +160,36 @@ unsafe fn set_core_err(err: *mut SynoError, e: &SynoFsError) -> i32 {
     set_err(err, status, dsm, &e.to_string())
 }
 
+/// The text a panic was raised with, for the payload shapes `panic!` produces.
+fn panic_text(payload: &(dyn Any + Send)) -> &str {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        s
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.as_str()
+    } else {
+        "no message"
+    }
+}
+
 /// Run `f`, converting any panic into a `Panic` status written to `err`.
+///
+/// The payload is carried into the message. It used to be dropped, so every
+/// panic reached the GUI as the bare words "panic in native code" while the
+/// text that says what actually went wrong went to stderr — which nobody reads
+/// when the GUI was launched from the Dock rather than a terminal. A mount
+/// that panicked was indistinguishable from any other panic, and diagnosing
+/// one meant reproducing it under a terminal first.
 fn guard<F: FnOnce() -> i32>(err: *mut SynoError, f: F) -> i32 {
     match std::panic::catch_unwind(AssertUnwindSafe(f)) {
         Ok(code) => code,
-        Err(_) => unsafe { set_err(err, SynoStatus::Panic, 0, "panic in native code") },
+        Err(payload) => unsafe {
+            set_err(
+                err,
+                SynoStatus::Panic,
+                0,
+                &format!("panic in native code: {}", panic_text(payload.as_ref())),
+            )
+        },
     }
 }
 
@@ -1277,6 +1303,22 @@ mod tests {
         } else {
             CStr::from_ptr(err.message).to_string_lossy().into_owned()
         }
+    }
+
+    /// A panic's own text has to survive the FFI boundary: it is the only
+    /// thing that says *which* panic happened, and a bundled .app has no
+    /// stderr for the default hook to print to.
+    #[test]
+    fn guard_carries_the_panic_text_into_the_error() {
+        let mut err = empty_err();
+        let code = guard(&mut err, || panic!("there is no reactor running"));
+
+        assert_eq!(code, SynoStatus::Panic as i32);
+        let message = unsafe { err_message(&err) };
+        assert!(
+            message.contains("there is no reactor running"),
+            "panic text was dropped: {message}"
+        );
     }
 
     /// Host/port for the FFI from a mock server URI ("http://127.0.0.1:PORT").
