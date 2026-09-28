@@ -82,9 +82,10 @@ jobs:
     # anything behind an isDarwin guard is never forced and a mac-only break
     # reaches main unnoticed — which is how a reference to the retired
     # darwin.apple_sdk.frameworks tree sat in flake.nix until someone tried to
-    # build on a mac. Evaluating the darwin derivations pins that down for the
-    # price of an eval: no darwin runner, nothing built, just proof that the
-    # expression still resolves on the platforms we claim to support.
+    # build on a mac. The darwin-build job below now compiles the aarch64
+    # outputs for real; this step stays because it is the only thing that
+    # reaches x86_64-darwin, which we claim to support and have no runner for.
+    # An eval cannot catch a build failure, so treat it as a floor, not a check.
     - name: Evaluate the darwin outputs
       run: |
         for system in aarch64-darwin x86_64-darwin; do
@@ -102,6 +103,53 @@ jobs:
         name: nix-deps-json
         path: nix/deps.json
         retention-days: 1
+
+  # Eval proves the darwin expression resolves. It cannot prove the tree
+  # compiles, and it cannot look inside the output: the GUI's .app bundle is
+  # assembled by shell in postInstall/postFixup, so a bad substitution or a
+  # launcher that execs out of the bundle produces a package that builds
+  # perfectly and never appears in Spotlight. Only a darwin runner catches
+  # either, and macos-latest is already arm64 — release-please.yml builds the
+  # .pkg on it.
+  #
+  # Cost note: this keeps a second Nix store in the Actions cache, against a
+  # 10 GB per-repo budget shared with the Linux job above. If the two start
+  # evicting each other, the levers are cache-nix-action's `gc-max-store-size`
+  # or gating this job on changes to flake.nix, nix/ and the .csproj files.
+  darwin-build:
+
+    runs-on: macos-latest
+    timeout-minutes: 60
+
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        # Same reasoning as flake-check: this job builds the PR's code and its
+        # third-party dependencies, so it must not hold a usable git token.
+        persist-credentials: false
+    - name: Install Nix
+      uses: DeterminateSystems/nix-installer-action@main
+    - name: Cache Nix store
+      uses: nix-community/cache-nix-action@v7
+      with:
+        primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock', 'nix/deps.json') }}
+        restore-prefixes-first-match: nix-${{ runner.os }}-
+
+    # The system is read from Nix rather than hard-coded, so the job follows
+    # macos-latest if GitHub ever repoints it at a different architecture
+    # instead of failing on an unbuildable attribute path.
+    #
+    # gui-app-bundle pulls in synologyfuse-gui, which pulls in the FFI cdylib;
+    # the packages are named anyway so a failure says which one broke.
+    - name: Build the darwin outputs
+      run: |
+        system=$(nix eval --raw --impure --expr builtins.currentSystem)
+        echo "Building for $system"
+        nix build -L \
+          ".#packages.$system.synology-filestation-fuse" \
+          ".#packages.$system.synology-filestation-ffi" \
+          ".#packages.$system.synologyfuse-gui" \
+          ".#checks.$system.gui-app-bundle"
 
   # Split out so the write token never exists in the environment that built the
   # PR's code: this job runs no part of the tree, and the only thing crossing

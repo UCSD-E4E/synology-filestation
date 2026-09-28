@@ -296,5 +296,5 @@ CI workflows:
 | `.github/workflows/rust.yml`           | every push / PR        | clippy, build, test for the rust crates + .deb/.pkg/.msi smoke builds |
 | `.github/workflows/python.yml`         | every push             | pytest matrix (Python 3.10–3.13) for the bindings |
 | `.github/workflows/maturin.yml`        | every push             | manylinux wheel smoke build |
-| `.github/workflows/nix.yml`            | push to main / PR      | `nix flake check` — CLI + GUI builds, clippy, rustfmt, GUI tests |
+| `.github/workflows/nix.yml`            | push to main / PR      | `nix flake check` — CLI + GUI builds, clippy, rustfmt, GUI tests; a `macos-latest` job that builds the darwin outputs and validates the `.app` bundle |
 | `.github/workflows/release-please.yml` | push to main (or workflow_dispatch with `tag`) | release-please PR, then every artifact uploaded to the one release |
