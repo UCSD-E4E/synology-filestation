@@ -86,6 +86,13 @@ Key files in `SynologyFuse.MacInstaller/`:
 - `distribution.xml` — installer UI config (welcome screen, license, macOS 12+ requirement)
 - `scripts/postinstall` — symlinks CLI to `/usr/local/bin/` after payload is placed
 
+The Nix flake builds the same bundle for `packages.<darwin>.synologyfuse-gui`, sharing `Info.plist` but **not** the assembled `.app` — the Nix launcher hard-codes `/nix/store` paths, so a `.pkg` built from it would not run without Nix. Two things there are load-bearing and easy to undo by accident:
+
+- **The whole payload lives in `Contents/MacOS`, and the launcher `exec`s a sibling.** macOS derives `NSBundle.mainBundle` from the path of the *running* executable, so a launcher that `exec`s a store path outside the bundle yields a process with no `Info.plist`: no Dock icon, no display name, and a well-formed bundle that looks broken. `postInstall` therefore moves the publish output into the bundle and leaves `$out/lib/synologyfuse-gui` as a symlink; `postFixup` wraps the apphost in place (`wrapProgram`, giving `.SynologyFuse.Gui-wrapped` beside it) and points `$out/bin/SynologyFuse.Gui` at the bundle. The rename is safe because the apphost carries its managed assembly name internally.
+- **`NSAppleEventsUsageDescription` is required to mount.** The macOS backend sends Finder an AppleScript `mount volume`, which TCC gates; without the string macOS denies the event (`errAEEventNotPermitted`) instead of prompting. A terminal launch works regardless because the terminal holds its own automation grant, so this fails *only* from the Dock, Launchpad or Spotlight — including for `.pkg` users.
+
+`checks.<darwin>.gui-app-bundle` (`nix/check-app-bundle.py`) pins both down, since a malformed bundle builds successfully and only shows up as "it never appears in Spotlight".
+
 ### Debian/Ubuntu Package (.deb)
 
 ```bash
