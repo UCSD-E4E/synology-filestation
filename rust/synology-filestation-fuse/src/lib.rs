@@ -539,17 +539,15 @@ impl Drop for PlatformMount {
     fn drop(&mut self) {
         use tracing::info;
         info!("Unmounting {}…", self.mountpoint.display());
-        let mp = self.mountpoint.clone();
         // Ask macOS to unmount the WebDAV volume, then tear down the server.
-        self.rt.block_on(async {
-            let _ = tokio::process::Command::new("diskutil")
-                .args(["unmount", &mp.to_string_lossy()])
-                .status()
-                .await;
-        });
+        // Through the same helper as the mount: the rule about where the
+        // child is spawned applies to every command this file runs, and the
+        // way to keep it applied is to have one place that knows it.
+        let _ = run_command("diskutil", &["unmount", &self.mountpoint.to_string_lossy()]);
         // macOS does not always remove the /Volumes/<name> directory after
         // unmounting a WebDAV volume. Remove it ourselves if it is now empty.
-        let _ = std::fs::remove_dir(&mp);
+        // Off the path itself, not the lossy string the argv needed.
+        let _ = std::fs::remove_dir(&self.mountpoint);
         if let Some(tx) = self.shutdown.take() {
             let _ = tx.send(());
         }
@@ -557,6 +555,27 @@ impl Drop for PlatformMount {
             let _ = self.rt.block_on(server);
         }
     }
+}
+
+/// Run a short-lived command to completion and collect its output.
+///
+/// Deliberately `std::process`, not `tokio::process`. Both callers are
+/// synchronous functions reached from outside the runtime — `spawn_mount` is
+/// called by the CLI before it parks and by the FFI on the GUI's own thread —
+/// and `tokio::process::Command::output()` spawns the child when the future is
+/// *constructed*, not when it is polled. Built as the argument to `block_on`
+/// that spawn therefore happens outside any runtime context, where tokio needs
+/// a reactor to reap the child by SIGCHLD, and it panics: "there is no reactor
+/// running, must be called from the context of a Tokio 1.x runtime". That
+/// panic aborted every GUI mount on macOS, and because it unwound through the
+/// FFI's catch_unwind the user saw only "the volume could not be opened".
+///
+/// Moving the construction inside an `async` block also works. Not spawning
+/// the child on a reactor at all is better: there is nothing to await here,
+/// the caller is already blocked, and this way the trap cannot be re-set.
+#[cfg(target_os = "macos")]
+fn run_command(program: &str, args: &[&str]) -> std::io::Result<std::process::Output> {
+    std::process::Command::new(program).args(args).output()
 }
 
 /// On macOS we mount via Finder which always places volumes under `/Volumes/`.
@@ -666,12 +685,7 @@ pub fn spawn_mount(
 
     // Ask Finder to mount the volume via AppleScript.
     let script = format!("mount volume \"{}\"", url);
-    let out = rt
-        .block_on(
-            tokio::process::Command::new("osascript")
-                .args(["-e", &script])
-                .output(),
-        )
+    let out = run_command("osascript", &["-e", &script])
         .map_err(|e| SynoFsError::Io(format!("failed to run osascript: {e}")))?;
 
     if !out.status.success() {
@@ -695,6 +709,32 @@ pub fn spawn_mount(
             server: Some(server),
         },
     })
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_tests {
+    /// The shape both callers use: a plain synchronous call from a thread that
+    /// is not inside a runtime, since the CLI runs `spawn_mount` before it
+    /// parks and the GUI calls in through the FFI on its own thread. A
+    /// tokio-backed implementation compiles, returns no error, and panics
+    /// here — which is how every macOS GUI mount failed with nothing more
+    /// specific than "the volume could not be opened".
+    ///
+    /// A live runtime exists in the process, exactly as it does at the real
+    /// call sites, and is deliberately not the thing the command is run on.
+    #[test]
+    fn runs_a_command_from_a_thread_outside_the_runtime() {
+        let _rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime should build");
+
+        let out = super::run_command("/bin/echo", &["mounted"]).expect("echo should run");
+
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "mounted");
+    }
 }
 
 // ─── Windows (WinFsp) ───────────────────────────────────────────────────────
