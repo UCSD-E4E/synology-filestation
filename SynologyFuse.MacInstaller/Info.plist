@@ -40,6 +40,18 @@
     <key>NSHighResolutionCapable</key>
     <true/>
 
+    <!--
+      The macOS backend mounts by asking Finder to `mount volume` over
+      AppleScript, which is an Apple event and therefore gated by TCC. Without
+      this string macOS denies the event outright (errAEEventNotPermitted)
+      rather than prompting, so the GUI mounts fine from a terminal — where the
+      terminal's own automation grant covers it — and fails only when launched
+      from the Dock, Launchpad or Spotlight. The text is what the consent
+      dialog shows.
+    -->
+    <key>NSAppleEventsUsageDescription</key>
+    <string>SynologyFuse asks Finder to mount your NAS folder as a local volume.</string>
+
     <key>NSPrincipalClass</key>
     <string>NSApplication</string>
 
