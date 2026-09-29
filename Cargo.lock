@@ -2603,6 +2603,7 @@ dependencies = [
  "sha1 0.11.0",
  "sha2",
  "smoltcp",
+ "socket2",
  "thiserror",
  "tokio",
  "tokio-util",
