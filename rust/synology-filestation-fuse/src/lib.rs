@@ -330,27 +330,154 @@ impl Drop for PlatformMount {
             return;
         };
         let mountpoint = self.mountpoint.clone();
+        // Looked up now: once detached, the mount is no longer listed.
+        // `absolute`, not `canonicalize` — the latter would stat through the
+        // filesystem this is trying to take down.
+        let connection = std::fs::read_to_string("/proc/self/mountinfo")
+            .ok()
+            .and_then(|info| {
+                let path = std::path::absolute(&mountpoint).unwrap_or(mountpoint.clone());
+                fuse_connection(&info, &path)
+            });
+        tear_down(
+            move || {
+                let _ = session.umount_and_join();
+            },
+            UNMOUNT_PATIENCE,
+            &mountpoint,
+            || detach(&mountpoint),
+            || match connection {
+                Some(id) => {
+                    if let Err(e) = abort_connection(std::path::Path::new(FUSECTL), id) {
+                        tracing::warn!("could not abort FUSE connection {id}: {e}");
+                    }
+                }
+                None => tracing::warn!(
+                    "no FUSE connection found for {}; it will finish when its last user lets go",
+                    mountpoint.display()
+                ),
+            },
+        );
+    }
+}
 
-        let (done, finished) = std::sync::mpsc::channel();
-        let joining = std::thread::spawn(move || {
-            let _ = done.send(session.umount_and_join());
-        });
+/// Where the kernel's fusectl filesystem lists FUSE connections.
+#[cfg(target_os = "linux")]
+const FUSECTL: &str = "/sys/fs/fuse/connections";
 
-        if finished.recv_timeout(UNMOUNT_PATIENCE).is_err() {
+/// The FUSE connection id of the mount at `mountpoint`, from the text of
+/// `/proc/self/mountinfo`.
+///
+/// The id is the mount's minor device number (FUSE mounts are major 0), which
+/// is also the name of its directory under [`FUSECTL`]. Read from mountinfo
+/// rather than by `stat`ing the mountpoint, because a `stat` goes through the
+/// very filesystem that is wedged. The last matching line wins: a remount on
+/// top of a detached mount that has not gone yet is listed after it.
+#[cfg(target_os = "linux")]
+fn fuse_connection(mountinfo: &str, mountpoint: &std::path::Path) -> Option<u32> {
+    let wanted = mountpoint.to_str()?;
+    mountinfo.lines().rev().find_map(|line| {
+        let fields: Vec<&str> = line.split(' ').collect();
+        let separator = fields.iter().position(|f| *f == "-")?;
+        let fstype = fields.get(separator + 1)?;
+        if *fstype != "fuse" && !fstype.starts_with("fuse.") {
+            return None;
+        }
+        if unescape_mountinfo(fields.get(4)?) != wanted {
+            return None;
+        }
+        let (major, minor) = fields.get(2)?.split_once(':')?;
+        (major == "0").then(|| minor.parse().ok()).flatten()
+    })
+}
+
+/// Undo mountinfo's octal escapes (`\040` for a space, `\011`, `\012`, `\134`).
+#[cfg(target_os = "linux")]
+fn unescape_mountinfo(field: &str) -> String {
+    let bytes = field.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\'
+            && i + 3 < bytes.len()
+            && bytes[i + 1..i + 4]
+                .iter()
+                .all(|b| (b'0'..=b'7').contains(b))
+        {
+            let code = u8::from_str_radix(&field[i + 1..i + 4], 8).unwrap_or(b'\\');
+            out.push(code);
+            i += 4;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Abort FUSE connection `id` through the fusectl filesystem at `root`.
+///
+/// The connection's directory belongs to the user who mounted it, so this
+/// needs no privilege. Never creates the file: a connection that is already
+/// gone is an error, not a stray file.
+#[cfg(target_os = "linux")]
+fn abort_connection(root: &std::path::Path, id: u32) -> std::io::Result<()> {
+    use std::io::Write;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(root.join(id.to_string()).join("abort"))?
+        .write_all(b"1")
+}
+
+/// The order a Linux mount comes down in: unmount and join, detach past
+/// `patience`, and `abort` past it again. Split out of `Drop` so the
+/// sequence can be driven without a live `/dev/fuse`.
+#[cfg(target_os = "linux")]
+fn tear_down(
+    join: impl FnOnce() + Send + 'static,
+    patience: std::time::Duration,
+    mountpoint: &std::path::Path,
+    detach: impl FnOnce(),
+    abort: impl FnOnce(),
+) {
+    let (done, finished) = std::sync::mpsc::channel();
+    let joining = std::thread::spawn(move || {
+        join();
+        let _ = done.send(());
+    });
+
+    if finished.recv_timeout(patience).is_err() {
+        tracing::warn!(
+            "unmounting {} is taking longer than {patience:?} — a request to the \
+             NAS is still outstanding, so the mount is busy. Detaching it; the filesystem \
+             will finish when that request does.",
+            mountpoint.display()
+        );
+        detach();
+
+        // A lazy detach frees the directory, but the kernel keeps the FUSE
+        // connection until the last process using the old mount lets go — a
+        // job with files open on it, a shell whose cwd is inside. Until then
+        // the session never sees EOF, and waiting for it kept the session,
+        // its runtime and the tunnel under it alive for as long as that
+        // process ran. Aborting the connection is the kernel's own way to end
+        // it: the session's reads fail, its loop exits, and anything still
+        // holding the old mount gets ENOTCONN — which is what disconnecting
+        // was asked to do.
+        if finished.recv_timeout(patience).is_err() {
             tracing::warn!(
-                "unmounting {} is taking longer than {UNMOUNT_PATIENCE:?} — a request to the \
-                 NAS is still outstanding, so the mount is busy. Detaching it; the filesystem \
-                 will finish when that request does.",
+                "{} is detached but still in use; aborting its FUSE connection so the \
+                 filesystem can finish",
                 mountpoint.display()
             );
-            detach(&mountpoint);
+            abort();
         }
+    }
 
-        // However long that takes. Nothing is waiting on this that a person can
-        // see, and letting go early is what turns a stuck request into a panic.
-        if joining.join().is_err() {
-            tracing::warn!("the filesystem's teardown panicked");
-        }
+    // However long that takes. Nothing is waiting on this that a person can
+    // see, and letting go early is what turns a stuck request into a panic.
+    if joining.join().is_err() {
+        tracing::warn!("the filesystem's teardown panicked");
     }
 }
 
@@ -1229,5 +1356,152 @@ mod log_capture {
         fn drop(&mut self) {
             *ACTIVE.lock().unwrap_or_else(|e| e.into_inner()) = None;
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod teardown_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{mpsc, Arc};
+    use std::time::{Duration, Instant};
+
+    const PATIENCE: Duration = Duration::from_millis(50);
+
+    /// Run `tear_down` off this thread and report how long it took, or `None`
+    /// if it never came back.
+    fn timed(
+        join: impl FnOnce() + Send + 'static,
+        detach: impl FnOnce() + Send + 'static,
+        abort: impl FnOnce() + Send + 'static,
+    ) -> Option<Duration> {
+        let (finished, took) = mpsc::channel();
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            tear_down(
+                join,
+                PATIENCE,
+                std::path::Path::new("/mnt/nas"),
+                detach,
+                abort,
+            );
+            let _ = finished.send(started.elapsed());
+        });
+        took.recv_timeout(Duration::from_secs(10)).ok()
+    }
+
+    #[test]
+    fn a_detached_mount_still_in_use_is_aborted_so_teardown_finishes() {
+        // The leak of 2026-09-25. A lazy detach frees the directory, but the
+        // kernel keeps the FUSE connection until the last process using the
+        // old mount lets go — a job with files open on it, here. The session
+        // never saw EOF, the join never returned, and the session, its
+        // runtime and its tunnel lived on for the rest of the GUI's life.
+        let (eof, connection_ends) = mpsc::channel::<()>();
+        let detached = Arc::new(AtomicBool::new(false));
+        let d = detached.clone();
+
+        let took = timed(
+            // The session's threads end when the connection does — here only
+            // on abort, with a fallback so a failing test cannot hang.
+            move || {
+                let _ = connection_ends.recv_timeout(Duration::from_secs(5));
+            },
+            move || d.store(true, Ordering::SeqCst),
+            move || {
+                let _ = eof.send(());
+            },
+        )
+        .expect("teardown returned");
+
+        assert!(
+            detached.load(Ordering::SeqCst),
+            "the mount was detached first"
+        );
+        assert!(
+            took < Duration::from_secs(2),
+            "teardown waited {took:?} on the old mount's users instead of aborting its connection"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_unmount_neither_detaches_nor_aborts() {
+        let detached = Arc::new(AtomicBool::new(false));
+        let aborted = Arc::new(AtomicBool::new(false));
+        let (d, a) = (detached.clone(), aborted.clone());
+
+        timed(
+            || {},
+            move || d.store(true, Ordering::SeqCst),
+            move || a.store(true, Ordering::SeqCst),
+        )
+        .expect("teardown returned");
+
+        assert!(!detached.load(Ordering::SeqCst));
+        assert!(!aborted.load(Ordering::SeqCst));
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod fuse_connection_tests {
+    use super::*;
+    use std::path::Path;
+
+    // Captured from a live GUI mount, 2026-09-29.
+    const LIVE: &str = "96 67 0:75 / /home/chris/mnt rw,nosuid,nodev,relatime shared:672 - fuse synology-fuse rw,user_id=1000,group_id=100,allow_other\n";
+
+    #[test]
+    fn the_connection_id_is_the_mounts_minor_device_number() {
+        let info = format!("29 1 259:2 / / rw,relatime shared:1 - ext4 /dev/nvme0n1p2 rw\n{LIVE}");
+        assert_eq!(
+            fuse_connection(&info, Path::new("/home/chris/mnt")),
+            Some(75)
+        );
+    }
+
+    #[test]
+    fn a_mountpoint_with_a_space_is_matched_through_its_escape() {
+        let info = "96 67 0:81 / /home/chris/NAS\\040mount rw - fuse synology-fuse rw\n";
+        assert_eq!(
+            fuse_connection(info, Path::new("/home/chris/NAS mount")),
+            Some(81)
+        );
+    }
+
+    #[test]
+    fn only_a_fuse_mount_at_that_exact_path_counts() {
+        let info = "50 1 0:40 / /home/chris/mnt rw - tmpfs tmpfs rw\n\
+                    96 67 0:75 / /home/chris/mnt/inner rw - fuse synology-fuse rw\n";
+        assert_eq!(fuse_connection(info, Path::new("/home/chris/mnt")), None);
+    }
+
+    #[test]
+    fn the_newest_mount_at_a_path_wins() {
+        // A remount on top of a detached one that has not gone away yet.
+        let info = format!("{LIVE}97 67 0:90 / /home/chris/mnt rw - fuse synology-fuse rw\n");
+        assert_eq!(
+            fuse_connection(&info, Path::new("/home/chris/mnt")),
+            Some(90)
+        );
+    }
+
+    #[test]
+    fn aborting_writes_one_to_the_connections_abort_file() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("75")).unwrap();
+        std::fs::write(root.path().join("75/abort"), "").unwrap();
+
+        abort_connection(root.path(), 75).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("75/abort")).unwrap(),
+            "1"
+        );
+    }
+
+    #[test]
+    fn aborting_a_connection_that_is_already_gone_is_an_error_not_a_panic() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(abort_connection(root.path(), 75).is_err());
     }
 }
