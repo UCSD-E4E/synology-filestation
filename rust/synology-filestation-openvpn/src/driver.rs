@@ -40,6 +40,13 @@ const IDLE_POLL: Duration = Duration::from_millis(100);
 /// What the tunnel socket asks the kernel for, each way.
 const SOCKET_BUFFER: usize = 4 * 1024 * 1024;
 
+/// The size to ask for, given the buffer a new socket already has — or none,
+/// when it already has at least [`SOCKET_BUFFER`]. Only ever raises: a fixed
+/// request would shrink the buffer on a host tuned above it.
+fn buffer_request(current: usize) -> Option<usize> {
+    (current < SOCKET_BUFFER).then_some(SOCKET_BUFFER)
+}
+
 /// The tunnel's UDP socket, bound for a peer at `remote`.
 ///
 /// Bound to whatever the OS gives us: this is a client, and `nobind` is what
@@ -66,8 +73,12 @@ fn bind_for(remote: SocketAddr) -> std::io::Result<UdpSocket> {
     )?;
     // Best effort: a refusal leaves the default, which is what every tunnel
     // before this one ran on.
-    let _ = socket.set_recv_buffer_size(SOCKET_BUFFER);
-    let _ = socket.set_send_buffer_size(SOCKET_BUFFER);
+    if let Some(size) = buffer_request(socket.recv_buffer_size().unwrap_or(0)) {
+        let _ = socket.set_recv_buffer_size(size);
+    }
+    if let Some(size) = buffer_request(socket.send_buffer_size().unwrap_or(0)) {
+        let _ = socket.set_send_buffer_size(size);
+    }
     tracing::debug!(
         "tunnel: socket buffers {} KiB in, {} KiB out (asked for {} KiB; the kernel caps at net.core.rmem_max/wmem_max)",
         socket.recv_buffer_size().unwrap_or(0) / 1024,
@@ -461,6 +472,15 @@ fn net_time() -> u32 {
 mod tests {
     use super::*;
     use socket2::SockRef;
+
+    #[test]
+    fn a_buffer_already_larger_than_the_ask_is_left_alone() {
+        // Copilot on #303: a fixed request shrinks a buffer on a host tuned
+        // above it (`rmem_default` at 16 MiB, say). This only ever raises.
+        assert_eq!(buffer_request(16 * 1024 * 1024), None);
+        assert_eq!(buffer_request(SOCKET_BUFFER), None);
+        assert_eq!(buffer_request(212_992), Some(SOCKET_BUFFER));
+    }
 
     #[tokio::test]
     async fn the_tunnel_socket_gets_bigger_buffers_than_the_default() {
