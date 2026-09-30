@@ -289,6 +289,9 @@ struct PlatformMount {
     session: Option<fuser::BackgroundSession>,
     /// Kept so a wedged mount can be detached by name. See [`detach`].
     mountpoint: PathBuf,
+    /// This mount's FUSE connection id, recorded while it was healthy so a
+    /// detached mount that is still in use can be aborted. See [`tear_down`].
+    connection: Option<u32>,
 }
 
 /// How long an ordinary unmount is given before the mount is treated as wedged.
@@ -330,15 +333,7 @@ impl Drop for PlatformMount {
             return;
         };
         let mountpoint = self.mountpoint.clone();
-        // Looked up now: once detached, the mount is no longer listed.
-        // `absolute`, not `canonicalize` — the latter would stat through the
-        // filesystem this is trying to take down.
-        let connection = std::fs::read_to_string("/proc/self/mountinfo")
-            .ok()
-            .and_then(|info| {
-                let path = std::path::absolute(&mountpoint).unwrap_or(mountpoint.clone());
-                fuse_connection(&info, &path)
-            });
+        let connection = self.connection;
         tear_down(
             move || {
                 let _ = session.umount_and_join();
@@ -365,54 +360,43 @@ impl Drop for PlatformMount {
 #[cfg(target_os = "linux")]
 const FUSECTL: &str = "/sys/fs/fuse/connections";
 
-/// The FUSE connection id of the mount at `mountpoint`, from the text of
+/// The device (major, minor) that `path` lives on.
+///
+/// For a live FUSE mountpoint this is the mount's own device, so it names the
+/// mount however the path was spelled — `mnt/`, `../mnt`, through a symlink.
+/// It `stat`s through the filesystem, so it is only called while the mount is
+/// healthy, right after it comes up.
+#[cfg(target_os = "linux")]
+fn mount_device(path: &std::path::Path) -> Option<(u32, u32)> {
+    use std::os::unix::fs::MetadataExt;
+    let dev = std::fs::metadata(path).ok()?.dev();
+    Some((libc::major(dev), libc::minor(dev)))
+}
+
+/// The FUSE connection id of the mount on `device`, from the text of
 /// `/proc/self/mountinfo`.
 ///
 /// The id is the mount's minor device number (FUSE mounts are major 0), which
-/// is also the name of its directory under [`FUSECTL`]. Read from mountinfo
-/// rather than by `stat`ing the mountpoint, because a `stat` goes through the
-/// very filesystem that is wedged. The last matching line wins: a remount on
-/// top of a detached mount that has not gone yet is listed after it.
+/// is also the name of its directory under [`FUSECTL`]. Matched by device, not
+/// by path: mountinfo lists the kernel's resolved path, which a mountpoint
+/// typed as `mnt/` or reached through a symlink does not match byte for byte.
+/// Checking the entry is FUSE keeps a mountpoint that failed to mount — whose
+/// device is whatever filesystem the directory sits on — from being taken for
+/// one.
 #[cfg(target_os = "linux")]
-fn fuse_connection(mountinfo: &str, mountpoint: &std::path::Path) -> Option<u32> {
-    let wanted = mountpoint.to_str()?;
-    mountinfo.lines().rev().find_map(|line| {
+fn fuse_connection(mountinfo: &str, device: (u32, u32)) -> Option<u32> {
+    let (major, minor) = device;
+    if major != 0 {
+        return None;
+    }
+    let wanted = format!("{major}:{minor}");
+    mountinfo.lines().find_map(|line| {
         let fields: Vec<&str> = line.split(' ').collect();
         let separator = fields.iter().position(|f| *f == "-")?;
         let fstype = fields.get(separator + 1)?;
-        if *fstype != "fuse" && !fstype.starts_with("fuse.") {
-            return None;
-        }
-        if unescape_mountinfo(fields.get(4)?) != wanted {
-            return None;
-        }
-        let (major, minor) = fields.get(2)?.split_once(':')?;
-        (major == "0").then(|| minor.parse().ok()).flatten()
+        let is_fuse = *fstype == "fuse" || fstype.starts_with("fuse.");
+        (is_fuse && *fields.get(2)? == wanted).then_some(minor)
     })
-}
-
-/// Undo mountinfo's octal escapes (`\040` for a space, `\011`, `\012`, `\134`).
-#[cfg(target_os = "linux")]
-fn unescape_mountinfo(field: &str) -> String {
-    let bytes = field.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'\\'
-            && i + 3 < bytes.len()
-            && bytes[i + 1..i + 4]
-                .iter()
-                .all(|b| (b'0'..=b'7').contains(b))
-        {
-            let code = u8::from_str_radix(&field[i + 1..i + 4], 8).unwrap_or(b'\\');
-            out.push(code);
-            i += 4;
-        } else {
-            out.push(bytes[i]);
-            i += 1;
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Abort FUSE connection `id` through the fusectl filesystem at `root`.
@@ -642,11 +626,25 @@ pub fn spawn_mount(
     })?;
     info!("Mounted at {}", mountpoint.display());
 
+    // Recorded now, while the mount answers: teardown cannot safely stat a
+    // mount that may be wedged.
+    let connection = mount_device(&mountpoint).and_then(|device| {
+        let info = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
+        fuse_connection(&info, device)
+    });
+    if connection.is_none() {
+        tracing::warn!(
+            "could not identify the FUSE connection for {}; a wedged unmount will not be able to abort it",
+            mountpoint.display()
+        );
+    }
+
     Ok(MountHandle {
         client,
         inner: PlatformMount {
             session: Some(session),
             mountpoint,
+            connection,
         },
     })
 }
@@ -1445,7 +1443,6 @@ mod teardown_tests {
 #[cfg(all(test, target_os = "linux"))]
 mod fuse_connection_tests {
     use super::*;
-    use std::path::Path;
 
     // Captured from a live GUI mount, 2026-09-29.
     const LIVE: &str = "96 67 0:75 / /home/chris/mnt rw,nosuid,nodev,relatime shared:672 - fuse synology-fuse rw,user_id=1000,group_id=100,allow_other\n";
@@ -1453,36 +1450,53 @@ mod fuse_connection_tests {
     #[test]
     fn the_connection_id_is_the_mounts_minor_device_number() {
         let info = format!("29 1 259:2 / / rw,relatime shared:1 - ext4 /dev/nvme0n1p2 rw\n{LIVE}");
-        assert_eq!(
-            fuse_connection(&info, Path::new("/home/chris/mnt")),
-            Some(75)
-        );
+        assert_eq!(fuse_connection(&info, (0, 75)), Some(75));
     }
 
     #[test]
-    fn a_mountpoint_with_a_space_is_matched_through_its_escape() {
-        let info = "96 67 0:81 / /home/chris/NAS\\040mount rw - fuse synology-fuse rw\n";
+    fn a_device_that_is_not_a_fuse_mount_is_not_a_connection() {
+        // A mountpoint that failed to mount reports the device of whatever the
+        // directory sits on — tmpfs here, also major 0. Aborting "connection
+        // 40" would hit somebody else's mount, or nothing.
+        let info = format!("50 1 0:40 / /tmp rw - tmpfs tmpfs rw\n{LIVE}");
+        assert_eq!(fuse_connection(&info, (0, 40)), None);
         assert_eq!(
-            fuse_connection(info, Path::new("/home/chris/NAS mount")),
-            Some(81)
+            fuse_connection(&info, (259, 2)),
+            None,
+            "a disk is never FUSE"
         );
+        assert_eq!(fuse_connection(&info, (0, 99)), None, "not listed at all");
     }
 
     #[test]
-    fn only_a_fuse_mount_at_that_exact_path_counts() {
-        let info = "50 1 0:40 / /home/chris/mnt rw - tmpfs tmpfs rw\n\
-                    96 67 0:75 / /home/chris/mnt/inner rw - fuse synology-fuse rw\n";
-        assert_eq!(fuse_connection(info, Path::new("/home/chris/mnt")), None);
+    fn a_subtype_fuse_mount_counts() {
+        let info = "96 67 0:81 / /mnt/x rw - fuse.sshfs host:/ rw\n";
+        assert_eq!(fuse_connection(info, (0, 81)), Some(81));
     }
 
     #[test]
-    fn the_newest_mount_at_a_path_wins() {
-        // A remount on top of a detached one that has not gone away yet.
-        let info = format!("{LIVE}97 67 0:90 / /home/chris/mnt rw - fuse synology-fuse rw\n");
-        assert_eq!(
-            fuse_connection(&info, Path::new("/home/chris/mnt")),
-            Some(90)
-        );
+    fn every_spelling_of_a_mountpoint_names_the_same_device() {
+        // The review finding: matching mountinfo by path missed `mnt/` (tab
+        // completion), `../mnt` and symlinked homes, so the abort never ran
+        // and the detached mount lived on. The device does not care how the
+        // path was spelled.
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("mnt");
+        std::fs::create_dir(&dir).unwrap();
+        std::os::unix::fs::symlink(&dir, root.path().join("link")).unwrap();
+
+        let device = mount_device(&dir).expect("a directory has a device");
+        for spelling in [
+            format!("{}/", dir.display()),
+            format!("{}/mnt/../mnt", root.path().display()),
+            format!("{}/link", root.path().display()),
+        ] {
+            assert_eq!(
+                mount_device(std::path::Path::new(&spelling)),
+                Some(device),
+                "{spelling}"
+            );
+        }
     }
 
     #[test]
