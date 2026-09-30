@@ -291,7 +291,7 @@ struct PlatformMount {
     mountpoint: PathBuf,
     /// This mount's FUSE connection id, recorded while it was healthy so a
     /// detached mount that is still in use can be aborted. See [`tear_down`].
-    connection: Option<u32>,
+    connection: Option<ConnectionAbort>,
 }
 
 /// How long an ordinary unmount is given before the mount is treated as wedged.
@@ -333,7 +333,7 @@ impl Drop for PlatformMount {
             return;
         };
         let mountpoint = self.mountpoint.clone();
-        let connection = self.connection;
+        let connection = self.connection.take();
         tear_down(
             move || {
                 let _ = session.umount_and_join();
@@ -342,9 +342,9 @@ impl Drop for PlatformMount {
             &mountpoint,
             || detach(&mountpoint),
             || match connection {
-                Some(id) => {
-                    if let Err(e) = abort_connection(std::path::Path::new(FUSECTL), id) {
-                        tracing::warn!("could not abort FUSE connection {id}: {e}");
+                Some(connection) => {
+                    if let Err(e) = connection.abort() {
+                        tracing::warn!("could not abort FUSE connection {}: {e}", connection.id);
                     }
                 }
                 None => tracing::warn!(
@@ -399,18 +399,49 @@ fn fuse_connection(mountinfo: &str, device: (u32, u32)) -> Option<u32> {
     })
 }
 
-/// Abort FUSE connection `id` through the fusectl filesystem at `root`.
+/// The text of a mountinfo file, decoded lossily.
 ///
-/// The connection's directory belongs to the user who mounted it, so this
-/// needs no privilege. Never creates the file: a connection that is already
-/// gone is an error, not a stray file.
+/// Mount paths are bytes, and mountinfo escapes only whitespace and
+/// backslashes, so one mount anywhere with an invalid-UTF-8 path made a strict
+/// read fail — and this mount's connection went unrecorded. The fields
+/// [`fuse_connection`] reads (device and filesystem type) are ASCII either way.
 #[cfg(target_os = "linux")]
-fn abort_connection(root: &std::path::Path, id: u32) -> std::io::Result<()> {
-    use std::io::Write;
-    std::fs::OpenOptions::new()
-        .write(true)
-        .open(root.join(id.to_string()).join("abort"))?
-        .write_all(b"1")
+fn read_mountinfo(path: &std::path::Path) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// A FUSE connection's `abort` file under fusectl, opened while the mount is
+/// known to be ours.
+///
+/// The id is a minor device number, and the kernel reuses the lowest free one.
+/// Looking it up again at teardown could abort a mount that took the number
+/// after ours went — a remount made while the old one was still coming down.
+/// An open file stays tied to its connection: once the kernel removes that
+/// connection a write through it does nothing, rather than reaching whoever
+/// holds the number now. The directory belongs to the mounting user, so
+/// opening it needs no privilege.
+#[cfg(target_os = "linux")]
+struct ConnectionAbort {
+    file: std::fs::File,
+    id: u32,
+}
+
+#[cfg(target_os = "linux")]
+impl ConnectionAbort {
+    /// Never creates the file: a connection that is not there is an error, not
+    /// a stray file.
+    fn open(root: &std::path::Path, id: u32) -> std::io::Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(root.join(id.to_string()).join("abort"))?;
+        Ok(Self { file, id })
+    }
+
+    fn abort(&self) -> std::io::Result<()> {
+        use std::io::Write;
+        (&self.file).write_all(b"1")
+    }
 }
 
 /// The order a Linux mount comes down in: unmount and join, detach past
@@ -628,10 +659,12 @@ pub fn spawn_mount(
 
     // Recorded now, while the mount answers: teardown cannot safely stat a
     // mount that may be wedged.
-    let connection = mount_device(&mountpoint).and_then(|device| {
-        let info = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
-        fuse_connection(&info, device)
-    });
+    let connection = mount_device(&mountpoint)
+        .and_then(|device| {
+            let info = read_mountinfo(std::path::Path::new("/proc/self/mountinfo"))?;
+            fuse_connection(&info, device)
+        })
+        .and_then(|id| ConnectionAbort::open(std::path::Path::new(FUSECTL), id).ok());
     if connection.is_none() {
         tracing::warn!(
             "could not identify the FUSE connection for {}; a wedged unmount will not be able to abort it",
@@ -1505,7 +1538,10 @@ mod fuse_connection_tests {
         std::fs::create_dir(root.path().join("75")).unwrap();
         std::fs::write(root.path().join("75/abort"), "").unwrap();
 
-        abort_connection(root.path(), 75).unwrap();
+        ConnectionAbort::open(root.path(), 75)
+            .unwrap()
+            .abort()
+            .unwrap();
 
         assert_eq!(
             std::fs::read_to_string(root.path().join("75/abort")).unwrap(),
@@ -1514,8 +1550,55 @@ mod fuse_connection_tests {
     }
 
     #[test]
-    fn aborting_a_connection_that_is_already_gone_is_an_error_not_a_panic() {
+    fn a_connection_that_is_not_there_cannot_be_opened() {
         let root = tempfile::tempdir().unwrap();
-        assert!(abort_connection(root.path(), 75).is_err());
+        assert!(ConnectionAbort::open(root.path(), 75).is_err());
+    }
+
+    #[test]
+    fn an_abort_reaches_only_the_connection_it_was_opened_for() {
+        // Copilot's finding on #303. Connection ids are minor device numbers,
+        // and the kernel hands out the lowest free one. If the old mount
+        // finishes just after the second timeout, a remount — which the GUI
+        // allows while the old one is still coming down — can take the same
+        // id, and an abort that looked the id up again would kill the new
+        // mount. The file is opened while the mount is known to be ours.
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("75")).unwrap();
+        std::fs::write(root.path().join("75/abort"), "").unwrap();
+        let ours = ConnectionAbort::open(root.path(), 75).unwrap();
+
+        // Our connection goes away, and a new mount takes its number.
+        std::fs::rename(root.path().join("75"), root.path().join("gone")).unwrap();
+        std::fs::create_dir(root.path().join("75")).unwrap();
+        std::fs::write(root.path().join("75/abort"), "").unwrap();
+
+        ours.abort().unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("75/abort")).unwrap(),
+            "",
+            "the abort reached the mount that reused the id"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("gone/abort")).unwrap(),
+            "1"
+        );
+    }
+
+    #[test]
+    fn a_non_utf8_mount_path_elsewhere_does_not_hide_the_connection() {
+        // Copilot's finding on #303: mount paths are bytes, and mountinfo
+        // escapes only whitespace and backslashes. One mount anywhere on the
+        // system with an invalid-UTF-8 path made `read_to_string` fail, the
+        // connection went unrecorded, and the detached mount lived on.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mountinfo");
+        let mut info = b"40 1 0:40 / /media/\xff\xfe rw - ext4 /dev/sdb1 rw\n".to_vec();
+        info.extend_from_slice(LIVE.as_bytes());
+        std::fs::write(&path, info).unwrap();
+
+        let text = read_mountinfo(&path).expect("mountinfo was read");
+        assert_eq!(fuse_connection(&text, (0, 75)), Some(75));
     }
 }
