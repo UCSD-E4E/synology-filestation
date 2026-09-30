@@ -51,6 +51,9 @@ thiserror = "2"
 # sans-io, which is what let the rest of this crate be tested without a
 # network at all.
 tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros", "io-util"] }
+# Socket options tokio does not expose: the UDP buffer sizes the kernel
+# defaults far too small for a tunnel carrying bulk reads.
+socket2 = "0.6"
 # `PollSender`: what makes the stack's write half an ordinary `AsyncWrite`
 # without hand-rolling a reserve-and-poll state machine.
 tokio-util = "0.7"
