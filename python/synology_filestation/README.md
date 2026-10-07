@@ -80,6 +80,47 @@ df = pd.read_csv(
 
 Both sync and async fsspec APIs are supported — `fs._cat_file(path)` returns an awaitable; `fs.cat_file(path)` is the auto-generated sync wrapper.
 
+## Verifying a file: NAS-side MD5
+
+`Client.md5(path)` (and `await AsyncClient.md5(path)`) returns the file's MD5 as
+lowercase hex, computed **by the NAS** through `SYNO.FileStation.MD5` — no bytes
+are downloaded. Use it to prove a transfer landed intact.
+
+It is not free:
+
+- **Time grows with file size.** DSM reads the whole file from disk to hash it;
+  the client polls the task once a second and gives up after 15 minutes. A
+  multi-GB file takes minutes.
+- **It counts against the throttle like a download.** On a throttled client
+  (the default) each call holds one of the `max_concurrency` transfer slots for
+  as long as the hash runs, and it always goes through FileStation, even when
+  transfers themselves use SMB.
+
+If a call fails or times out, the client tells DSM to stop the task rather than
+leaving it running on the appliance. Errors raise the usual typed exceptions,
+e.g. `NoSuchFile` for a missing path.
+
+```python
+import hashlib
+from synology_filestation import Client
+
+def local_md5(path: str) -> str:
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+with Client.login("nas.example.com", 5001, "alice", "secret") as nas:
+    nas.download_to("/photos/2026/img.orf", "/tmp/img.orf")
+    if nas.md5("/photos/2026/img.orf") != local_md5("/tmp/img.orf"):
+        raise RuntimeError("download does not match the NAS copy")
+```
+
+The fsspec backend does not use this for `checksum()`/`ukey()`: fsspec treats
+those as cheap metadata fingerprints and may call them per file, which would
+turn every call into a full read of the file on the NAS.
+
 ## TLS certificates
 
 The NAS certificate is verified by default. A DSM appliance ships with a

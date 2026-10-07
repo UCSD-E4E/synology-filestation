@@ -449,6 +449,19 @@ impl Client {
         Ok(PyBytes::new(py, &bytes))
     }
 
+    /// MD5 of ``path`` as lowercase hex, computed by the NAS
+    /// (``SYNO.FileStation.MD5``) — nothing is downloaded. DSM reads the whole
+    /// file to produce it, so this takes time proportional to the file's size
+    /// (up to a 15-minute ceiling), and on a throttled client it holds a
+    /// transfer slot for that whole time, exactly like a download.
+    fn md5(&self, py: Python<'_>, path: &str) -> PyResult<String> {
+        let inner = self.inner.clone();
+        let path_owned = path.to_string();
+        self.run(py, async move {
+            inner.with_relogin_retry(|| inner.md5(&path_owned)).await
+        })
+    }
+
     fn list_dir<'py>(&self, py: Python<'py>, path: &str) -> PyResult<Vec<Bound<'py, PyDict>>> {
         let inner = self.inner.clone();
         let path_owned = path.to_string();
@@ -728,6 +741,21 @@ impl AsyncClient {
                 .await
                 .map_err(synofs_to_pyerr_gil)?;
             Python::attach(|py| -> PyResult<Py<PyBytes>> { Ok(PyBytes::new(py, &bytes).unbind()) })
+        })
+    }
+
+    /// MD5 of ``path`` as lowercase hex, computed by the NAS
+    /// (``SYNO.FileStation.MD5``) — nothing is downloaded. DSM reads the whole
+    /// file to produce it, so this takes time proportional to the file's size
+    /// (up to a 15-minute ceiling), and on a throttled client it holds a
+    /// transfer slot for that whole time, exactly like a download.
+    fn md5<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            inner
+                .with_relogin_retry(|| inner.md5(&path))
+                .await
+                .map_err(synofs_to_pyerr_gil)
         })
     }
 
