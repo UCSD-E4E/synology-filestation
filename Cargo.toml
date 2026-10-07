@@ -12,7 +12,7 @@ members = [
 
 # Our fork of `smb2`, pinned by revision.
 #
-# It carries three things upstream does not have yet. Two SET_INFO operations:
+# It carries four things upstream does not have yet. Two SET_INFO operations:
 # a rename that tells the server to replace the destination (so a published
 # file is never briefly absent, instead of the delete-then-rename dance that
 # leaves a gap), and `set_end_of_file`, which truncates in one round trip
@@ -25,9 +25,13 @@ members = [
 # `Connection` and no further, so SMB through the tunnel stopped one layer
 # short of anything that could use it.
 #
+# And a directory listing that stops when the server starts handing back
+# names it already returned, rather than paging forever: a Synology once spent
+# 77 minutes and 911 MB on a listing whose whole directory is 168 MB.
+#
 # A `patch` rather than a `git` dependency so the crates named in each manifest
 # stay honest: when the changes land upstream, this block goes away and nothing
 # else moves. Pinned to a revision, never a branch — a build that can change
 # under you is not a build.
 [patch.crates-io]
-smb2 = { git = "https://github.com/UCSD-E4E/smb2", rev = "66262fdf48ef8a4bc9c0b24299fd60dad6c7bfb8" }
+smb2 = { git = "https://github.com/UCSD-E4E/smb2", rev = "c04472b23e620e2d65388a60e229afcff27ba861" }
