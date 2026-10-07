@@ -445,11 +445,19 @@ impl SmbConfig {
 /// short probe timeout bounds the cost off-network (where port 445 is dropped),
 /// and the caller's circuit breaker takes over from there.
 ///
+/// Except that a refused login is not silent: it is logged as a warning and
+/// remembered process-wide, so the account is not dialled again for the
+/// cool-down — each refusal is a strike towards DSM's auto-block of the
+/// caller's address. See [`crate::probe`], and [`crate::probe_as`] for the
+/// reason a client ended up on HTTP.
+///
 /// Deploy escape hatches (environment, invisible to any public API):
 /// * `SYNOLOGY_FS_SMB_DISABLE` (any value) — never use SMB.
 /// * `SYNOLOGY_FS_SMB_DOMAIN` — override the domain parsed from the username.
 /// * `SYNOLOGY_FS_SMB_PORT` — override the SMB port (default 445).
 /// * `SYNOLOGY_FS_SMB_TIMEOUT_MS` — probe timeout (default 2000).
+/// * `SYNOLOGY_FS_SMB_AUTH_COOLDOWN_S` — how long a refused login is
+///   remembered (default 86400, DSM's auto-block window).
 pub async fn auto_connect(host: &str, username: &str, password: &str) -> Option<Arc<SmbTransport>> {
     auto_connect_as(host, username, password, None).await
 }
@@ -466,20 +474,9 @@ pub async fn auto_connect_as(
     password: &str,
     domain: Option<&str>,
 ) -> Option<Arc<SmbTransport>> {
-    if std::env::var_os("SYNOLOGY_FS_SMB_DISABLE").is_some() {
-        return None;
-    }
-    let cfg = SmbConfig::for_account(host, username, password, domain);
-
-    match SmbTransport::connect(&cfg).await {
-        Ok(transport) => {
-            tracing::info!(host, "SMB transport enabled; preferring it over HTTP");
-            Some(Arc::new(transport))
-        }
-        Err(e) => {
-            tracing::debug!(host, error = %e, "SMB unavailable; using HTTP only");
-            None
-        }
+    match crate::probe::probe_as(host, username, password, domain).await {
+        crate::probe::Probe::Smb(transport) => Some(transport),
+        crate::probe::Probe::Http(_) => None,
     }
 }
 

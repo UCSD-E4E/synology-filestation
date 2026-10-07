@@ -389,3 +389,32 @@ async fn a_slow_listing_does_not_hold_up_a_lookup() {
     assert!(entries.iter().any(|e| e.name == "beside-a-listing.txt"));
     smb.delete(path).await.ok();
 }
+
+// ── The login probe: one strike, then HTTP ───────────────────────────────────
+
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn a_probe_refused_by_the_server_is_not_dialled_again() {
+    // What got krg-nat blocked: a client per task, each probing SMB with a
+    // username SMB would not accept. Every refusal was a DSM strike.
+    use synology_filestation_smb::{probe_as, FallbackKind, Probe};
+
+    let _servers = TestServers::start().await.expect("docker compose up");
+    let host = format!("127.0.0.1:{}", smb2::testing::auth_port());
+
+    let Probe::Http(first) = probe_as(&host, "testuser", "not the password", Some("")).await else {
+        panic!("the server turns the login down");
+    };
+    assert_eq!(first.kind, FallbackKind::AuthRefused, "{}", first.detail);
+    assert!(first.detail.contains("bare username"), "{}", first.detail);
+
+    let Probe::Http(second) = tokio::time::timeout(
+        Duration::from_secs(1),
+        probe_as(&host, "testuser", "not the password", Some("")),
+    )
+    .await
+    .expect("answered without a round trip") else {
+        panic!("still HTTP");
+    };
+    assert_eq!(second.kind, FallbackKind::AuthCooldown, "{}", second.detail);
+}

@@ -215,6 +215,14 @@ Who enables it:
 
 **Structural fix for bulk raw staging:** prefer **SMB/NFS** on a mounted share over the HTTP Download API — it bypasses `synoscgi` entirely (no CGI backend to saturate). The UCSD campus firewall already permits SMB/NFS. Treat the HTTP Download path as the fallback; the throttle is the safety net for when it must be used. (See `python/synology_filestation/README.md` → *Throttling & reliability* / *Bulk staging*.)
 
+### The SMB login probe and DSM's auto-block
+
+Every Python `login` (and anything using `smb::auto_connect*`) probes SMB with the login's credentials. **A failed SMB authentication is a strike towards DSM's auto-block**: 3 in 24 h, permanent, applied to the caller's IP address for every service on the NAS. A fishsense service that created a client per task, with a bare username (FileStation accepts one; SMB reads it as a local account), got krg-nat, the cluster's shared NAT address, blocked this way. So `smb/src/probe.rs` (`probe_as`) remembers a refusal **process-wide per (host, username, domain)** for `SYNOLOGY_FS_SMB_AUTH_COOLDOWN_S` (default 86400 s, DSM's window) and declines to dial in the meantime. It holds a per-account async lock across the dial, so a burst of clients spends one strike rather than one each. It warns once, naming the bare username as the likely cause. Network failures cost no strike, so they are neither remembered nor logged above debug. Python surfaces the outcome as `Client.transport` / `transport_reason` / `transport_detail` and accepts `domain=`. The mount paths (`Chain`/`Legs`) latch a refusal per transport instead (`ReconnectState::refuse`).
+
+Rust warnings reach Python `logging` through `tracing`'s `log` feature plus `pyo3-log`. Do **not** reinstall `tracing_log::LogTracer` in `_native`. It bridges the other way (`log` into `tracing`), and by taking the single global `log` slot it left pyo3-log uninstalled, so no Rust warning ever reached Python.
+
+**MD5 task ids are JSON.** `SYNO.FileStation.MD5` `status`/`stop` take `taskid="FileStation_…"` (quoted). A bare id names no task, and DSM answers 599. That was the 0.9.0 `Client.md5` failure.
+
 ### .NET GUI (`SynologyFuse.Gui/`)
 
 MVVM pattern (Avalonia). The GUI calls the Rust core **directly via the FFI cdylib** (no subprocess):

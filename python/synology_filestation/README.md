@@ -196,6 +196,44 @@ of the activity and let Temporal's retry policy reschedule it with its own
 200–250×-per-file storm that saturated the appliance. One activity ≈ one file;
 bound the work here, reschedule out there.
 
+## Which transport a client uses: SMB first, then HTTP
+
+`login` also tries an in-process SMB connection with the same credentials, and
+file transfers prefer it when it works, which keeps bulk traffic off
+FileStation. If SMB can't be reached, the client falls back to HTTP without a
+warning, as before. To see which transport a client got, and why:
+
+```python
+c = Client.login(host, 6021, "svc_fishsense", pw, domain="KRG")
+c.transport          # "smb" or "http"
+c.transport_reason   # None on SMB; else "disabled", "unreachable",
+                     # "auth_refused", "auth_cooldown" or "disconnected"
+c.transport_detail   # the same in words, including what to change
+```
+
+**The SMB login must name the domain.** FileStation accepts a bare
+`svc_fishsense`, but SMB treats a bare name as a *local* NAS account, and the
+login fails. Pass `domain="KRG"` (keyword-only, on `Client.login` and
+`AsyncClient.login`), write the username as `KRG\\svc_fishsense`, or set
+`SYNOLOGY_FS_SMB_DOMAIN`, in that order of precedence.
+
+**A refused SMB login is remembered.** DSM counts each failed SMB login
+toward its auto-block (on e4e-nas, 3 failures in 24 hours, and the block is
+permanent), and the block applies to the caller's IP address for every
+service on the NAS, HTTPS included. So after a refusal, the library:
+
+- logs one `WARNING` (logger `synology_filestation_smb.probe`). For a bare
+  username, the warning says the domain is the likely cause;
+- uses HTTP for that (host, username, domain) for the next
+  `SYNOLOGY_FS_SMB_AUTH_COOLDOWN_S` seconds (default 86400, DSM's window),
+  across every `Client`/`AsyncClient` in the process. It does not dial SMB
+  for that account again during the cool-down. Clients created in a burst
+  wait for the first one's answer, so a burst spends at most one strike.
+
+The memory is per process, so N worker processes can still spend N strikes
+between them. Fix the account name instead of relying on the cool-down. Set
+`SYNOLOGY_FS_SMB_DISABLE=1` to turn SMB off entirely.
+
 ## Bulk staging: prefer SMB/NFS over the Download API
 
 For sustained bulk transfer of large binaries (e.g. staging raw `.ORF` frames),
