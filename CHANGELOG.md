@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.9.0](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-fuse-v0.8.3...synology-filestation-fuse-v0.9.0) (2026-10-07)
+
+
+### Features
+
+* **ffi:** export syno_md5, a hash of a file computed by the NAS ([4fc8020](https://github.com/UCSD-E4E/synology-filestation/commit/4fc80202c6313e2162c1b6f617fb708e829d7409))
+* **gui:** compute a file's MD5 on the NAS from the file browser ([a18bbe2](https://github.com/UCSD-E4E/synology-filestation/commit/a18bbe276da43c6257c2229abec6192d1747acb6))
+* **python:** hash a file on the NAS with Client.md5 / AsyncClient.md5 ([3ed2ea2](https://github.com/UCSD-E4E/synology-filestation/commit/3ed2ea2a9faea859fd0d5441fc34b83b7621dedf))
+
+
+### Bug Fixes
+
+* **core:** keep an MD5 call to one deadline, and make sure its stop lands ([1dc942c](https://github.com/UCSD-E4E/synology-filestation/commit/1dc942c571630bd1afc7390598ebec12cc80cea1))
+* **core:** stop an abandoned MD5 task, and throttle hashing like a download ([9cb5163](https://github.com/UCSD-E4E/synology-filestation/commit/9cb51632084dec1361568e14419a5a412e81d9fd))
+* **core:** stop an MD5 task the caller gave up on, and one whose session expired ([56a7772](https://github.com/UCSD-E4E/synology-filestation/commit/56a777239e0f3c0c197866f54d868cd14f031652))
+* **fuse:** list a directory once per pass, off the event loop ([2fd0b4e](https://github.com/UCSD-E4E/synology-filestation/commit/2fd0b4e9c6d46e688b80a819b14de2c6607f6edc))
+* **fuse:** share one listing between a directory's readers, and clean up failed ones ([0e381d9](https://github.com/UCSD-E4E/synology-filestation/commit/0e381d9dd235255bbf034a8ec58f9975d57a440e))
+* **gui:** keep a hash and a transfer from sharing the browser's progress bar ([3accb34](https://github.com/UCSD-E4E/synology-filestation/commit/3accb34c22201e7b1d9a2f32c06bff5026a77226))
+* **gui:** keep a hash out of the way of a directory load, and the reverse ([4be1082](https://github.com/UCSD-E4E/synology-filestation/commit/4be108265db10a37d7353241fed4e593110111ac))
+* **macos:** the GUI mounts again, and the flake installs a real .app ([2ffbb2c](https://github.com/UCSD-E4E/synology-filestation/commit/2ffbb2ce28f6c39359b2ecb894ee9a2363fa30b0))
+* **smb:** keep DFS referrals working on the unlocked metadata path ([1a66859](https://github.com/UCSD-E4E/synology-filestation/commit/1a6685971ceea34b96742786a35e1f6ca20f17f6))
+* **smb:** stop a directory listing from holding up every other lookup ([895f2ca](https://github.com/UCSD-E4E/synology-filestation/commit/895f2ca1f96627c860dac045486d6061aa3a34b0))
+* **smb:** stop a listing whose enumeration repeats instead of paging forever ([83ff8c2](https://github.com/UCSD-E4E/synology-filestation/commit/83ff8c27ee05e366d1df86351a437f613d97b20d))
+
 ## [0.8.3](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-fuse-v0.8.2...synology-filestation-fuse-v0.8.3) (2026-09-30)
 
 
