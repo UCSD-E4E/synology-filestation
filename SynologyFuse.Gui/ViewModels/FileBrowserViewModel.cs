@@ -36,7 +36,7 @@ public sealed partial class FileBrowserViewModel : ObservableObject, IDisposable
     private readonly Stack<string> _history = new();
 
     /// <summary>Asks the NAS for a file's MD5; null when the client went away
-    /// mid-call. The native call unless a test supplies its own.</summary>
+    /// mid-call. Uses the native call unless a test supplies its own.</summary>
     private readonly Func<string, Task<string?>> _md5;
 
     public FileBrowserViewModel(MountConfig config, IClipboardService? clipboard = null)
@@ -76,7 +76,11 @@ public sealed partial class FileBrowserViewModel : ObservableObject, IDisposable
     [ObservableProperty]
     private string _status = "Connecting…";
 
+    /// <summary>Anything this window is waiting on the NAS for. A hash may not
+    /// start under it: it would take over the status and progress of the
+    /// work already running, and queue behind it on the gate regardless.</summary>
     [ObservableProperty]
+    [NotifyCanExecuteChangedFor(nameof(ComputeMd5Command))]
     private bool _isBusy;
 
     // ── 2FA ─────────────────────────────────────────────────────────────────────
@@ -203,7 +207,7 @@ public sealed partial class FileBrowserViewModel : ObservableObject, IDisposable
 
     private async Task LoadAsync(string path)
     {
-        if (_client is null) return;
+        if (RefusedWhileHashing() || _client is null) return;
         IsBusy = true;
         Status = path.Length == 0 ? "Loading shares…" : $"Loading {path}…";
         try
@@ -233,7 +237,7 @@ public sealed partial class FileBrowserViewModel : ObservableObject, IDisposable
     [RelayCommand]
     private async Task Open()
     {
-        if (SelectedItem is not { IsDir: true } dir) return;
+        if (RefusedWhileHashing() || SelectedItem is not { IsDir: true } dir) return;
         _history.Push(CurrentPath);
         await LoadAsync(dir.Path);
     }
@@ -241,6 +245,8 @@ public sealed partial class FileBrowserViewModel : ObservableObject, IDisposable
     [RelayCommand(CanExecute = nameof(CanGoUp))]
     private async Task Up()
     {
+        // Before the pop: a refused step up must not lose its way back.
+        if (RefusedWhileHashing()) return;
         var target = _history.Count > 0 ? _history.Pop() : "";
         await LoadAsync(target);
     }
@@ -359,7 +365,7 @@ public sealed partial class FileBrowserViewModel : ObservableObject, IDisposable
         }
     }
 
-    private bool CanComputeMd5() => SelectedItem is { IsDir: false } && !IsHashing && !ShowProgress;
+    private bool CanComputeMd5() => SelectedItem is { IsDir: false } && !IsHashing && !ShowProgress && !IsBusy;
 
     /// <summary>Turn away a transfer while a hash runs. It would only queue
     /// behind the hash on the gate — for minutes, with nothing on screen to

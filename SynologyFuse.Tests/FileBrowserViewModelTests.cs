@@ -344,4 +344,39 @@ public class FileBrowserViewModelTests
         await running;
         Assert.Equal("9e107d9d372bb6826bd81d3542a419d6", vm.Md5Result);
     }
+
+    // Review: excluding only the progress bar left the rest of the window's
+    // busy state shared. A hash started during a directory load took over its
+    // status, and a load started during a hash cleared the busy flag in its
+    // `finally` while the hash still ran.
+
+    [Fact]
+    public void ComputeMd5_UnavailableWhileTheWindowIsBusy()
+    {
+        var (vm, _, _) = NewHashingVm(_ => Task.FromResult<string?>("x"));
+        vm.SelectedItem = AFile;
+
+        vm.IsBusy = true; // a listing being loaded
+
+        Assert.False(vm.ComputeMd5Command.CanExecute(null));
+    }
+
+    [Fact]
+    public async Task NavigatingDuringAHash_IsRefusedAndLeavesTheHashBusy()
+    {
+        var answer = new TaskCompletionSource<string?>();
+        var (vm, _, _) = NewHashingVm(_ => answer.Task);
+        vm.SelectedItem = AFile;
+        vm.CurrentPath = "/photos";
+        var running = vm.ComputeMd5Command.ExecuteAsync(null);
+
+        await vm.UpCommand.ExecuteAsync(null);
+
+        Assert.StartsWith("Wait for the MD5 of raw.ORF", vm.Status);
+        Assert.True(vm.IsBusy, "the hash is still running");
+        Assert.Equal("/photos", vm.CurrentPath);
+
+        answer.SetResult("9e107d9d372bb6826bd81d3542a419d6");
+        await running;
+    }
 }
