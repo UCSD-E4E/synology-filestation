@@ -1063,6 +1063,55 @@ pub unsafe extern "C" fn syno_rename(
     })
 }
 
+/// Have the NAS hash `path` (`SYNO.FileStation.MD5`) and return the digest in
+/// `*out_md5` as a bare lowercase-hex C string (not JSON). Free it with
+/// [`syno_string_free`].
+///
+/// **Long-running and blocking.** DSM reads the whole file to answer, so a
+/// large file takes minutes; the core polls once a second and gives up after
+/// 15 minutes, stopping the task on the NAS. Call it off the UI thread. There
+/// is no cancellation: like [`syno_download_to`], it returns when the work is
+/// done or has failed. It holds one of the client's throttled transfer slots
+/// for the whole task, since it costs the appliance what a download does.
+///
+/// # Safety
+/// `client` must be live; `path`/`out_md5` must be non-null.
+#[no_mangle]
+pub unsafe extern "C" fn syno_md5(
+    client: *mut SynoClient,
+    path: *const c_char,
+    out_md5: *mut *mut c_char,
+    err: *mut SynoError,
+) -> i32 {
+    guard(err, || {
+        let path = match req_str(path, "path", err) {
+            Ok(v) => v.to_string(),
+            Err(c) => return c,
+        };
+        // Checked before the call, not after: finding out there is nowhere to
+        // put the answer once DSM has spent minutes reading the file is waste.
+        if out_md5.is_null() {
+            return set_err(err, SynoStatus::NullArg, 0, "`out_md5` must not be null");
+        }
+        let res = run_op(client, move |c| {
+            let path = path.clone();
+            async move { c.md5(&path).await }
+        });
+        finish(res, err, |digest| match CString::new(digest) {
+            Ok(s) => {
+                *out_md5 = s.into_raw();
+                SynoStatus::Ok as i32
+            }
+            Err(_) => set_err(
+                err,
+                SynoStatus::Io,
+                0,
+                "digest contained an interior NUL byte",
+            ),
+        })
+    })
+}
+
 // ─── Mount lifecycle ─────────────────────────────────────────────────────────
 
 /// Mount the FileStation share at `mountpoint`, in-process, on a background
@@ -1256,7 +1305,7 @@ pub unsafe extern "C" fn syno_set_log_file(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn cstr(s: &str) -> CString {
@@ -1599,6 +1648,179 @@ mod tests {
             let rc = syno_list_shares(ptr::null_mut(), &mut out_json, &mut err);
             assert_eq!(rc, SynoStatus::NullArg as i32);
             syno_string_free(err.message);
+        }
+    }
+
+    /// Log in against `server` with no SMB and no tunnel, and hand back the
+    /// handle — the preamble every per-operation test needs.
+    unsafe fn connect_to(server: &MockServer) -> *mut SynoClient {
+        let (host, port) = host_port(server);
+        let mut client: *mut SynoClient = ptr::null_mut();
+        let mut err = empty_err();
+        let rc = syno_connect(
+            host.as_ptr(),
+            port,
+            false,
+            cstr("alice").as_ptr(),
+            cstr("secret").as_ptr(),
+            ptr::null(),
+            false,
+            true,
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            &mut client,
+            &mut err,
+        );
+        assert_eq!(rc, SynoStatus::Ok as i32, "connect: {}", err_message(&err));
+        client
+    }
+
+    /// A mock that answers only `SYNO.FileStation.MD5` calls with `method`.
+    fn md5_call(m: &str) -> wiremock::MockBuilder {
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("api", "SYNO.FileStation.MD5"))
+            .and(query_param("method", m))
+    }
+
+    #[test]
+    fn md5_polls_until_the_nas_has_a_digest() {
+        let (_rt, server) = server_with(async {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/webapi/auth.cgi"))
+                .respond_with(login_ok())
+                .mount(&server)
+                .await;
+            md5_call("start")
+                .and(query_param("file_path", "/home/big.bin"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "success": true, "data": {"taskid": "md5-1"}
+                })))
+                .mount(&server)
+                .await;
+            // Still hashing the first time it is asked, done the second.
+            md5_call("status")
+                .and(query_param("taskid", "md5-1"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "success": true, "data": {"finished": false}
+                })))
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
+            md5_call("status")
+                .and(query_param("taskid", "md5-1"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "success": true,
+                    "data": {"finished": true, "md5": "9e107d9d372bb6826bd81d3542a419d6"}
+                })))
+                .mount(&server)
+                .await;
+            server
+        });
+
+        unsafe {
+            let client = connect_to(&server);
+            let mut out: *mut c_char = ptr::null_mut();
+            let mut err = empty_err();
+            let rc = syno_md5(client, cstr("/home/big.bin").as_ptr(), &mut out, &mut err);
+            assert_eq!(rc, SynoStatus::Ok as i32, "md5: {}", err_message(&err));
+            assert_eq!(
+                CStr::from_ptr(out).to_str().unwrap(),
+                "9e107d9d372bb6826bd81d3542a419d6",
+                "the bare hex digest, not JSON"
+            );
+            syno_string_free(out);
+
+            let polls = _rt
+                .block_on(server.received_requests())
+                .unwrap()
+                .iter()
+                .filter(|r| r.url.query().is_some_and(|q| q.contains("method=status")))
+                .count();
+            assert_eq!(polls, 2, "asked again after an unfinished answer");
+
+            syno_logout(client);
+            syno_client_free(client);
+        }
+    }
+
+    #[test]
+    fn md5_a_dsm_refusal_comes_back_typed_with_its_code() {
+        let (_rt, server) = server_with(async {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/webapi/auth.cgi"))
+                .respond_with(login_ok())
+                .mount(&server)
+                .await;
+            md5_call("start")
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "success": false, "error": {"code": 408}
+                })))
+                .mount(&server)
+                .await;
+            server
+        });
+
+        unsafe {
+            let client = connect_to(&server);
+            let mut out: *mut c_char = ptr::null_mut();
+            let mut err = empty_err();
+            let rc = syno_md5(
+                client,
+                cstr("/home/secret.bin").as_ptr(),
+                &mut out,
+                &mut err,
+            );
+            assert_eq!(rc, SynoStatus::PermissionDenied as i32);
+            assert_eq!(err.kind, SynoStatus::PermissionDenied as i32);
+            assert_eq!(err.dsm_code, 408, "DSM code preserved on `.dsm_code`");
+            assert!(!err_message(&err).is_empty());
+            assert!(out.is_null(), "no digest on failure");
+            syno_string_free(err.message);
+            syno_logout(client);
+            syno_client_free(client);
+        }
+    }
+
+    #[test]
+    fn md5_null_arguments_are_null_arg_not_panic() {
+        unsafe {
+            let mut out: *mut c_char = ptr::null_mut();
+
+            // Null path: rejected before the client is even looked at.
+            let mut err = empty_err();
+            let rc = syno_md5(ptr::null_mut(), ptr::null(), &mut out, &mut err);
+            assert_eq!(rc, SynoStatus::NullArg as i32);
+            assert!(err_message(&err).contains("path"));
+            syno_string_free(err.message);
+
+            // Null client.
+            let mut err = empty_err();
+            let rc = syno_md5(
+                ptr::null_mut(),
+                cstr("/home/a").as_ptr(),
+                &mut out,
+                &mut err,
+            );
+            assert_eq!(rc, SynoStatus::NullArg as i32);
+            syno_string_free(err.message);
+
+            // Null out-pointer: refused up front, rather than after DSM has
+            // spent minutes reading the file.
+            let mut err = empty_err();
+            let rc = syno_md5(
+                ptr::null_mut(),
+                cstr("/home/a").as_ptr(),
+                ptr::null_mut(),
+                &mut err,
+            );
+            assert_eq!(rc, SynoStatus::NullArg as i32);
+            syno_string_free(err.message);
+            assert!(out.is_null());
         }
     }
 
