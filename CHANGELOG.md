@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.10.0](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-fuse-v0.9.0...synology-filestation-fuse-v0.10.0) (2026-10-07)
+
+
+### Features
+
+* **python:** stop a failing SMB probe from getting the caller's address blocked ([9fdb45e](https://github.com/UCSD-E4E/synology-filestation/commit/9fdb45ee18b10a72b3d978df575d7c1f7818d83d))
+
+
+### Bug Fixes
+
+* close the gaps the review found in the SMB login gate and the wheel ([06b81f9](https://github.com/UCSD-E4E/synology-filestation/commit/06b81f9d256d3260d742843630a10488950c8f1f))
+* **core:** send the MD5 task id as JSON, which DSM requires ([c5fd05b](https://github.com/UCSD-E4E/synology-filestation/commit/c5fd05b9217ec0b0fbcb71ff3d359a4cf8aed42b))
+* **smb:** narrow the refusal marker, let a qualified username beat the environment ([bd4d926](https://github.com/UCSD-E4E/synology-filestation/commit/bd4d92652cc2107584979759e83fb2c948e238de))
+* **smb:** release a shared-answer slot, and tell a cool-down from a refusal ([46a9563](https://github.com/UCSD-E4E/synology-filestation/commit/46a956368bfdca0c89508e76c620471dfd212b36))
+
 ## [0.9.0](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-fuse-v0.8.3...synology-filestation-fuse-v0.9.0) (2026-10-07)
 
 
