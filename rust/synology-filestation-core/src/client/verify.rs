@@ -187,7 +187,8 @@ impl SynologyClient {
     /// left to the caller's relogin retry. That retry would start a second hash
     /// of the same file while the first still ran, since a stop sent on the
     /// expired session cannot land. Here the old task is stopped on the new
-    /// session first, and the hash is started again once.
+    /// session first, and the hash is started again once, inside the same
+    /// deadline: `max_wait` bounds the whole call, not each attempt.
     pub(super) async fn md5_within(
         &self,
         path: &str,
@@ -195,19 +196,26 @@ impl SynologyClient {
     ) -> Result<String, SynoFsError> {
         let _slot = self.acquire_transfer_slot().await;
         let url = format!("{}/entry.cgi", self.base_url);
-        match self.md5_attempt(&url, path, max_wait).await {
+        let limit = Md5Deadline {
+            at: Instant::now() + max_wait,
+            max_wait,
+        };
+        match self.md5_attempt(&url, path, limit).await {
             Md5Attempt::Done(result) => result,
-            Md5Attempt::SessionRenewed => match self.md5_attempt(&url, path, max_wait).await {
+            Md5Attempt::SessionRenewed => match self.md5_attempt(&url, path, limit).await {
+                // A 119 from here would read to a caller's relogin wrapper as
+                // "log in and call again": a third hash, with a fresh ceiling.
+                Md5Attempt::Done(Err(SynoFsError::ApiError(SID_NOT_FOUND)))
+                | Md5Attempt::SessionRenewed => Err(SynoFsError::Io(format!(
+                    "md5 of {path}: the session expired twice while the NAS hashed it"
+                ))),
                 Md5Attempt::Done(result) => result,
-                // Expired twice in one call: hand it to the caller, with the
-                // second task already stopped.
-                Md5Attempt::SessionRenewed => Err(SynoFsError::ApiError(SID_NOT_FOUND)),
             },
         }
     }
 
     /// Start one MD5 task and wait for it, stopping it if it is given up on.
-    async fn md5_attempt(&self, url: &str, path: &str, max_wait: Duration) -> Md5Attempt {
+    async fn md5_attempt(&self, url: &str, path: &str, limit: Md5Deadline) -> Md5Attempt {
         let taskid = match self.md5_start(url, path).await {
             Ok(taskid) => taskid,
             Err(e) => return Md5Attempt::Done(Err(e)),
@@ -215,7 +223,7 @@ impl SynologyClient {
         // Covers the one way out that never reaches the code below: the
         // caller dropping this future mid-poll, as a timeout around it does.
         let mut on_drop = StopOnDrop::arm(self.md5_stop_request(url, &taskid));
-        let result = self.md5_wait(url, path, &taskid, max_wait).await;
+        let result = self.md5_wait(url, path, &taskid, limit).await;
         on_drop.disarm();
 
         match result {
@@ -273,15 +281,14 @@ impl SynologyClient {
         ]))
     }
 
-    /// Poll a started MD5 task until it finishes or `max_wait` runs out.
+    /// Poll a started MD5 task until it finishes or the call's deadline passes.
     async fn md5_wait(
         &self,
         url: &str,
         path: &str,
         taskid: &str,
-        max_wait: Duration,
+        limit: Md5Deadline,
     ) -> Result<String, SynoFsError> {
-        let deadline = Instant::now() + max_wait;
         loop {
             let text = self
                 .get_text_retried(
@@ -308,21 +315,41 @@ impl SynologyClient {
                     });
                 }
             }
-            if Instant::now() >= deadline {
+            let left = limit.at.saturating_duration_since(Instant::now());
+            if left.is_zero() {
                 return Err(SynoFsError::Io(format!(
                     "md5 of {path} did not finish within {}s",
-                    max_wait.as_secs()
+                    limit.max_wait.as_secs()
                 )));
             }
-            tokio::time::sleep(MD5_POLL_INTERVAL).await;
+            // Never past the deadline: a last poll at it, not a second after.
+            tokio::time::sleep(MD5_POLL_INTERVAL.min(left)).await;
         }
     }
 
-    /// Tell DSM to abandon an MD5 task. Best effort: the caller already has
-    /// the error that matters, and a stop that fails leaves nothing worse than
-    /// the task running to the end, which is what happened before.
+    /// Tell DSM to abandon an MD5 task.
+    ///
+    /// Its answer is read, not assumed: a stop refused because the session has
+    /// just expired would otherwise count as sent while the task read on. That
+    /// one refusal is worth a new session and a second try. Anything else is
+    /// logged and left, since the caller already has the error that matters
+    /// and a task that cannot be stopped runs to its end, as it did before.
     async fn md5_stop(&self, url: &str, taskid: &str) {
-        let stopped = self
+        let mut refused = self.md5_stop_once(url, taskid).await;
+        if matches!(refused, Some(SynoFsError::ApiError(SID_NOT_FOUND))) && self.auto_relogin {
+            refused = match self.relogin().await {
+                Ok(()) => self.md5_stop_once(url, taskid).await,
+                Err(e) => Some(e),
+            };
+        }
+        if let Some(e) = refused {
+            warn!(taskid, error = %e, "md5: could not stop an abandoned task; the NAS may read the file to the end");
+        }
+    }
+
+    /// One stop request; why it was refused, if it was.
+    async fn md5_stop_once(&self, url: &str, taskid: &str) -> Option<SynoFsError> {
+        let text = match self
             .get_text_retried(
                 url,
                 &[
@@ -332,11 +359,27 @@ impl SynologyClient {
                     ("taskid", taskid),
                 ],
             )
-            .await;
-        if let Err(e) = stopped {
-            tracing::debug!(taskid, error = %e, "md5: stopping an abandoned task failed");
+            .await
+        {
+            Ok(text) => text,
+            Err(e) => return Some(e),
+        };
+        match serde_json::from_str::<SynoResponse<serde_json::Value>>(&text) {
+            Ok(parsed) if parsed.success => None,
+            Ok(parsed) => Some(SynoFsError::ApiError(
+                parsed.error.map(|e| e.code).unwrap_or(0),
+            )),
+            Err(e) => Some(SynoFsError::Io(format!("md5 stop parse error: {e}"))),
         }
     }
+}
+
+/// When an MD5 call gives up, kept whole across its attempts.
+#[derive(Clone, Copy)]
+struct Md5Deadline {
+    at: Instant,
+    /// What the caller asked for, for the message when it runs out.
+    max_wait: Duration,
 }
 
 /// How one MD5 attempt ended.

@@ -1003,3 +1003,184 @@ async fn mount_probe_ok_for_verify(server: &MockServer) {
         .mount(server)
         .await;
 }
+
+/// Logins that hand out `old_sid` first and `new_sid` after.
+async fn mount_two_logins(server: &MockServer) {
+    mount_probe_ok_for_verify(server).await;
+    Mock::given(method("POST"))
+        .and(path("/webapi/auth.cgi"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true, "data": {"sid": "old_sid"}
+        })))
+        .up_to_n_times(1)
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/webapi/auth.cgi"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true, "data": {"sid": "new_sid"}
+        })))
+        .mount(server)
+        .await;
+}
+
+async fn mount_md5_status_for(
+    server: &MockServer,
+    taskid: &str,
+    body: serde_json::Value,
+    delay: Duration,
+) {
+    Mock::given(method("GET"))
+        .and(path("/webapi/entry.cgi"))
+        .and(query_param("method", "status"))
+        .and(query_param("taskid", taskid))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(body)
+                .set_delay(delay),
+        )
+        .mount(server)
+        .await;
+}
+
+async fn mount_md5_starts(server: &MockServer, taskids: &[&str]) {
+    for taskid in taskids {
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "start"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true, "data": {"taskid": taskid}
+            })))
+            .up_to_n_times(1)
+            .mount(server)
+            .await;
+    }
+}
+
+/// Regression: the restart after a renewed session got a deadline of its own,
+/// so a session that expired near the 15-minute ceiling could keep the caller
+/// waiting most of another 15. The ceiling is for the whole call.
+#[tokio::test]
+async fn md5_keeps_one_deadline_across_a_renewed_session() {
+    let server = MockServer::start().await;
+    mount_two_logins(&server).await;
+    mount_md5_starts(&server, &["md5-a", "md5-b"]).await;
+    mount_md5_status_for(
+        &server,
+        "md5-a",
+        serde_json::json!({"success": false, "error": {"code": 119}}),
+        Duration::from_millis(1000),
+    )
+    .await;
+    mount_md5_status_for(
+        &server,
+        "md5-b",
+        serde_json::json!({"success": true, "data": {"finished": false}}),
+        Duration::ZERO,
+    )
+    .await;
+    mount_md5_stop(&server).await;
+    let client = client_auto_for(&server);
+    client.login("alice", "secret", None).await.unwrap();
+
+    let started = Instant::now();
+    let err = client
+        .md5_within("/share/f.bin", Duration::from_millis(1500))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, SynoFsError::Io(_)), "got {err:?}");
+    assert!(
+        started.elapsed() < Duration::from_millis(2500),
+        "gave up {:?} after starting, against a 1.5 s ceiling",
+        started.elapsed()
+    );
+}
+
+/// The stop's answer was never read: a stop refused because the session had
+/// just expired counted as sent, and the task went on reading the file.
+#[tokio::test]
+async fn md5_sends_the_stop_again_when_the_session_expired_under_it() {
+    let server = MockServer::start().await;
+    mount_two_logins(&server).await;
+    mount_md5_starts(&server, &["md5-x"]).await;
+    mount_md5_status_for(
+        &server,
+        "md5-x",
+        serde_json::json!({"success": true, "data": {"finished": false}}),
+        Duration::ZERO,
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/webapi/entry.cgi"))
+        .and(query_param("method", "stop"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": false, "error": {"code": 119}
+        })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    mount_md5_stop(&server).await;
+    let client = client_auto_for(&server);
+    client.login("alice", "secret", None).await.unwrap();
+
+    client
+        .md5_within("/share/f.bin", Duration::from_millis(1200))
+        .await
+        .unwrap_err();
+
+    let stops: Vec<String> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| {
+            r.url
+                .query_pairs()
+                .any(|(k, v)| k == "method" && v == "stop")
+        })
+        .map(|r| {
+            r.headers
+                .get("cookie")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(stops.len(), 2, "refused once, sent again: {stops:?}");
+    assert!(stops[1].contains("new_sid"), "{stops:?}");
+}
+
+/// A session that expires under both attempts must not come back as 119: a
+/// caller's relogin wrapper reads that as "log in and call again", which is a
+/// third full hash, with a fresh ceiling.
+#[tokio::test]
+async fn md5_does_not_invite_another_retry_after_two_expired_sessions() {
+    let server = MockServer::start().await;
+    mount_two_logins(&server).await;
+    mount_md5_starts(&server, &["md5-a", "md5-b"]).await;
+    for taskid in ["md5-a", "md5-b"] {
+        mount_md5_status_for(
+            &server,
+            taskid,
+            serde_json::json!({"success": false, "error": {"code": 119}}),
+            Duration::ZERO,
+        )
+        .await;
+    }
+    mount_md5_stop(&server).await;
+    let client = client_auto_for(&server);
+    client.login("alice", "secret", None).await.unwrap();
+
+    let err = client
+        .with_relogin_retry(|| client.md5("/share/f.bin"))
+        .await
+        .unwrap_err();
+
+    assert!(!matches!(err, SynoFsError::ApiError(119)), "got {err:?}");
+    assert_eq!(
+        md5_method_calls(&server, "start").await.len(),
+        2,
+        "no third hash"
+    );
+}
