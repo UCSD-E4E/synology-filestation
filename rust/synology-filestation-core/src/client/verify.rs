@@ -1,5 +1,6 @@
 //! Proving an upload landed: MD5 over the wire, and what to do when it did not.
 
+use super::session::SID_NOT_FOUND;
 use super::*;
 
 /// How long to let a just-written file settle before a size disagreement is
@@ -173,13 +174,20 @@ impl SynologyClient {
     ///
     /// DSM reads the whole file to answer, which is the same load on the
     /// appliance as a download, so a throttled client holds a transfer slot
-    /// for the length of the task. A task given up on — timed out, or its
-    /// status refused — is stopped, or it would go on reading regardless.
+    /// for the length of the task. A task given up on — timed out, its status
+    /// refused, or this call dropped by a caller that stopped waiting — is
+    /// stopped, or it would go on reading regardless.
     pub async fn md5(&self, path: &str) -> Result<String, SynoFsError> {
         self.md5_within(path, MD5_MAX_WAIT).await
     }
 
     /// [`Self::md5`], giving up after `max_wait` rather than [`MD5_MAX_WAIT`].
+    ///
+    /// A session that expires under a long hash is dealt with here rather than
+    /// left to the caller's relogin retry. That retry would start a second hash
+    /// of the same file while the first still ran, since a stop sent on the
+    /// expired session cannot land. Here the old task is stopped on the new
+    /// session first, and the hash is started again once.
     pub(super) async fn md5_within(
         &self,
         path: &str,
@@ -187,9 +195,53 @@ impl SynologyClient {
     ) -> Result<String, SynoFsError> {
         let _slot = self.acquire_transfer_slot().await;
         let url = format!("{}/entry.cgi", self.base_url);
+        match self.md5_attempt(&url, path, max_wait).await {
+            Md5Attempt::Done(result) => result,
+            Md5Attempt::SessionRenewed => match self.md5_attempt(&url, path, max_wait).await {
+                Md5Attempt::Done(result) => result,
+                // Expired twice in one call: hand it to the caller, with the
+                // second task already stopped.
+                Md5Attempt::SessionRenewed => Err(SynoFsError::ApiError(SID_NOT_FOUND)),
+            },
+        }
+    }
+
+    /// Start one MD5 task and wait for it, stopping it if it is given up on.
+    async fn md5_attempt(&self, url: &str, path: &str, max_wait: Duration) -> Md5Attempt {
+        let taskid = match self.md5_start(url, path).await {
+            Ok(taskid) => taskid,
+            Err(e) => return Md5Attempt::Done(Err(e)),
+        };
+        // Covers the one way out that never reaches the code below: the
+        // caller dropping this future mid-poll, as a timeout around it does.
+        let mut on_drop = StopOnDrop::arm(self.md5_stop_request(url, &taskid));
+        let result = self.md5_wait(url, path, &taskid, max_wait).await;
+        on_drop.disarm();
+
+        match result {
+            Ok(digest) => Md5Attempt::Done(Ok(digest)),
+            Err(SynoFsError::ApiError(SID_NOT_FOUND)) if self.auto_relogin => {
+                if let Err(e) = self.relogin().await {
+                    // No session to stop it on. DSM ends the task with the
+                    // session, or it runs to the end; either way it is out of
+                    // reach.
+                    return Md5Attempt::Done(Err(SynoFsError::LoginFailed(Box::new(e))));
+                }
+                self.md5_stop(url, &taskid).await;
+                Md5Attempt::SessionRenewed
+            }
+            Err(e) => {
+                self.md5_stop(url, &taskid).await;
+                Md5Attempt::Done(Err(e))
+            }
+        }
+    }
+
+    /// Ask DSM to start hashing `path`; its task id.
+    async fn md5_start(&self, url: &str, path: &str) -> Result<String, SynoFsError> {
         let text = self
             .get_text_retried(
-                &url,
+                url,
                 &[
                     ("api", "SYNO.FileStation.MD5"),
                     ("version", "2"),
@@ -205,16 +257,20 @@ impl SynologyClient {
                 parsed.error.map(|e| e.code).unwrap_or(0),
             ));
         }
-        let taskid = parsed
+        parsed
             .data
             .map(|d| d.taskid)
-            .ok_or_else(|| SynoFsError::Io("md5 start returned no taskid".into()))?;
+            .ok_or_else(|| SynoFsError::Io("md5 start returned no taskid".into()))
+    }
 
-        let result = self.md5_wait(&url, path, &taskid, max_wait).await;
-        if result.is_err() {
-            self.md5_stop(&url, &taskid).await;
-        }
-        result
+    /// A ready-to-send stop for `taskid`, on the current session.
+    fn md5_stop_request(&self, url: &str, taskid: &str) -> reqwest::RequestBuilder {
+        self.attach_session(self.http.get(url).query(&[
+            ("api", "SYNO.FileStation.MD5"),
+            ("version", "2"),
+            ("method", "stop"),
+            ("taskid", taskid),
+        ]))
     }
 
     /// Poll a started MD5 task until it finishes or `max_wait` runs out.
@@ -279,6 +335,48 @@ impl SynologyClient {
             .await;
         if let Err(e) = stopped {
             tracing::debug!(taskid, error = %e, "md5: stopping an abandoned task failed");
+        }
+    }
+}
+
+/// How one MD5 attempt ended.
+enum Md5Attempt {
+    Done(Result<String, SynoFsError>),
+    /// The session expired under the task. A new one is up and the task has
+    /// been stopped on it, so the hash can be started again.
+    SessionRenewed,
+}
+
+/// Sends a task's stop if dropped while armed.
+///
+/// A future dropped mid-poll gets no chance to run cleanup code, so the stop
+/// has to be ready to go before the wait starts. Sending it needs a runtime;
+/// without one (the runtime itself is shutting down) there is nothing to send
+/// it on.
+struct StopOnDrop(Option<reqwest::RequestBuilder>);
+
+impl StopOnDrop {
+    fn arm(stop: reqwest::RequestBuilder) -> Self {
+        Self(Some(stop))
+    }
+
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        let Some(stop) = self.0.take() else {
+            return;
+        };
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            debug!("md5: caller gave up on a hash; stopping its task");
+            rt.spawn(async move {
+                if let Err(e) = stop.send().await {
+                    debug!(error = %e, "md5: stopping an abandoned task failed");
+                }
+            });
         }
     }
 }
