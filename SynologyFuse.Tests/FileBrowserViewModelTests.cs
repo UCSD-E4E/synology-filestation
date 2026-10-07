@@ -303,4 +303,45 @@ public class FileBrowserViewModelTests
         Assert.False(vm.IsBusy);
         Assert.False(vm.ShowProgress);
     }
+
+    // The browser has one progress bar, and a transfer and a hash used to share
+    // it unawares: a hash started mid-download turned the download's byte count
+    // into an endless sweep, and whichever finished first hid the bar on the
+    // other. Every native call queues on one gate anyway, so letting them
+    // overlap bought nothing but the confusion.
+
+    [Fact]
+    public void ComputeMd5_UnavailableWhileTheProgressBarIsInUse()
+    {
+        var (vm, _, _) = NewHashingVm(_ => Task.FromResult<string?>("x"));
+        vm.SelectedItem = AFile;
+        Assert.True(vm.ComputeMd5Command.CanExecute(null));
+
+        vm.ShowProgress = true; // a download, upload, delete or mkdir running
+
+        Assert.False(vm.ComputeMd5Command.CanExecute(null));
+
+        vm.ShowProgress = false;
+
+        Assert.True(vm.ComputeMd5Command.CanExecute(null));
+    }
+
+    [Fact]
+    public async Task ADownloadStartedDuringAHash_IsRefusedAndLeavesTheHashBarAlone()
+    {
+        var answer = new TaskCompletionSource<string?>();
+        var (vm, _, _) = NewHashingVm(_ => answer.Task);
+        vm.SelectedItem = AFile;
+        var running = vm.ComputeMd5Command.ExecuteAsync(null);
+
+        await vm.DownloadAsync(AFile, "/tmp/raw.ORF");
+
+        Assert.StartsWith("Wait for the MD5 of raw.ORF", vm.Status);
+        Assert.True(vm.ShowProgress, "the hash still has its bar");
+        Assert.True(vm.ProgressIndeterminate);
+
+        answer.SetResult("9e107d9d372bb6826bd81d3542a419d6");
+        await running;
+        Assert.Equal("9e107d9d372bb6826bd81d3542a419d6", vm.Md5Result);
+    }
 }

@@ -91,7 +91,11 @@ public sealed partial class FileBrowserViewModel : ObservableObject, IDisposable
 
     // ── Transfer progress ─────────────────────────────────────────────────────
 
+    /// <summary>The one progress bar, which a transfer and a hash cannot share:
+    /// a hash started mid-download turned the byte count into an endless sweep,
+    /// and whichever finished first hid the bar on the other.</summary>
     [ObservableProperty]
+    [NotifyCanExecuteChangedFor(nameof(ComputeMd5Command))]
     private bool _showProgress;
 
     [ObservableProperty]
@@ -126,6 +130,9 @@ public sealed partial class FileBrowserViewModel : ObservableObject, IDisposable
     [ObservableProperty]
     [NotifyCanExecuteChangedFor(nameof(ComputeMd5Command))]
     private bool _isHashing;
+
+    /// <summary>The file being hashed, for the message that turns a transfer away.</summary>
+    private string _hashingName = "";
 
     public bool IsConnected => _client is not null;
 
@@ -282,14 +289,14 @@ public sealed partial class FileBrowserViewModel : ObservableObject, IDisposable
 
     public async Task DownloadAsync(SynoFileInfo item, string localPath)
     {
-        if (_client is null || item.IsDir) return;
+        if (RefusedWhileHashing() || _client is null || item.IsDir) return;
         await RunWithProgressAsync($"Downloading {item.Name}…", client =>
             client.DownloadTo(item.Path, localPath, ReportProgress));
     }
 
     public async Task UploadAsync(string localPath)
     {
-        if (_client is null || CurrentPath.Length == 0) return; // can't upload to the shares root
+        if (RefusedWhileHashing() || _client is null || CurrentPath.Length == 0) return; // can't upload to the shares root
         var name = System.IO.Path.GetFileName(localPath);
         await RunWithProgressAsync($"Uploading {name}…", client =>
             client.Upload(localPath, CurrentPath, overwrite: true, ReportProgress));
@@ -299,7 +306,7 @@ public sealed partial class FileBrowserViewModel : ObservableObject, IDisposable
     [RelayCommand]
     private async Task Delete()
     {
-        if (_client is null || SelectedItem is null) return;
+        if (RefusedWhileHashing() || _client is null || SelectedItem is null) return;
         var item = SelectedItem;
         await RunWithProgressAsync($"Deleting {item.Name}…", client => client.Delete(item.Path));
         await LoadAsync(CurrentPath);
@@ -307,7 +314,7 @@ public sealed partial class FileBrowserViewModel : ObservableObject, IDisposable
 
     public async Task CreateFolderAsync(string name)
     {
-        if (_client is null || CurrentPath.Length == 0 || string.IsNullOrWhiteSpace(name)) return;
+        if (RefusedWhileHashing() || _client is null || CurrentPath.Length == 0 || string.IsNullOrWhiteSpace(name)) return;
         await RunWithProgressAsync($"Creating {name}…", client => client.CreateFolder(CurrentPath, name));
         await LoadAsync(CurrentPath);
     }
@@ -322,6 +329,7 @@ public sealed partial class FileBrowserViewModel : ObservableObject, IDisposable
         if (SelectedItem is not { IsDir: false } item) return;
         Md5Result = "";
         Md5FileName = "";
+        _hashingName = item.Name;
         IsHashing = true;
         IsBusy = true;
         ShowProgress = true;
@@ -351,7 +359,17 @@ public sealed partial class FileBrowserViewModel : ObservableObject, IDisposable
         }
     }
 
-    private bool CanComputeMd5() => SelectedItem is { IsDir: false } && !IsHashing;
+    private bool CanComputeMd5() => SelectedItem is { IsDir: false } && !IsHashing && !ShowProgress;
+
+    /// <summary>Turn away a transfer while a hash runs. It would only queue
+    /// behind the hash on the gate — for minutes, with nothing on screen to
+    /// say why — and take the progress bar from it.</summary>
+    private bool RefusedWhileHashing()
+    {
+        if (!IsHashing) return false;
+        Status = $"Wait for the MD5 of {_hashingName} to finish first: this window sends the NAS one request at a time.";
+        return true;
+    }
 
     [RelayCommand(CanExecute = nameof(HasMd5Result))]
     private Task CopyMd5() => CopyAsync(Md5Result);
