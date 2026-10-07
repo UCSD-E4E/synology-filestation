@@ -965,13 +965,31 @@ impl SmbTransport {
         }
     }
 
+    /// The connection and the attached share to run an operation on `share`,
+    /// as cheap clones that outlive the lock.
+    ///
+    /// The lock covers only reconnecting and attaching the share. An operation
+    /// that held it across its round trips made everything else on the mount
+    /// wait for it, and a listing of a directory of a million entries pages
+    /// for minutes: a `find` that reached one froze every lookup on every
+    /// share. `Connection` is an `Arc` over shared state that routes responses
+    /// by message id, so concurrent operations on one session need no lock.
+    async fn attached(
+        &self,
+        share: &str,
+    ) -> Result<(smb2::client::connection::Connection, Tree), SynoFsError> {
+        let mut guard = self.inner.lock().await;
+        let (client, tree) = self.ready(&mut guard, share).await?;
+        let tree = tree.clone();
+        Ok((client.connection_mut().clone(), tree))
+    }
+
     /// Metadata for a logical path (`/share/sub/file`).
     pub async fn stat(&self, logical: &str) -> Result<FileMeta, SynoFsError> {
         let loc = SmbPath::from_logical(logical)?;
-        let mut guard = self.inner.lock().await;
-        let (client, tree) = self.ready(&mut guard, &loc.share).await?;
-        let info = client
-            .stat(tree, &loc.path)
+        let (mut conn, tree) = self.attached(&loc.share).await?;
+        let info = tree
+            .stat(&mut conn, &loc.path)
             .await
             .map_err(|e| self.mark_and_map(&e))?;
         Ok(FileMeta {
@@ -999,12 +1017,7 @@ impl SmbTransport {
             return Ok(reader);
         }
 
-        let (conn, tree) = {
-            let mut guard = self.inner.lock().await;
-            let (client, tree) = self.ready(&mut guard, &loc.share).await?;
-            let tree = tree.clone();
-            (client.connection_mut().clone(), tree)
-        };
+        let (conn, tree) = self.attached(&loc.share).await?;
 
         let reader = Arc::new(
             std::sync::Arc::new(tree)
@@ -1722,10 +1735,9 @@ impl MetadataTransport for SmbTransport {
 
     async fn list_dir(&self, folder_path: &str) -> Result<Vec<SynoFileInfo>, SynoFsError> {
         let loc = SmbPath::from_logical(folder_path)?;
-        let mut guard = self.inner.lock().await;
-        let (client, tree) = self.ready(&mut guard, &loc.share).await?;
-        let entries = client
-            .list_directory(tree, &loc.path)
+        let (mut conn, tree) = self.attached(&loc.share).await?;
+        let entries = tree
+            .list_directory(&mut conn, &loc.path)
             .await
             .map_err(|e| self.mark_and_map(&e))?;
 
@@ -1752,10 +1764,9 @@ impl MetadataTransport for SmbTransport {
 
     async fn get_info(&self, path: &str) -> Result<SynoFileInfo, SynoFsError> {
         let loc = SmbPath::from_logical(path)?;
-        let mut guard = self.inner.lock().await;
-        let (client, tree) = self.ready(&mut guard, &loc.share).await?;
-        let info = client
-            .stat(tree, &loc.path)
+        let (mut conn, tree) = self.attached(&loc.share).await?;
+        let info = tree
+            .stat(&mut conn, &loc.path)
             .await
             .map_err(|e| self.mark_and_map(&e))?;
         let name = path

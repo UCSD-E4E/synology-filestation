@@ -291,3 +291,101 @@ async fn a_refused_session_is_not_asked_for_again() {
         synology_filestation_core::error::ErrorCategory::PermissionDenied
     );
 }
+
+// ── One slow listing does not hold up the rest of the mount ──────────────────
+
+/// SMB2 command code for QUERY_DIRECTORY.
+const QUERY_DIRECTORY: u16 = 0x000E;
+
+/// A session to the server whose directory listings come back `delay` late.
+///
+/// Sits between the transport and Samba and holds back every response whose
+/// command is QUERY_DIRECTORY, passing everything else straight through. SMB
+/// responses are routed by message id, so a late one overtaken by others is
+/// what a slow listing on a real NAS looks like: one huge directory paging
+/// through a tunnel while the rest of the mount asks small questions.
+async fn listings_delayed_by(delay: Duration) -> SmbTransport {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let server = a_stream_to_the_server().await;
+    let (ours, theirs) = tokio::io::duplex(1 << 20);
+    let (mut from_server, mut to_server) = server.into_split();
+    let (mut from_client, mut to_client) = tokio::io::split(theirs);
+
+    tokio::spawn(async move {
+        let _ = tokio::io::copy(&mut from_client, &mut to_server).await;
+    });
+
+    // Whole frames only, so a held-back response is never interleaved with
+    // another one on the way out.
+    let (frames, mut out) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    tokio::spawn(async move {
+        while let Some(frame) = out.recv().await {
+            if to_client.write_all(&frame).await.is_err() {
+                break;
+            }
+        }
+    });
+    tokio::spawn(async move {
+        loop {
+            let mut netbios = [0u8; 4];
+            if from_server.read_exact(&mut netbios).await.is_err() {
+                break;
+            }
+            let len = u32::from_be_bytes([0, netbios[1], netbios[2], netbios[3]]) as usize;
+            let mut frame = netbios.to_vec();
+            frame.resize(4 + len, 0);
+            if from_server.read_exact(&mut frame[4..]).await.is_err() {
+                break;
+            }
+            // The SMB2 header is in the clear even on a signed session; the
+            // command sits 12 bytes in.
+            let command = u16::from_le_bytes([frame[4 + 12], frame[4 + 13]]);
+            if command == QUERY_DIRECTORY {
+                let frames = frames.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    let _ = frames.send(frame);
+                });
+            } else if frames.send(frame).is_err() {
+                break;
+            }
+        }
+    });
+
+    let smb = SmbTransport::unconnected(&config_with("testpass"), no_redial());
+    smb.adopt(Box::new(ours), "127.0.0.1")
+        .await
+        .expect("the session is built through the proxy");
+    smb
+}
+
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn a_slow_listing_does_not_hold_up_a_lookup() {
+    // The wedge: a `find` reached a directory of a million entries, and the
+    // listing took the transport's lock for the whole of its paging. Every
+    // lookup on every share then waited behind it, and so did every FUSE
+    // thread asking one. A lookup has nothing to do with somebody else's
+    // listing and must not wait for it.
+    let _servers = TestServers::start().await.expect("docker compose up");
+    let smb = std::sync::Arc::new(listings_delayed_by(Duration::from_secs(5)).await);
+    let path = "/private/beside-a-listing.txt";
+    smb.write_atomic(path, b"here").await.expect("write");
+
+    let lister = std::sync::Arc::clone(&smb);
+    let listing = tokio::spawn(async move { lister.list_dir("/private").await });
+    // Long enough for the listing to be sent and to be waiting on its page.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let info = tokio::time::timeout(Duration::from_secs(2), smb.get_info(path))
+        .await
+        .expect("a lookup answered while a listing was still paging")
+        .expect("get_info");
+    assert_eq!(info.name, "beside-a-listing.txt");
+    assert!(!listing.is_finished(), "the listing was still in flight");
+
+    let entries = listing.await.unwrap().expect("the listing finishes too");
+    assert!(entries.iter().any(|e| e.name == "beside-a-listing.txt"));
+    smb.delete(path).await.ok();
+}
