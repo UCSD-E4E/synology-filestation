@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.8.3](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-fuse-v0.8.2...synology-filestation-fuse-v0.8.3) (2026-09-30)
+
+
+### Bug Fixes
+
+* **fuse:** abort a detached mount's FUSE connection so its teardown finishes ([0d5e2ae](https://github.com/UCSD-E4E/synology-filestation/commit/0d5e2ae4f5f515c137f7cabdb96a40940eb51bcb))
+* **fuse:** find a mount's FUSE connection by device, not by path ([936c2de](https://github.com/UCSD-E4E/synology-filestation/commit/936c2de5b4510d917558adce821a6c9e4938c6cb))
+* **fuse:** hold the FUSE abort file from mount time, and read mountinfo as bytes ([e207a4f](https://github.com/UCSD-E4E/synology-filestation/commit/e207a4f34276f716422ac3099de77ad70ac45ce9))
+* **openvpn:** give the tunnel socket 4 MiB buffers instead of the kernel default ([2a72fd4](https://github.com/UCSD-E4E/synology-filestation/commit/2a72fd49eaa1db334f1c8630f7f3a3cb86a2a9ef))
+* **openvpn:** only ever raise the tunnel socket's buffers ([cd9ceff](https://github.com/UCSD-E4E/synology-filestation/commit/cd9ceff13d4e248a3adf57b511e3931cddf12640))
+
 ## [0.8.2](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-fuse-v0.8.1...synology-filestation-fuse-v0.8.2) (2026-09-25)
 
 
