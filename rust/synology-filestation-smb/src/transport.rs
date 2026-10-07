@@ -42,6 +42,12 @@ fn part_name(path: &str, seq: u64) -> String {
     format!("{path}.part-{}-{}", std::process::id(), seq)
 }
 
+/// Whether an operation run off the lock has to be redone through the client:
+/// only the client can follow a DFS referral and repoint the cached tree.
+fn is_referral(kind: smb2::ErrorKind) -> bool {
+    kind == smb2::ErrorKind::DfsReferral
+}
+
 /// Whether an `smb2` error means the connection itself is dead (so the transport
 /// should reconnect before the next operation), vs. a per-request error the live
 /// connection can keep serving.
@@ -965,15 +971,66 @@ impl SmbTransport {
         }
     }
 
+    /// The connection and the attached share to run an operation on `share`,
+    /// as cheap clones that outlive the lock.
+    ///
+    /// The lock covers only reconnecting and attaching the share. An operation
+    /// that held it across its round trips made everything else on the mount
+    /// wait for it, and a listing of a directory of a million entries pages
+    /// for minutes: a `find` that reached one froze every lookup on every
+    /// share. `Connection` is an `Arc` over shared state that routes responses
+    /// by message id, so concurrent operations on one session need no lock.
+    async fn attached(
+        &self,
+        share: &str,
+    ) -> Result<(smb2::client::connection::Connection, Tree), SynoFsError> {
+        let mut guard = self.inner.lock().await;
+        let (client, tree) = self.ready(&mut guard, share).await?;
+        // The tree's own connection, not the primary one: a DFS referral may
+        // have moved this share to another server.
+        let conn = client.connection_for(tree).ok_or_else(|| {
+            SynoFsError::Io(format!("smb: no connection to the server holding {share}"))
+        })?;
+        Ok((conn, tree.clone()))
+    }
+
+    /// `stat` off the lock, or through the client when a DFS referral has to
+    /// be resolved: that path follows it and repoints the cached tree, so the
+    /// next call runs off the lock on the right server.
+    async fn stat_at(&self, loc: &SmbPath) -> Result<smb2::FileInfo, SynoFsError> {
+        let (mut conn, tree) = self.attached(&loc.share).await?;
+        match tree.stat(&mut conn, &loc.path).await {
+            Err(e) if is_referral(e.kind()) => {}
+            other => return other.map_err(|e| self.mark_and_map(&e)),
+        }
+        let mut guard = self.inner.lock().await;
+        let (client, tree) = self.ready(&mut guard, &loc.share).await?;
+        client
+            .stat(tree, &loc.path)
+            .await
+            .map_err(|e| self.mark_and_map(&e))
+    }
+
+    /// `list_directory` off the lock, with the same referral fallback as
+    /// [`Self::stat_at`].
+    async fn list_at(&self, loc: &SmbPath) -> Result<Vec<smb2::DirectoryEntry>, SynoFsError> {
+        let (mut conn, tree) = self.attached(&loc.share).await?;
+        match tree.list_directory(&mut conn, &loc.path).await {
+            Err(e) if is_referral(e.kind()) => {}
+            other => return other.map_err(|e| self.mark_and_map(&e)),
+        }
+        let mut guard = self.inner.lock().await;
+        let (client, tree) = self.ready(&mut guard, &loc.share).await?;
+        client
+            .list_directory(tree, &loc.path)
+            .await
+            .map_err(|e| self.mark_and_map(&e))
+    }
+
     /// Metadata for a logical path (`/share/sub/file`).
     pub async fn stat(&self, logical: &str) -> Result<FileMeta, SynoFsError> {
         let loc = SmbPath::from_logical(logical)?;
-        let mut guard = self.inner.lock().await;
-        let (client, tree) = self.ready(&mut guard, &loc.share).await?;
-        let info = client
-            .stat(tree, &loc.path)
-            .await
-            .map_err(|e| self.mark_and_map(&e))?;
+        let info = self.stat_at(&loc).await?;
         Ok(FileMeta {
             size: info.size,
             is_directory: info.is_directory,
@@ -999,12 +1056,7 @@ impl SmbTransport {
             return Ok(reader);
         }
 
-        let (conn, tree) = {
-            let mut guard = self.inner.lock().await;
-            let (client, tree) = self.ready(&mut guard, &loc.share).await?;
-            let tree = tree.clone();
-            (client.connection_mut().clone(), tree)
-        };
+        let (conn, tree) = self.attached(&loc.share).await?;
 
         let reader = Arc::new(
             std::sync::Arc::new(tree)
@@ -1360,6 +1412,17 @@ impl StreamReadTransport for SmbTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_dfs_referral_sends_an_unlocked_operation_back_through_the_client() {
+        // The client resolves a referral and repoints the cached tree; the
+        // unlocked path cannot. Anything else is the operation's real answer,
+        // and redoing it under the lock would only double it.
+        assert!(is_referral(smb2::ErrorKind::DfsReferral));
+        assert!(!is_referral(smb2::ErrorKind::NotFound));
+        assert!(!is_referral(smb2::ErrorKind::ConnectionLost));
+        assert!(!is_referral(smb2::ErrorKind::InvalidData));
+    }
 
     #[test]
     fn connection_lost_kinds_trigger_reconnect() {
@@ -1722,12 +1785,7 @@ impl MetadataTransport for SmbTransport {
 
     async fn list_dir(&self, folder_path: &str) -> Result<Vec<SynoFileInfo>, SynoFsError> {
         let loc = SmbPath::from_logical(folder_path)?;
-        let mut guard = self.inner.lock().await;
-        let (client, tree) = self.ready(&mut guard, &loc.share).await?;
-        let entries = client
-            .list_directory(tree, &loc.path)
-            .await
-            .map_err(|e| self.mark_and_map(&e))?;
+        let entries = self.list_at(&loc).await?;
 
         let base = folder_path.trim_end_matches('/');
         Ok(entries
@@ -1752,12 +1810,7 @@ impl MetadataTransport for SmbTransport {
 
     async fn get_info(&self, path: &str) -> Result<SynoFileInfo, SynoFsError> {
         let loc = SmbPath::from_logical(path)?;
-        let mut guard = self.inner.lock().await;
-        let (client, tree) = self.ready(&mut guard, &loc.share).await?;
-        let info = client
-            .stat(tree, &loc.path)
-            .await
-            .map_err(|e| self.mark_and_map(&e))?;
+        let info = self.stat_at(&loc).await?;
         let name = path
             .trim_end_matches('/')
             .rsplit('/')

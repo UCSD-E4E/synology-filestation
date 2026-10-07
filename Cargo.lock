@@ -2403,7 +2403,7 @@ checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
 [[package]]
 name = "smb2"
 version = "0.18.1"
-source = "git+https://github.com/UCSD-E4E/smb2?rev=66262fdf48ef8a4bc9c0b24299fd60dad6c7bfb8#66262fdf48ef8a4bc9c0b24299fd60dad6c7bfb8"
+source = "git+https://github.com/UCSD-E4E/smb2?rev=2462a6656a2cc378a30b06f44c1faa7b747bb5dc#2462a6656a2cc378a30b06f44c1faa7b747bb5dc"
 dependencies = [
  "aes",
  "aes-gcm",
