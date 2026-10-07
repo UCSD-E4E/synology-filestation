@@ -34,7 +34,10 @@ pub fn is_login_refusal(err: &smb2::Error) -> bool {
 /// [`is_login_refusal`], after a session-setup failure has been mapped by
 /// [`session_error`]: a refusal is the one `LoginFailed` this crate makes.
 pub fn is_refused_login(err: &SynoFsError) -> bool {
-    matches!(err, SynoFsError::LoginFailed(_))
+    // The exact shape, not any `LoginFailed`: core wraps HTTP re-login
+    // failures in it too, and one handed back through a redial is not the
+    // SMB server refusing the account.
+    matches!(err, SynoFsError::LoginFailed(inner) if matches!(**inner, SynoFsError::PermissionDenied))
 }
 
 /// Map a failure to build a session. As [`to_syno_error`], except that a
@@ -88,6 +91,25 @@ pub(crate) fn kind_to_syno(kind: ErrorKind, context: &str) -> SynoFsError {
 mod tests {
     use super::*;
     use synology_filestation_core::error::ErrorCategory;
+
+    /// Regression (Copilot, #315): any `LoginFailed` counted, and core wraps
+    /// HTTP re-login failures in it too — a TLS error or a DSM 400 handed
+    /// back through a redial was latched as an SMB credential refusal.
+    #[test]
+    fn only_the_marker_session_error_makes_is_a_refused_login() {
+        let marker = SynoFsError::LoginFailed(Box::new(SynoFsError::PermissionDenied));
+        assert!(is_refused_login(&marker));
+        assert!(is_refused_login(&session_error(&smb2::Error::Auth {
+            message: "STATUS_LOGON_FAILURE".into()
+        })));
+        for other in [
+            SynoFsError::LoginFailed(Box::new(SynoFsError::Io("tls handshake".into()))),
+            SynoFsError::LoginFailed(Box::new(SynoFsError::ApiError(400))),
+            SynoFsError::PermissionDenied,
+        ] {
+            assert!(!is_refused_login(&other), "{other:?}");
+        }
+    }
 
     fn cat(kind: ErrorKind) -> ErrorCategory {
         kind_to_syno(kind, "detail").category()

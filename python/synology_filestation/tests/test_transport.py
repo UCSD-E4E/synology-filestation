@@ -70,13 +70,16 @@ class TestTransport:
         c = _login(host_port, "svc_fishsense", domain="KRG")
         assert "KRG\\svc_fishsense" in c.transport_detail
 
-    def test_without_the_keyword_the_environment_then_the_username_decide(
+    def test_without_the_keyword_the_username_then_the_environment_decide(
         self, httpserver, host_port, smb_unreachable, monkeypatch
     ):
         _serve_login(httpserver)
         assert "KRG\\bob" in _login(host_port, "KRG\\bob").transport_detail
         monkeypatch.setenv("SYNOLOGY_FS_SMB_DOMAIN", "ENVDOM")
         assert "ENVDOM\\carol" in _login(host_port, "carol").transport_detail
+        # A qualified username is about this login; the environment is a
+        # process-wide default, and a stale one must not override it.
+        assert "KRG\\bob" in _login(host_port, "KRG\\bob").transport_detail
 
     def test_domain_is_keyword_only(self, httpserver, host_port):
         _serve_login(httpserver)

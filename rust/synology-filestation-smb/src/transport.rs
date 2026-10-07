@@ -90,6 +90,11 @@ struct ReconnectState {
     /// the session slot so that asking never waits on the lock an operation
     /// holds.
     has_session: AtomicBool,
+    /// The stream ended, on a transport that cannot reopen it. Separate from
+    /// `needs` because that one must stay clear when there is nothing to
+    /// redial (see `possible`); this one only tells a status display the
+    /// truth, which is that the session is gone for good.
+    ended: AtomicBool,
 }
 
 impl Default for ReconnectState {
@@ -100,6 +105,7 @@ impl Default for ReconnectState {
             refused: std::sync::Mutex::new(None),
             turned_away: AtomicBool::new(false),
             has_session: AtomicBool::new(true),
+            ended: AtomicBool::new(false),
         }
     }
 }
@@ -160,17 +166,25 @@ impl ReconnectState {
     fn settled(&self) {
         self.has_session.store(true, Ordering::SeqCst);
         self.needs.store(false, Ordering::SeqCst);
+        self.ended.store(false, Ordering::SeqCst);
     }
 
     /// A session exists and nothing has found it dead.
     fn is_live(&self) -> bool {
-        self.has_session.load(Ordering::SeqCst) && !self.needs.load(Ordering::SeqCst)
+        self.has_session.load(Ordering::SeqCst)
+            && !self.needs.load(Ordering::SeqCst)
+            && !self.ended.load(Ordering::SeqCst)
     }
 
     /// Flag for reconnect if `kind` means the link is dead.
     fn flag_if_lost(&self, kind: smb2::ErrorKind) {
         if self.possible && is_connection_lost(kind) {
             self.needs.store(true, Ordering::SeqCst);
+        }
+        // Only a closed stream, not a slow answer: with no way to reopen it,
+        // this is final, so it must not be set by a timeout that may pass.
+        if !self.possible && kind == smb2::ErrorKind::ConnectionLost {
+            self.ended.store(true, Ordering::SeqCst);
         }
     }
 
@@ -409,20 +423,18 @@ impl SmbConfig {
     /// SMB is reachable, say — and wants it authenticated exactly as the
     /// automatic path would authenticate it.
     ///
-    /// An explicit domain wins over `SYNOLOGY_FS_SMB_DOMAIN`, which wins over
-    /// the one parsed from the username. `Some("")` is an explicit answer, not
-    /// an absent one: an empty domain is how a local DSM user is named, so it
-    /// has to be able to override the environment back to none.
+    /// An explicit domain wins over one parsed from the username, which wins
+    /// over `SYNOLOGY_FS_SMB_DOMAIN` (see `chosen_domain`). `Some("")` is an
+    /// explicit answer, not an absent one: an empty domain is how a local DSM
+    /// user is named, so it has to be able to override the environment back to
+    /// none.
     pub fn for_account(host: &str, username: &str, password: &str, domain: Option<&str>) -> Self {
         let mut cfg = SmbConfig::from_login(host, username, password);
-        match domain {
-            Some(domain) => cfg.domain = domain.to_string(),
-            None => {
-                if let Ok(domain) = std::env::var("SYNOLOGY_FS_SMB_DOMAIN") {
-                    cfg.domain = domain;
-                }
-            }
-        }
+        cfg.domain = chosen_domain(
+            domain,
+            &cfg.domain,
+            std::env::var("SYNOLOGY_FS_SMB_DOMAIN").ok(),
+        );
         if let Some(port) = std::env::var("SYNOLOGY_FS_SMB_PORT")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -450,6 +462,21 @@ impl SmbConfig {
         } else {
             format!("{}:{}", self.host, self.port)
         }
+    }
+}
+
+/// Which domain an account authenticates in: the one the caller passed, then
+/// one spelled into the username, then `SYNOLOGY_FS_SMB_DOMAIN`, then none.
+///
+/// The environment comes last because it is process-wide and the other two
+/// are about this login. When it came before the username, a stale value sent
+/// `KRG\\bob` as `OLD\\bob`, and a wrong principal is a refused login, which is
+/// a strike towards DSM's auto-block.
+fn chosen_domain(explicit: Option<&str>, parsed: &str, env: Option<String>) -> String {
+    match explicit {
+        Some(domain) => domain.to_string(),
+        None if !parsed.is_empty() => parsed.to_string(),
+        None => env.unwrap_or_default(),
     }
 }
 
@@ -1799,6 +1826,40 @@ mod tests {
         // Different sequence numbers yield different temp names (so concurrent
         // writers to the same target don't collide).
         assert_ne!(part_name("x", 1), part_name("x", 2));
+    }
+
+    /// The precedence the Python binding documents, and the one asked for: an
+    /// explicit domain, then a qualified username, then the environment.
+    /// Regression (Copilot, #315): the environment beat a qualified username,
+    /// so a stale `SYNOLOGY_FS_SMB_DOMAIN` sent `KRG\\bob` as `OLD\\bob` — a
+    /// strike for a login the caller had spelled out.
+    #[test]
+    fn the_domain_comes_from_the_call_then_the_username_then_the_environment() {
+        let env = Some("ENVDOM".to_string());
+        assert_eq!(chosen_domain(Some("ARG"), "KRG", env.clone()), "ARG");
+        assert_eq!(
+            chosen_domain(Some(""), "KRG", env.clone()),
+            "",
+            "an explicit local account"
+        );
+        assert_eq!(chosen_domain(None, "KRG", env.clone()), "KRG");
+        assert_eq!(chosen_domain(None, "", env.clone()), "ENVDOM");
+        assert_eq!(chosen_domain(None, "", None), "");
+    }
+
+    /// Regression (Copilot, #315): a transport on a stream nobody can reopen
+    /// never marked the stream dead, so it reported itself serving while every
+    /// operation went to HTTP.
+    #[test]
+    fn a_stream_that_cannot_be_reopened_is_reported_dead_once_it_ends() {
+        let state = ReconnectState::for_supplied_stream(false);
+        state.flag_if_lost(smb2::ErrorKind::TimedOut);
+        assert!(state.is_live(), "a slow answer is not an ended stream");
+        state.flag_if_lost(smb2::ErrorKind::ConnectionLost);
+        assert!(!state.is_live());
+        // A session handed over afterwards is a new one, and live.
+        state.settled();
+        assert!(state.is_live());
     }
 
     #[test]
