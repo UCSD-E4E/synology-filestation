@@ -34,4 +34,4 @@ members = [
 # else moves. Pinned to a revision, never a branch — a build that can change
 # under you is not a build.
 [patch.crates-io]
-smb2 = { git = "https://github.com/UCSD-E4E/smb2", rev = "c04472b23e620e2d65388a60e229afcff27ba861" }
+smb2 = { git = "https://github.com/UCSD-E4E/smb2", rev = "2462a6656a2cc378a30b06f44c1faa7b747bb5dc" }
