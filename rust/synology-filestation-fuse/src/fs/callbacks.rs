@@ -9,9 +9,9 @@ use std::sync::atomic::Ordering;
 use std::time::SystemTime;
 
 use fuser::{
-    BsdFileFlags, Errno, FileHandle, FileType, Filesystem, FopenFlags, INodeNo, LockOwner,
-    OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
-    ReplyEntry, ReplyOpen, ReplyWrite, Request, WriteFlags,
+    BsdFileFlags, Errno, FileHandle, Filesystem, FopenFlags, INodeNo, LockOwner, OpenFlags,
+    RenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
+    ReplyOpen, ReplyWrite, Request, WriteFlags,
 };
 use tracing::{debug, error, info, warn};
 
@@ -163,22 +163,41 @@ impl Filesystem for SynologyFS {
         }
     }
 
-    /// Nothing to open — a directory here is a listing, not a handle — but the
-    /// reply is the only place to tell the kernel it may cache one, and
-    /// fuser's default says nothing. See [`dir_open_flags`].
+    /// A handle for one pass over the directory, which keeps the listing that
+    /// pass reads (see `dirs`). The reply is also the only place to tell the
+    /// kernel it may cache the directory, and fuser's default says nothing.
+    /// See [`dir_open_flags`].
     fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
         if self.get_path_for_ino(ino.0).is_none() {
             reply.error(Errno::ENOENT);
             return;
         }
-        reply.opened(FileHandle(0), dir_open_flags(self.dir_cache.is_enabled()));
+        reply.opened(
+            FileHandle(self.open_dir()),
+            dir_open_flags(self.dir_cache.is_enabled()),
+        );
     }
 
+    fn releasedir(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        _flags: OpenFlags,
+        reply: ReplyEmpty,
+    ) {
+        self.release_dir(fh.0);
+        reply.ok();
+    }
+
+    /// Answered from the runtime, not from here: the listing behind it can
+    /// take minutes for a big enough directory, and an event-loop thread
+    /// waiting on it was one fewer for the rest of the mount. See `dirs`.
     fn readdir(
         &self,
         _req: &Request,
         ino: INodeNo,
-        _fh: FileHandle,
+        fh: FileHandle,
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
@@ -192,65 +211,23 @@ impl Filesystem for SynologyFS {
         };
         debug!("readdir: ino={} path={} offset={}", ino, path, offset);
 
-        // Virtual root: list FileStation shares instead of a real directory.
-        let (entries, parent_ino) = if path == VIRTUAL_ROOT_PATH {
-            let shares = match self.listing(VIRTUAL_ROOT_PATH) {
-                Ok(s) => s,
+        let shown = path.clone();
+        self.start_readdir(fh.0, ino, path, offset, move |listed| {
+            let entries = match listed {
+                Ok(entries) => entries,
                 Err(e) => {
-                    error!("readdir shares: {}", e);
+                    error!("readdir {}: {}", shown, e);
                     reply.error(errno(e.to_errno()));
                     return;
                 }
             };
-            debug!("readdir root: got {} shares", shares.len());
-            (shares, ROOT_INO)
-        } else {
-            let entries = match self.listing(&path) {
-                Ok(e) => e,
-                Err(e) => {
-                    error!("readdir {}: {}", path, e);
-                    reply.error(errno(e.to_errno()));
-                    return;
+            for (i, entry) in entries.iter().enumerate().skip(offset as usize) {
+                if reply.add(INodeNo(entry.ino), (i + 1) as u64, entry.kind, &entry.name) {
+                    break;
                 }
-            };
-            let parent_ino = path
-                .rfind('/')
-                .map(|i| {
-                    let parent_path = &path[..i];
-                    // parent of a top-level share (e.g. "/homes") is the virtual root
-                    if parent_path.is_empty() {
-                        ROOT_INO
-                    } else {
-                        self.cache.get_or_alloc_ino(parent_path)
-                    }
-                })
-                .unwrap_or(ROOT_INO);
-            (entries, parent_ino)
-        };
-
-        // Build full entry list: ".", "..", then actual entries
-        let mut all_entries: Vec<(u64, FileType, String)> = Vec::new();
-        all_entries.push((ino, FileType::Directory, ".".to_string()));
-        all_entries.push((parent_ino, FileType::Directory, "..".to_string()));
-
-        for file_info in entries.iter() {
-            let child_ino = self.cache.get_or_alloc_ino(&file_info.path);
-            let kind = if file_info.isdir {
-                FileType::Directory
-            } else {
-                FileType::RegularFile
-            };
-            let name = file_info.name.clone();
-            self.cache.insert(child_ino, file_info.clone());
-            all_entries.push((child_ino, kind, name));
-        }
-
-        for (i, (child_ino, kind, name)) in all_entries.iter().enumerate().skip(offset as usize) {
-            if reply.add(INodeNo(*child_ino), (i + 1) as u64, *kind, name) {
-                break;
             }
-        }
-        reply.ok();
+            reply.ok();
+        });
     }
 
     fn read(

@@ -2,6 +2,7 @@
 //! `SynologyClient`, and the seeding helpers the write tests build on.
 
 mod attr;
+mod dirs;
 mod read;
 mod write;
 
@@ -41,12 +42,17 @@ fn fixture() -> Fixture {
 }
 
 fn fixture_with_prefetch(depth: u64) -> Fixture {
+    fixture_with(depth, 30)
+}
+
+/// `dir_ttl` is `--cache-ttl` for listings; `0` switches their cache off.
+fn fixture_with(depth: u64, dir_ttl: u64) -> Fixture {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let server = rt.block_on(MockServer::start());
     let fs = SynologyFS::new(
         Arc::new(client_for(&server)),
         Arc::new(InodeCache::new(30)),
-        Arc::new(DirCache::new(30)),
+        Arc::new(DirCache::new(dir_ttl)),
         Arc::new(ReadCache::new(BLOCK, 64)),
         rt.handle().clone(),
         Ownership {

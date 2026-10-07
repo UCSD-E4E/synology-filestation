@@ -11,10 +11,13 @@ use crate::spill::SpillBuffer;
 use synology_filestation_core::client::SynologyClient;
 use synology_filestation_core::error::SynoFsError;
 use synology_filestation_core::transport::WriteOpen;
-use synology_filestation_core::types::{SynoFileInfo, VIRTUAL_ROOT_PATH};
+use synology_filestation_core::types::SynoFileInfo;
+#[cfg(test)]
+use synology_filestation_core::types::VIRTUAL_ROOT_PATH;
 
 mod attr;
 mod callbacks;
+mod dirs;
 mod prefetch;
 #[cfg(test)]
 mod tests;
@@ -22,6 +25,9 @@ mod transfer;
 
 use attr::file_attr;
 pub use attr::Ownership;
+#[cfg(test)]
+use dirs::DirEntry;
+use dirs::{DirHandles, Flights};
 use prefetch::{
     is_indexed_media, open_window, InflightGuard, ReadAhead, MAX_INFLIGHT_PREFETCH_BLOCKS,
     MAX_PREFETCH_SPAN,
@@ -57,6 +63,10 @@ pub struct SynologyFS {
     read_ahead: Arc<Mutex<HashMap<u64, (u64, ReadAhead)>>>,
     /// Speculative downloads still running, so a close can abandon them.
     prefetch_tasks: Arc<Mutex<HashMap<u64, Vec<tokio::task::JoinHandle<()>>>>>,
+    /// Open directory handles and the listing each pass is reading.
+    dir_handles: DirHandles,
+    /// Listings being fetched, so a second reader waits for the first.
+    flights: Flights,
 }
 
 impl SynologyFS {
@@ -71,18 +81,11 @@ impl SynologyFS {
     /// The virtual root is a listing like any other; that it comes from
     /// `list_share` rather than `list` is the only difference, and it is the
     /// one that gets polled.
+    ///
+    /// Blocks, so it is for callers that need the answer before they can
+    /// reply. `readdir` does not, and goes through [`SynologyFS::start_readdir`].
     fn listing(&self, path: &str) -> Result<Arc<Vec<SynoFileInfo>>, SynoFsError> {
-        if let Some(cached) = self.dir_cache.get(path) {
-            return Ok(cached);
-        }
-        let entries = if path == VIRTUAL_ROOT_PATH {
-            self.block(self.client.list_shares())?
-        } else {
-            self.block(self.client.list_dir(path))?
-        };
-        // `insert` hands back what it stored, so this still works when caching
-        // is switched off (`--cache-ttl 0`) and nothing was stored at all.
-        Ok(self.dir_cache.insert(path, entries))
+        self.block(self.lister().get(path))
     }
 
     pub fn new(
@@ -108,6 +111,8 @@ impl SynologyFS {
             prefetch_blocks,
             read_ahead: Arc::new(Mutex::new(HashMap::new())),
             prefetch_tasks: Arc::new(Mutex::new(HashMap::new())),
+            dir_handles: Arc::new(Mutex::new(HashMap::new())),
+            flights: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
