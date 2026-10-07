@@ -1745,7 +1745,7 @@ mod tests {
                 .await;
             // Still hashing the first time it is asked, done the second.
             md5_call("status")
-                .and(query_param("taskid", "md5-1"))
+                .and(query_param("taskid", "\"md5-1\""))
                 .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "success": true, "data": {"finished": false}
                 })))
@@ -1753,7 +1753,7 @@ mod tests {
                 .mount(&server)
                 .await;
             md5_call("status")
-                .and(query_param("taskid", "md5-1"))
+                .and(query_param("taskid", "\"md5-1\""))
                 .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "success": true,
                     "data": {"finished": true, "md5": "9e107d9d372bb6826bd81d3542a419d6"}
