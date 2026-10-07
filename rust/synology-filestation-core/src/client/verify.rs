@@ -170,7 +170,22 @@ impl SynologyClient {
     /// hands back a task id, `status` is polled (it polls at 1 s) until
     /// `finished`. Bounded by [`MD5_MAX_WAIT`] so a task that never finishes
     /// cannot park the caller — for the FUSE backend, that caller is a `flush`.
+    ///
+    /// DSM reads the whole file to answer, which is the same load on the
+    /// appliance as a download, so a throttled client holds a transfer slot
+    /// for the length of the task. A task given up on — timed out, or its
+    /// status refused — is stopped, or it would go on reading regardless.
     pub async fn md5(&self, path: &str) -> Result<String, SynoFsError> {
+        self.md5_within(path, MD5_MAX_WAIT).await
+    }
+
+    /// [`Self::md5`], giving up after `max_wait` rather than [`MD5_MAX_WAIT`].
+    pub(super) async fn md5_within(
+        &self,
+        path: &str,
+        max_wait: Duration,
+    ) -> Result<String, SynoFsError> {
+        let _slot = self.acquire_transfer_slot().await;
         let url = format!("{}/entry.cgi", self.base_url);
         let text = self
             .get_text_retried(
@@ -195,16 +210,31 @@ impl SynologyClient {
             .map(|d| d.taskid)
             .ok_or_else(|| SynoFsError::Io("md5 start returned no taskid".into()))?;
 
-        let deadline = Instant::now() + MD5_MAX_WAIT;
+        let result = self.md5_wait(&url, path, &taskid, max_wait).await;
+        if result.is_err() {
+            self.md5_stop(&url, &taskid).await;
+        }
+        result
+    }
+
+    /// Poll a started MD5 task until it finishes or `max_wait` runs out.
+    async fn md5_wait(
+        &self,
+        url: &str,
+        path: &str,
+        taskid: &str,
+        max_wait: Duration,
+    ) -> Result<String, SynoFsError> {
+        let deadline = Instant::now() + max_wait;
         loop {
             let text = self
                 .get_text_retried(
-                    &url,
+                    url,
                     &[
                         ("api", "SYNO.FileStation.MD5"),
                         ("version", "2"),
                         ("method", "status"),
-                        ("taskid", &taskid),
+                        ("taskid", taskid),
                     ],
                 )
                 .await?;
@@ -225,10 +255,30 @@ impl SynologyClient {
             if Instant::now() >= deadline {
                 return Err(SynoFsError::Io(format!(
                     "md5 of {path} did not finish within {}s",
-                    MD5_MAX_WAIT.as_secs()
+                    max_wait.as_secs()
                 )));
             }
             tokio::time::sleep(MD5_POLL_INTERVAL).await;
+        }
+    }
+
+    /// Tell DSM to abandon an MD5 task. Best effort: the caller already has
+    /// the error that matters, and a stop that fails leaves nothing worse than
+    /// the task running to the end, which is what happened before.
+    async fn md5_stop(&self, url: &str, taskid: &str) {
+        let stopped = self
+            .get_text_retried(
+                url,
+                &[
+                    ("api", "SYNO.FileStation.MD5"),
+                    ("version", "2"),
+                    ("method", "stop"),
+                    ("taskid", taskid),
+                ],
+            )
+            .await;
+        if let Err(e) = stopped {
+            tracing::debug!(taskid, error = %e, "md5: stopping an abandoned task failed");
         }
     }
 }

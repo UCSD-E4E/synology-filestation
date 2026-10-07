@@ -714,3 +714,142 @@ async fn slice_upload_notices_the_file_landed_before_starting_over() {
     );
     std::fs::remove_file(&local).ok();
 }
+
+/// The `SYNO.FileStation.MD5` calls made with `method`, by task id.
+async fn md5_method_calls(server: &MockServer, wanted: &str) -> Vec<String> {
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| {
+            r.url
+                .query_pairs()
+                .any(|(k, v)| k == "method" && v == wanted)
+        })
+        .map(|r| {
+            r.url
+                .query_pairs()
+                .find(|(k, _)| k == "taskid")
+                .map(|(_, v)| v.to_string())
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+async fn mount_md5_start(server: &MockServer, taskid: &str) {
+    Mock::given(method("GET"))
+        .and(path("/webapi/entry.cgi"))
+        .and(query_param("method", "start"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true, "data": {"taskid": taskid}
+        })))
+        .mount(server)
+        .await;
+}
+
+async fn mount_md5_stop(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path("/webapi/entry.cgi"))
+        .and(query_param("method", "stop"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true
+        })))
+        .mount(server)
+        .await;
+}
+
+/// Giving up on a hash is not the same as DSM giving up on it: the task goes
+/// on reading the whole file unless it is told to stop. A caller verifying
+/// thousands of files that each time out would leave thousands of whole-file
+/// reads running on the appliance.
+#[tokio::test]
+async fn md5_stops_the_task_it_gives_up_waiting_for() {
+    let server = MockServer::start().await;
+    mount_md5_start(&server, "md5-slow").await;
+    Mock::given(method("GET"))
+        .and(path("/webapi/entry.cgi"))
+        .and(query_param("method", "status"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true, "data": {"finished": false}
+        })))
+        .mount(&server)
+        .await;
+    mount_md5_stop(&server).await;
+
+    let err = client_for(&server)
+        .md5_within("/share/huge.bin", Duration::from_millis(1500))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, SynoFsError::Io(_)), "got {err:?}");
+    assert_eq!(md5_method_calls(&server, "stop").await, vec!["md5-slow"]);
+}
+
+/// Same when a status poll is refused: the task was started, so it is ours to
+/// stop.
+#[tokio::test]
+async fn md5_stops_the_task_when_its_status_cannot_be_read() {
+    let server = MockServer::start().await;
+    mount_md5_start(&server, "md5-err").await;
+    Mock::given(method("GET"))
+        .and(path("/webapi/entry.cgi"))
+        .and(query_param("method", "status"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": false, "error": {"code": 401}
+        })))
+        .mount(&server)
+        .await;
+    mount_md5_stop(&server).await;
+
+    let err = client_for(&server).md5("/share/f.bin").await.unwrap_err();
+
+    assert!(matches!(err, SynoFsError::ApiError(401)), "got {err:?}");
+    assert_eq!(md5_method_calls(&server, "stop").await, vec!["md5-err"]);
+}
+
+/// A hash is a whole-file read on the appliance — the same load as a
+/// download — so it waits for a slot like one. Unthrottled, a loop verifying a
+/// batch of files would start every read at once.
+#[tokio::test]
+async fn md5_waits_for_a_throttle_slot_like_a_download() {
+    let server = MockServer::start().await;
+    mount_md5_start(&server, "md5-t").await;
+    Mock::given(method("GET"))
+        .and(path("/webapi/entry.cgi"))
+        .and(query_param("method", "status"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({
+                    "success": true,
+                    "data": {"finished": true, "md5": "d41d8cd98f00b204e9800998ecf8427e"}
+                }))
+                .set_delay(Duration::from_millis(800)),
+        )
+        .mount(&server)
+        .await;
+
+    let uri = server.uri();
+    let (host, port) = uri.trim_start_matches("http://").rsplit_once(':').unwrap();
+    let client = Arc::new(
+        SynologyClient::new(host, port.parse().unwrap(), false).with_throttle(ThrottleConfig {
+            max_concurrency: 1,
+            min_interval: Duration::ZERO,
+            ..ThrottleConfig::default()
+        }),
+    );
+
+    let (a, b) = (Arc::clone(&client), Arc::clone(&client));
+    let first = tokio::spawn(async move { a.md5("/share/a.bin").await });
+    let second = tokio::spawn(async move { b.md5("/share/b.bin").await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert_eq!(
+        md5_method_calls(&server, "start").await.len(),
+        1,
+        "the second hash waited for the first to finish"
+    );
+    first.await.unwrap().unwrap();
+    second.await.unwrap().unwrap();
+    assert_eq!(md5_method_calls(&server, "start").await.len(), 2);
+}
