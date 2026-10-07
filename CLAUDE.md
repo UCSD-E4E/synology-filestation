@@ -86,6 +86,13 @@ Key files in `SynologyFuse.MacInstaller/`:
 - `distribution.xml` — installer UI config (welcome screen, license, macOS 12+ requirement)
 - `scripts/postinstall` — symlinks CLI to `/usr/local/bin/` after payload is placed
 
+The Nix flake builds the same bundle for `packages.<darwin>.synologyfuse-gui`, sharing `Info.plist` but **not** the assembled `.app` — the Nix launcher hard-codes `/nix/store` paths, so a `.pkg` built from it would not run without Nix. Two things there are load-bearing and easy to undo by accident:
+
+- **The whole payload lives in `Contents/MacOS`, and the launcher `exec`s a sibling.** macOS derives `NSBundle.mainBundle` from the path of the *running* executable, so a launcher that `exec`s a store path outside the bundle yields a process with no `Info.plist`: no Dock icon, no display name, and a well-formed bundle that looks broken. `postInstall` therefore moves the publish output into the bundle and leaves `$out/lib/synologyfuse-gui` as a symlink; `postFixup` wraps the apphost in place (`wrapProgram`, giving `.SynologyFuse.Gui-wrapped` beside it) and points `$out/bin/SynologyFuse.Gui` at the bundle. The rename is safe because the apphost carries its managed assembly name internally.
+- **`NSAppleEventsUsageDescription` is required to mount.** The macOS backend sends Finder an AppleScript `mount volume`, which TCC gates; without the string macOS denies the event (`errAEEventNotPermitted`) instead of prompting. A terminal launch works regardless because the terminal holds its own automation grant, so this fails *only* from the Dock, Launchpad or Spotlight — including for `.pkg` users.
+
+`checks.<darwin>.gui-app-bundle` (`nix/check-app-bundle.py`) pins both down, since a malformed bundle builds successfully and only shows up as "it never appears in Spotlight".
+
 ### Debian/Ubuntu Package (.deb)
 
 ```bash
@@ -158,7 +165,7 @@ The GUI path goes: MountService.cs / SynoClient.cs → P/Invoke (Interop/NativeM
 | File | Role |
 |------|------|
 | `main.rs`   | CLI binary: parsing (clap), interactive prompts, login, then calls `lib.rs::spawn_mount` and parks on Ctrl-C |
-| `lib.rs`    | Library surface: `spawn_mount`/`MountHandle` (non-blocking, background mount) + `is_otp_required`, shared by the CLI and the FFI crate |
+| `lib.rs`    | Library surface: `spawn_mount`/`MountHandle` (non-blocking, background mount) + `is_otp_required`, shared by the CLI and the FFI crate. The macOS mount and unmount shell out through `run_command`, which is `std::process` on purpose: both callers are synchronous and outside the runtime, and `tokio::process::Command::output()` spawns the child when the future is *constructed*, so building one as the argument to `block_on` panics with "there is no reactor running" — which is what aborted every GUI mount on macOS |
 | `fs.rs`     | Linux FUSE backend. Metadata callbacks use `runtime.block_on()`; **file transfers do not** — `flush`/`release` (upload), `setattr` (truncate) and cross-directory `rename` hand the transfer to the Tokio runtime via `start_*` and reply to the kernel from there, so no transfer ever occupies an event-loop thread. Transfers are capped at `MAX_CONCURRENT_TRANSFERS` (the event loop used to be that limit by accident) and each open handle has its own buffer lock. The session also runs a multi-threaded event loop (`MountOptions::io_threads`, `--fuse-threads`) for the remaining blocking callbacks |
 | `cache.rs`  | Linux only — `InodeCache` (TTL metadata), `ReadCache` (LRU block cache, 256 KiB blocks) |
 | `prefetch.rs` | Linux only — what to speculate on and when: the container sniff that decides the open window, the sequential-detection ramp behind `read`, and `InflightGuard` |
@@ -289,5 +296,5 @@ CI workflows:
 | `.github/workflows/rust.yml`           | every push / PR        | clippy, build, test for the rust crates + .deb/.pkg/.msi smoke builds |
 | `.github/workflows/python.yml`         | every push             | pytest matrix (Python 3.10–3.13) for the bindings |
 | `.github/workflows/maturin.yml`        | every push             | manylinux wheel smoke build |
-| `.github/workflows/nix.yml`            | push to main / PR      | `nix flake check` — CLI + GUI builds, clippy, rustfmt, GUI tests |
+| `.github/workflows/nix.yml`            | push to main / PR      | `nix flake check` — CLI + GUI builds, clippy, rustfmt, GUI tests; a `macos-latest` job that builds the darwin outputs and validates the `.app` bundle |
 | `.github/workflows/release-please.yml` | push to main (or workflow_dispatch with `tag`) | release-please PR, then every artifact uploaded to the one release |
