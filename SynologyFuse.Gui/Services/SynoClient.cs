@@ -142,6 +142,18 @@ public sealed class SynoClient : IDisposable
         Check(syno_rename(_client, path, newName, ref err), ref err);
     }
 
+    /// <summary>Have the NAS hash <paramref name="path"/> and return its MD5 as
+    /// lowercase hex. DSM reads the whole file to answer, so this blocks for
+    /// minutes on a large one (the native side gives up after 15). It cannot be
+    /// cancelled; call it off the UI thread like a transfer.</summary>
+    public string Md5(string path)
+    {
+        var err = default(NativeError);
+        int rc = syno_md5(_client, path, out var digest, ref err);
+        Check(rc, ref err);
+        return TakeString(digest);
+    }
+
     // ── Mount lifecycle ──────────────────────────────────────────────────────────
 
     /// <summary>Mount the share at <paramref name="mountpoint"/> in-process.

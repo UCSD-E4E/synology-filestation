@@ -714,3 +714,473 @@ async fn slice_upload_notices_the_file_landed_before_starting_over() {
     );
     std::fs::remove_file(&local).ok();
 }
+
+/// The `SYNO.FileStation.MD5` calls made with `method`, by task id.
+async fn md5_method_calls(server: &MockServer, wanted: &str) -> Vec<String> {
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| {
+            r.url
+                .query_pairs()
+                .any(|(k, v)| k == "method" && v == wanted)
+        })
+        .map(|r| {
+            r.url
+                .query_pairs()
+                .find(|(k, _)| k == "taskid")
+                .map(|(_, v)| v.to_string())
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+async fn mount_md5_start(server: &MockServer, taskid: &str) {
+    Mock::given(method("GET"))
+        .and(path("/webapi/entry.cgi"))
+        .and(query_param("method", "start"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true, "data": {"taskid": taskid}
+        })))
+        .mount(server)
+        .await;
+}
+
+async fn mount_md5_stop(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path("/webapi/entry.cgi"))
+        .and(query_param("method", "stop"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true
+        })))
+        .mount(server)
+        .await;
+}
+
+/// Giving up on a hash is not the same as DSM giving up on it: the task goes
+/// on reading the whole file unless it is told to stop. A caller verifying
+/// thousands of files that each time out would leave thousands of whole-file
+/// reads running on the appliance.
+#[tokio::test]
+async fn md5_stops_the_task_it_gives_up_waiting_for() {
+    let server = MockServer::start().await;
+    mount_md5_start(&server, "md5-slow").await;
+    Mock::given(method("GET"))
+        .and(path("/webapi/entry.cgi"))
+        .and(query_param("method", "status"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true, "data": {"finished": false}
+        })))
+        .mount(&server)
+        .await;
+    mount_md5_stop(&server).await;
+
+    let err = client_for(&server)
+        .md5_within("/share/huge.bin", Duration::from_millis(1500))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, SynoFsError::Io(_)), "got {err:?}");
+    assert_eq!(md5_method_calls(&server, "stop").await, vec!["md5-slow"]);
+}
+
+/// Same when a status poll is refused: the task was started, so it is ours to
+/// stop.
+#[tokio::test]
+async fn md5_stops_the_task_when_its_status_cannot_be_read() {
+    let server = MockServer::start().await;
+    mount_md5_start(&server, "md5-err").await;
+    Mock::given(method("GET"))
+        .and(path("/webapi/entry.cgi"))
+        .and(query_param("method", "status"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": false, "error": {"code": 401}
+        })))
+        .mount(&server)
+        .await;
+    mount_md5_stop(&server).await;
+
+    let err = client_for(&server).md5("/share/f.bin").await.unwrap_err();
+
+    assert!(matches!(err, SynoFsError::ApiError(401)), "got {err:?}");
+    assert_eq!(md5_method_calls(&server, "stop").await, vec!["md5-err"]);
+}
+
+/// A hash is a whole-file read on the appliance — the same load as a
+/// download — so it waits for a slot like one. Unthrottled, a loop verifying a
+/// batch of files would start every read at once.
+#[tokio::test]
+async fn md5_waits_for_a_throttle_slot_like_a_download() {
+    let server = MockServer::start().await;
+    mount_md5_start(&server, "md5-t").await;
+    Mock::given(method("GET"))
+        .and(path("/webapi/entry.cgi"))
+        .and(query_param("method", "status"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({
+                    "success": true,
+                    "data": {"finished": true, "md5": "d41d8cd98f00b204e9800998ecf8427e"}
+                }))
+                .set_delay(Duration::from_millis(800)),
+        )
+        .mount(&server)
+        .await;
+
+    let uri = server.uri();
+    let (host, port) = uri.trim_start_matches("http://").rsplit_once(':').unwrap();
+    let client = Arc::new(
+        SynologyClient::new(host, port.parse().unwrap(), false).with_throttle(ThrottleConfig {
+            max_concurrency: 1,
+            min_interval: Duration::ZERO,
+            ..ThrottleConfig::default()
+        }),
+    );
+
+    let (a, b) = (Arc::clone(&client), Arc::clone(&client));
+    let first = tokio::spawn(async move { a.md5("/share/a.bin").await });
+    let second = tokio::spawn(async move { b.md5("/share/b.bin").await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert_eq!(
+        md5_method_calls(&server, "start").await.len(),
+        1,
+        "the second hash waited for the first to finish"
+    );
+    first.await.unwrap().unwrap();
+    second.await.unwrap().unwrap();
+    assert_eq!(md5_method_calls(&server, "start").await.len(), 2);
+}
+
+/// Regression: only an error stopped the task. A caller that gives up first
+/// drops the call mid-poll — Python's `asyncio.wait_for(client.md5(p), 60)`
+/// does exactly that on its timeout — and nothing told DSM, which went on
+/// reading the whole file. Over a batch, that is one abandoned whole-file read
+/// per timed-out file.
+#[tokio::test]
+async fn md5_stops_the_task_when_the_caller_gives_up_on_it() {
+    let server = MockServer::start().await;
+    mount_md5_start(&server, "md5-dropped").await;
+    Mock::given(method("GET"))
+        .and(path("/webapi/entry.cgi"))
+        .and(query_param("method", "status"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true, "data": {"finished": false}
+        })))
+        .mount(&server)
+        .await;
+    mount_md5_stop(&server).await;
+
+    let client = client_for(&server);
+    let gave_up =
+        tokio::time::timeout(Duration::from_millis(1500), client.md5("/share/huge.bin")).await;
+    assert!(gave_up.is_err(), "the caller's own timeout fired");
+
+    // The stop is sent from the drop, so give it a moment to arrive.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while md5_method_calls(&server, "stop").await.is_empty() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(md5_method_calls(&server, "stop").await, vec!["md5-dropped"]);
+}
+
+/// Regression: a session that expired during a long hash made the stop go
+/// out on the dead session, where it failed quietly, and the caller's
+/// relogin retry then started a second hash of the same file beside the
+/// first. The old task has to be stopped on the new session, before the new
+/// one starts — and the retry belongs here, where that order can be kept.
+#[tokio::test]
+async fn md5_stops_the_old_task_on_the_new_session_when_the_session_expires() {
+    let server = MockServer::start().await;
+    mount_probe_ok_for_verify(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/webapi/auth.cgi"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true, "data": {"sid": "old_sid"}
+        })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/webapi/auth.cgi"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true, "data": {"sid": "new_sid"}
+        })))
+        .mount(&server)
+        .await;
+    for taskid in ["md5-a", "md5-b"] {
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "start"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true, "data": {"taskid": taskid}
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+    }
+    Mock::given(method("GET"))
+        .and(path("/webapi/entry.cgi"))
+        .and(query_param("method", "status"))
+        .and(query_param("taskid", "md5-a"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": false, "error": {"code": 119}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/webapi/entry.cgi"))
+        .and(query_param("method", "status"))
+        .and(query_param("taskid", "md5-b"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true, "data": {"finished": true, "md5": "d41d8cd98f00b204e9800998ecf8427e"}
+        })))
+        .mount(&server)
+        .await;
+    mount_md5_stop(&server).await;
+
+    let client = client_auto_for(&server);
+    client.login("alice", "secret", None).await.unwrap();
+    let digest = client
+        .with_relogin_retry(|| client.md5("/share/f.bin"))
+        .await
+        .unwrap();
+    assert_eq!(digest, "d41d8cd98f00b204e9800998ecf8427e");
+
+    let md5_requests: Vec<_> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|r| {
+            r.url
+                .query()
+                .is_some_and(|q| q.contains("SYNO.FileStation.MD5"))
+        })
+        .collect();
+    let order: Vec<String> = md5_requests
+        .iter()
+        .map(|r| {
+            let q: std::collections::HashMap<_, _> = r.url.query_pairs().into_owned().collect();
+            format!(
+                "{} {}",
+                q["method"],
+                q.get("taskid").map(String::as_str).unwrap_or("-")
+            )
+        })
+        .collect();
+    assert_eq!(
+        order,
+        vec![
+            "start -",
+            "status md5-a",
+            "stop md5-a",
+            "start -",
+            "status md5-b"
+        ],
+        "the old task is stopped before the new one starts, and only one restart"
+    );
+    let stop = &md5_requests[2];
+    let cookie = stop
+        .headers
+        .get("cookie")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    assert!(
+        cookie.contains("new_sid"),
+        "the stop went out on the new session, not the expired one: {cookie:?}"
+    );
+}
+
+async fn mount_probe_ok_for_verify(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(query_param("method", "list_share"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            serde_json::json!({"success": true, "data": {"total": 0, "shares": []}}),
+        ))
+        .mount(server)
+        .await;
+}
+
+/// Logins that hand out `old_sid` first and `new_sid` after.
+async fn mount_two_logins(server: &MockServer) {
+    mount_probe_ok_for_verify(server).await;
+    Mock::given(method("POST"))
+        .and(path("/webapi/auth.cgi"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true, "data": {"sid": "old_sid"}
+        })))
+        .up_to_n_times(1)
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/webapi/auth.cgi"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true, "data": {"sid": "new_sid"}
+        })))
+        .mount(server)
+        .await;
+}
+
+async fn mount_md5_status_for(
+    server: &MockServer,
+    taskid: &str,
+    body: serde_json::Value,
+    delay: Duration,
+) {
+    Mock::given(method("GET"))
+        .and(path("/webapi/entry.cgi"))
+        .and(query_param("method", "status"))
+        .and(query_param("taskid", taskid))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(body)
+                .set_delay(delay),
+        )
+        .mount(server)
+        .await;
+}
+
+async fn mount_md5_starts(server: &MockServer, taskids: &[&str]) {
+    for taskid in taskids {
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", "start"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true, "data": {"taskid": taskid}
+            })))
+            .up_to_n_times(1)
+            .mount(server)
+            .await;
+    }
+}
+
+/// Regression: the restart after a renewed session got a deadline of its own,
+/// so a session that expired near the 15-minute ceiling could keep the caller
+/// waiting most of another 15. The ceiling is for the whole call.
+#[tokio::test]
+async fn md5_keeps_one_deadline_across_a_renewed_session() {
+    let server = MockServer::start().await;
+    mount_two_logins(&server).await;
+    mount_md5_starts(&server, &["md5-a", "md5-b"]).await;
+    mount_md5_status_for(
+        &server,
+        "md5-a",
+        serde_json::json!({"success": false, "error": {"code": 119}}),
+        Duration::from_millis(1000),
+    )
+    .await;
+    mount_md5_status_for(
+        &server,
+        "md5-b",
+        serde_json::json!({"success": true, "data": {"finished": false}}),
+        Duration::ZERO,
+    )
+    .await;
+    mount_md5_stop(&server).await;
+    let client = client_auto_for(&server);
+    client.login("alice", "secret", None).await.unwrap();
+
+    let started = Instant::now();
+    let err = client
+        .md5_within("/share/f.bin", Duration::from_millis(1500))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, SynoFsError::Io(_)), "got {err:?}");
+    assert!(
+        started.elapsed() < Duration::from_millis(2500),
+        "gave up {:?} after starting, against a 1.5 s ceiling",
+        started.elapsed()
+    );
+}
+
+/// The stop's answer was never read: a stop refused because the session had
+/// just expired counted as sent, and the task went on reading the file.
+#[tokio::test]
+async fn md5_sends_the_stop_again_when_the_session_expired_under_it() {
+    let server = MockServer::start().await;
+    mount_two_logins(&server).await;
+    mount_md5_starts(&server, &["md5-x"]).await;
+    mount_md5_status_for(
+        &server,
+        "md5-x",
+        serde_json::json!({"success": true, "data": {"finished": false}}),
+        Duration::ZERO,
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/webapi/entry.cgi"))
+        .and(query_param("method", "stop"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": false, "error": {"code": 119}
+        })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    mount_md5_stop(&server).await;
+    let client = client_auto_for(&server);
+    client.login("alice", "secret", None).await.unwrap();
+
+    client
+        .md5_within("/share/f.bin", Duration::from_millis(1200))
+        .await
+        .unwrap_err();
+
+    let stops: Vec<String> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| {
+            r.url
+                .query_pairs()
+                .any(|(k, v)| k == "method" && v == "stop")
+        })
+        .map(|r| {
+            r.headers
+                .get("cookie")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(stops.len(), 2, "refused once, sent again: {stops:?}");
+    assert!(stops[1].contains("new_sid"), "{stops:?}");
+}
+
+/// A session that expires under both attempts must not come back as 119: a
+/// caller's relogin wrapper reads that as "log in and call again", which is a
+/// third full hash, with a fresh ceiling.
+#[tokio::test]
+async fn md5_does_not_invite_another_retry_after_two_expired_sessions() {
+    let server = MockServer::start().await;
+    mount_two_logins(&server).await;
+    mount_md5_starts(&server, &["md5-a", "md5-b"]).await;
+    for taskid in ["md5-a", "md5-b"] {
+        mount_md5_status_for(
+            &server,
+            taskid,
+            serde_json::json!({"success": false, "error": {"code": 119}}),
+            Duration::ZERO,
+        )
+        .await;
+    }
+    mount_md5_stop(&server).await;
+    let client = client_auto_for(&server);
+    client.login("alice", "secret", None).await.unwrap();
+
+    let err = client
+        .with_relogin_retry(|| client.md5("/share/f.bin"))
+        .await
+        .unwrap_err();
+
+    assert!(!matches!(err, SynoFsError::ApiError(119)), "got {err:?}");
+    assert_eq!(
+        md5_method_calls(&server, "start").await.len(),
+        2,
+        "no third hash"
+    );
+}

@@ -113,6 +113,12 @@ internal static partial class NativeMethods
     [LibraryImport(Lib, StringMarshalling = StringMarshalling.Utf8)]
     internal static partial int syno_rename(IntPtr client, string path, string newName, ref NativeError err);
 
+    /// <summary>DSM-side MD5 of <paramref name="path"/>; <paramref name="outMd5"/> is a
+    /// bare hex string freed with <see cref="syno_string_free"/>. Blocks for as
+    /// long as DSM takes to read the file — minutes for a large one.</summary>
+    [LibraryImport(Lib, StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial int syno_md5(IntPtr client, string path, out IntPtr outMd5, ref NativeError err);
+
     // ── Mount lifecycle ────────────────────────────────────────────────────────
 
     [LibraryImport(Lib, StringMarshalling = StringMarshalling.Utf8)]
