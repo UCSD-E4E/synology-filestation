@@ -35,10 +35,23 @@ public sealed partial class FileBrowserViewModel : ObservableObject, IDisposable
     /// <summary>Path stack for breadcrumb navigation; "" denotes the shares root.</summary>
     private readonly Stack<string> _history = new();
 
+    /// <summary>Asks the NAS for a file's MD5; null when the client went away
+    /// mid-call. The native call unless a test supplies its own.</summary>
+    private readonly Func<string, Task<string?>> _md5;
+
     public FileBrowserViewModel(MountConfig config, IClipboardService? clipboard = null)
+        : this(config, clipboard, null)
+    {
+    }
+
+    /// <summary>Seam for tests: <paramref name="md5"/> stands in for the native
+    /// hash call, which otherwise needs a connected session.</summary>
+    internal FileBrowserViewModel(
+        MountConfig config, IClipboardService? clipboard, Func<string, Task<string?>>? md5)
     {
         _config = config;
         _clipboard = clipboard;
+        _md5 = md5 ?? (path => GatedAsync(c => c.Md5(path)));
     }
 
     public ObservableCollection<SynoFileInfo> Items { get; } = new();
@@ -53,6 +66,7 @@ public sealed partial class FileBrowserViewModel : ObservableObject, IDisposable
     [ObservableProperty]
     [NotifyCanExecuteChangedFor(nameof(CopySelectedPathCommand))]
     [NotifyCanExecuteChangedFor(nameof(CopySelectedNameCommand))]
+    [NotifyCanExecuteChangedFor(nameof(ComputeMd5Command))]
     private SynoFileInfo? _selectedItem;
 
     /// <summary>Window title — carries the directory being browsed so the path
@@ -88,6 +102,30 @@ public sealed partial class FileBrowserViewModel : ObservableObject, IDisposable
 
     [ObservableProperty]
     private string _progressText = "";
+
+    /// <summary>For work that reports no progress — DSM's MD5 task says only
+    /// "not finished yet" — so the bar moves without claiming a fraction.</summary>
+    [ObservableProperty]
+    private bool _progressIndeterminate;
+
+    // ── MD5 result ────────────────────────────────────────────────────────────
+
+    /// <summary>The last digest the NAS produced, as lowercase hex; "" when none.</summary>
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(HasMd5Result))]
+    [NotifyCanExecuteChangedFor(nameof(CopyMd5Command))]
+    private string _md5Result = "";
+
+    /// <summary>Which file <see cref="Md5Result"/> belongs to — the selection may
+    /// have moved on since.</summary>
+    [ObservableProperty]
+    private string _md5FileName = "";
+
+    public bool HasMd5Result => Md5Result.Length != 0;
+
+    [ObservableProperty]
+    [NotifyCanExecuteChangedFor(nameof(ComputeMd5Command))]
+    private bool _isHashing;
 
     public bool IsConnected => _client is not null;
 
@@ -273,6 +311,50 @@ public sealed partial class FileBrowserViewModel : ObservableObject, IDisposable
         await RunWithProgressAsync($"Creating {name}…", client => client.CreateFolder(CurrentPath, name));
         await LoadAsync(CurrentPath);
     }
+
+    /// <summary>Have the NAS hash the selected file. DSM reads the whole file to
+    /// answer — minutes for a large one — and reports nothing until it is done,
+    /// so the bar is indeterminate. The digest lands in <see cref="Md5Result"/>,
+    /// where it can be selected or copied.</summary>
+    [RelayCommand(CanExecute = nameof(CanComputeMd5))]
+    private async Task ComputeMd5()
+    {
+        if (SelectedItem is not { IsDir: false } item) return;
+        Md5Result = "";
+        Md5FileName = "";
+        IsHashing = true;
+        IsBusy = true;
+        ShowProgress = true;
+        ProgressIndeterminate = true;
+        ProgressText = $"The NAS is reading {item.Name}; a large file takes minutes.";
+        Status = $"Computing MD5 of {item.Name}…";
+        try
+        {
+            var digest = await _md5(item.Path);
+            if (digest is null) return; // client was disposed mid-call
+            Md5FileName = item.Name;
+            Md5Result = digest;
+            Status = $"MD5 of {item.Name} computed";
+        }
+        catch (Exception ex)
+        {
+            // The same classification the connect path and the main window's
+            // banner use, so a refusal names the cause rather than a DSM number.
+            Status = $"Could not compute the MD5 of {item.Name}: {ErrorPresenter.Describe(ex).Title}";
+        }
+        finally
+        {
+            ProgressIndeterminate = false;
+            ShowProgress = false;
+            IsBusy = false;
+            IsHashing = false;
+        }
+    }
+
+    private bool CanComputeMd5() => SelectedItem is { IsDir: false } && !IsHashing;
+
+    [RelayCommand(CanExecute = nameof(HasMd5Result))]
+    private Task CopyMd5() => CopyAsync(Md5Result);
 
     private async Task RunWithProgressAsync(string status, Action<SynoClient> op)
     {

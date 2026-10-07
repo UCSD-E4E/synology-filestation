@@ -49,10 +49,23 @@
       <StackPanel Spacing="4">
         <TextBlock Text="{Binding Status}" FontSize="12" />
         <ProgressBar IsVisible="{Binding ShowProgress}"
+                     IsIndeterminate="{Binding ProgressIndeterminate}"
                      Minimum="0"
                      Maximum="{Binding ProgressMax}"
                      Value="{Binding ProgressValue}" />
         <TextBlock IsVisible="{Binding ShowProgress}" Text="{Binding ProgressText}" FontSize="11" />
+        <!-- The NAS-side MD5 of a file, selectable and copyable. Labelled with
+             the file it belongs to, since the selection may have moved on. -->
+        <Grid IsVisible="{Binding HasMd5Result}" ColumnDefinitions="Auto,*,Auto">
+          <TextBlock Grid.Column="0" VerticalAlignment="Center" FontSize="12"
+                     Text="{Binding Md5FileName, StringFormat='MD5 of {0}:'}" />
+          <SelectableTextBlock Grid.Column="1" VerticalAlignment="Center" Margin="6,0"
+                               Text="{Binding Md5Result}"
+                               FontFamily="Consolas,Menlo,monospace" FontSize="12" />
+          <Button Grid.Column="2" Content="Copy" Padding="8,2"
+                  Command="{Binding CopyMd5Command}"
+                  ToolTip.Tip="Copy MD5" />
+        </Grid>
       </StackPanel>
     </Border>
 
@@ -88,6 +101,7 @@
           <MenuItem Header="Copy Current Folder Path" Command="{Binding CopyCurrentPathCommand}" />
           <Separator />
           <MenuItem Header="Download…" Click="OnDownload" />
+          <MenuItem Header="Compute MD5" Command="{Binding ComputeMd5Command}" />
           <MenuItem Header="Delete" Command="{Binding DeleteCommand}" />
         </ContextMenu>
       </ListBox.ContextMenu>
