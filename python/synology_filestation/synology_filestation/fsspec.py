@@ -60,6 +60,9 @@ class SynologyFileSystem(AsyncFileSystem):
       * ``auto_relogin`` (bool, default True): transparent re-auth on SID
         expiry. Turn off only for 2FA accounts (where re-login can't reuse
         the original OTP).
+      * ``domain`` (str | None, default None): the SMB (AD) domain, as for
+        :meth:`AsyncClient.login`. Without it, a bare username is tried
+        over SMB as a local NAS account.
 
     The underlying :class:`synology_filestation.aio.AsyncClient` is created
     lazily on the first I/O call so that constructing a FileSystem object
@@ -79,6 +82,7 @@ class SynologyFileSystem(AsyncFileSystem):
         verify_ssl: bool = True,
         otp: str | None = None,
         auto_relogin: bool = True,
+        domain: str | None = None,
         asynchronous: bool = False,
         loop=None,
         **kwargs,
@@ -92,6 +96,7 @@ class SynologyFileSystem(AsyncFileSystem):
         self._verify_ssl = verify_ssl
         self._otp = otp
         self._auto_relogin = auto_relogin
+        self._domain = domain
         self._client: AsyncClient | None = None
 
     # ── helpers ────────────────────────────────────────────────────────
@@ -131,6 +136,7 @@ class SynologyFileSystem(AsyncFileSystem):
                 verify_ssl=self._verify_ssl,
                 otp=self._otp,
                 auto_relogin=self._auto_relogin,
+                domain=self._domain,
             )
         return self._client
 

@@ -123,9 +123,11 @@ impl ReconnectState {
 
     /// Remember that the credentials were refused, and say so once.
     fn refuse(&self, why: String) {
-        tracing::warn!(
+        // Debug, not warn: the gate every login goes through has already
+        // warned, with the account and what to change.
+        tracing::debug!(
             "SMB: the server refused the login ({why}); not trying again until the \
-             share is reconnected. An AD account needs its domain set."
+             share is reconnected"
         );
         *self.refused.lock().unwrap_or_else(|e| e.into_inner()) = Some(why);
     }
@@ -188,7 +190,7 @@ impl ReconnectState {
 /// Whether building a session failed because the server turned the
 /// credentials down, rather than because the link did.
 fn is_refusal(e: &smb2::Error) -> bool {
-    to_syno_error(e).category() == synology_filestation_core::error::ErrorCategory::PermissionDenied
+    crate::error::is_login_refusal(e)
 }
 
 /// What an operation gets from a transport that has no session to serve it
@@ -286,7 +288,7 @@ where
         conn,
     )
     .await
-    .map_err(|e| to_syno_error(&e))
+    .map_err(|e| crate::error::session_error(&e))
 }
 
 /// Carry a redial failure back as an `smb2::Error` so it flows through the
@@ -304,11 +306,10 @@ where
 /// three.
 fn redial_failed(e: SynoFsError) -> smb2::Error {
     let message = format!("reopening the stream: {e}");
-    match e.category() {
-        synology_filestation_core::error::ErrorCategory::PermissionDenied => {
-            smb2::Error::Auth { message }
-        }
-        _ => smb2::Error::Io(std::io::Error::other(message)),
+    if crate::error::is_refused_login(&e) {
+        smb2::Error::Auth { message }
+    } else {
+        smb2::Error::Io(std::io::Error::other(message))
     }
 }
 
@@ -575,7 +576,20 @@ pub struct SmbTransport {
 
 impl SmbTransport {
     /// Connect + authenticate (SMB3 negotiate, NTLMv2, signing).
+    ///
+    /// Behind the process-wide refusal memory ([`crate::probe`]): an account
+    /// refused within the cool-down is not asked again, and comes back as
+    /// `LoginFailed(PermissionDenied)`.
     pub async fn connect(cfg: &SmbConfig) -> Result<Self, SynoFsError> {
+        crate::probe::gated(cfg, crate::probe::Route::Address, || {
+            Self::connect_ungated(cfg)
+        })
+        .await
+    }
+
+    /// [`connect`](Self::connect) without the gate, for the probe, which
+    /// runs the gate itself to learn how it decided.
+    pub(crate) async fn connect_ungated(cfg: &SmbConfig) -> Result<Self, SynoFsError> {
         let client = SmbClient::connect(ClientConfig {
             addr: cfg.addr(),
             timeout: cfg.timeout,
@@ -588,7 +602,7 @@ impl SmbTransport {
             dfs_target_overrides: HashMap::new(),
         })
         .await
-        .map_err(|e| to_syno_error(&e))?;
+        .map_err(|e| crate::error::session_error(&e))?;
         // This one dialled its own address, so `SmbClient` can redial it.
         Ok(Self::built(
             Inner::with(client),
@@ -673,6 +687,30 @@ impl SmbTransport {
         self.reconnect.is_live()
     }
 
+    /// Why operations are going to HTTP rather than here, or `None` while
+    /// the session is up. For a status display: a refusal is final and says
+    /// so, where a lost link is rebuilt on the next operation that needs it.
+    pub fn fallback(&self) -> Option<crate::probe::Fallback> {
+        use crate::probe::{Fallback, FallbackKind};
+        if let Some(why) = self.reconnect.refused() {
+            return Some(Fallback {
+                kind: FallbackKind::AuthRefused,
+                detail: format!(
+                    "the SMB login was refused when the session was rebuilt ({why}); this \
+                     client stays on HTTP, since each refused login counts towards the \
+                     NAS's auto-block"
+                ),
+            });
+        }
+        if self.is_connected() {
+            return None;
+        }
+        Some(Fallback {
+            kind: FallbackKind::Disconnected,
+            detail: "the SMB session was lost; HTTP until it is rebuilt".into(),
+        })
+    }
+
     /// Why the server refused the login, if it has. Once it has, this
     /// transport builds no session again: see [`adopt`](Self::adopt).
     pub fn refused(&self) -> Option<String> {
@@ -711,11 +749,14 @@ impl SmbTransport {
         }
         let mut cfg = self.config();
         cfg.host = host.to_string();
-        let fresh = match client_over(stream, &cfg).await {
+        let fresh = match crate::probe::gated(&cfg, crate::probe::Route::Stream, || {
+            client_over(stream, &cfg)
+        })
+        .await
+        {
             Ok(client) => client,
             Err(e) => {
-                if e.category() == synology_filestation_core::error::ErrorCategory::PermissionDenied
-                {
+                if crate::error::is_refused_login(&e) {
                     self.reconnect.refuse(format!("{e} at {host}"));
                 }
                 return Err(e);
@@ -822,7 +863,10 @@ impl SmbTransport {
             return Err(SynoFsError::InvalidArg);
         }
 
-        let client = client_over(stream, cfg).await?;
+        let client = crate::probe::gated(cfg, crate::probe::Route::Stream, || {
+            client_over(stream, cfg)
+        })
+        .await?;
 
         // Only a caller that can reopen the stream makes recovery possible;
         // without one, nothing here will pretend it might.
@@ -877,15 +921,25 @@ impl SmbTransport {
                 let slot = &mut *live;
                 self.reconnect
                     .reconnect_if_needed(move || async move {
-                        let stream = open().await.map_err(redial_failed)?;
-                        *slot = client_over(stream, &cfg).await.map_err(redial_failed)?;
-                        Ok(())
+                        crate::probe::gated_smb2(&cfg, crate::probe::Route::Stream, || async {
+                            let stream = open().await.map_err(redial_failed)?;
+                            *slot = client_over(stream, &cfg).await.map_err(redial_failed)?;
+                            Ok(())
+                        })
+                        .await
                     })
                     .await
             }
             None => {
+                let cfg = self.config();
+                let session = &mut *live;
                 self.reconnect
-                    .reconnect_if_needed(|| live.reconnect())
+                    .reconnect_if_needed(|| async move {
+                        crate::probe::gated_smb2(&cfg, crate::probe::Route::Address, || {
+                            session.reconnect()
+                        })
+                        .await
+                    })
                     .await
             }
         };
@@ -1579,13 +1633,41 @@ mod tests {
         // The redial carries its failure back as an `smb2::Error`. Folding a
         // rejected password into `Io` there hid the one failure that must not
         // be retried behind the kind that always is.
-        assert!(is_refusal(&redial_failed(SynoFsError::PermissionDenied)));
+        assert!(is_refusal(&redial_failed(SynoFsError::LoginFailed(
+            Box::new(SynoFsError::PermissionDenied)
+        ))));
+        // Signing or access denied: the server, not the credentials.
+        assert!(!is_refusal(&redial_failed(SynoFsError::PermissionDenied)));
         assert!(!is_refusal(&redial_failed(SynoFsError::Io(
             "no route".into()
         ))));
     }
 
     // ── A transport with no session yet ───────────────────────────────────────
+
+    /// Regression: a transport whose redial was refused reported itself as
+    /// "disconnected", HTTP "until it is rebuilt" — but a refused transport is
+    /// never rebuilt, and the reason it is on HTTP is the credentials.
+    #[test]
+    fn a_transport_says_why_it_is_not_serving() {
+        let smb = SmbTransport::unconnected(&a_config(), never_redialled());
+        let lost = smb.fallback().expect("no session, so not serving");
+        assert_eq!(lost.kind, crate::probe::FallbackKind::Disconnected);
+
+        smb.reconnect.refuse("STATUS_LOGON_FAILURE".into());
+        let refused = smb.fallback().expect("still not serving");
+        assert_eq!(refused.kind, crate::probe::FallbackKind::AuthRefused);
+        assert!(
+            refused.detail.contains("STATUS_LOGON_FAILURE"),
+            "{}",
+            refused.detail
+        );
+        assert!(
+            !refused.detail.contains("until it is rebuilt"),
+            "{}",
+            refused.detail
+        );
+    }
 
     fn a_config() -> SmbConfig {
         SmbConfig::new("nas.example", "user", "hunter2")

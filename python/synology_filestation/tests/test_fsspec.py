@@ -363,3 +363,32 @@ class TestAsync:
 
         assert not dest.exists()
         assert not (tmp_path / "async_dest.bin.part").exists()
+
+
+# ─── Which account SMB uses ──────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_domain_reaches_the_smb_probe(httpserver, host_port, smb_unreachable):
+    # A filesystem built from storage_options has no other way to name the
+    # SMB domain than the process-wide environment variable.
+    _ensure_fsspec()
+    from synology_filestation.fsspec import SynologyFileSystem
+
+    httpserver.expect_request("/webapi/auth.cgi").respond_with_json(
+        {"success": True, "data": {"sid": "fsspec-sid"}}
+    )
+    host, port = host_port
+    fs = SynologyFileSystem(
+        host=host,
+        port=port,
+        username="svc_fishsense",
+        password="secret",
+        https=False,
+        domain="KRG",
+        asynchronous=True,
+        skip_instance_cache=True,
+    )
+    client = await fs._get_client()
+    assert client.transport == "http"
+    assert "KRG\\svc_fishsense" in client.transport_detail

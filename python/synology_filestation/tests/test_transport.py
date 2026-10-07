@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import json
 import logging
-import socket
 
 import pytest
 from werkzeug import Request, Response
@@ -27,22 +26,6 @@ def _serve_login(httpserver) -> None:
     httpserver.expect_request("/webapi/auth.cgi").respond_with_json(
         {"success": True, "data": {"sid": "transport-sid"}}
     )
-
-
-def _closed_port() -> int:
-    """A local port nothing listens on, so an SMB dial is refused at once."""
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
-@pytest.fixture
-def smb_unreachable(monkeypatch):
-    """Let the probe run, against a port that refuses the connection."""
-    monkeypatch.delenv("SYNOLOGY_FS_SMB_DISABLE", raising=False)
-    monkeypatch.delenv("SYNOLOGY_FS_SMB_DOMAIN", raising=False)
-    monkeypatch.setenv("SYNOLOGY_FS_SMB_PORT", str(_closed_port()))
-    monkeypatch.setenv("SYNOLOGY_FS_SMB_TIMEOUT_MS", "1000")
 
 
 def _login(host_port, username="alice", **kw) -> Client:

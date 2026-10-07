@@ -211,6 +211,12 @@ c.transport_reason   # None on SMB; else "disabled", "unreachable",
 c.transport_detail   # the same in words, including what to change
 ```
 
+`transport` is live: a client whose SMB session drops reports `"http"` and
+`"disconnected"` until the session is rebuilt, and `"auth_refused"` if
+rebuilding it was refused. The package ships a type stub (`_native.pyi`), so
+type checkers see all of this. The fsspec backend takes `domain=` too
+(`fsspec.filesystem("synofs", ..., domain="KRG")`).
+
 **The SMB login must name the domain.** FileStation accepts a bare
 `svc_fishsense`, but SMB treats a bare name as a *local* NAS account, and the
 login fails. Pass `domain="KRG"` (keyword-only, on `Client.login` and
@@ -223,12 +229,24 @@ permanent), and the block applies to the caller's IP address for every
 service on the NAS, HTTPS included. So after a refusal, the library:
 
 - logs one `WARNING` (logger `synology_filestation_smb.probe`). For a bare
-  username, the warning says the domain is the likely cause;
-- uses HTTP for that (host, username, domain) for the next
-  `SYNOLOGY_FS_SMB_AUTH_COOLDOWN_S` seconds (default 86400, DSM's window),
-  across every `Client`/`AsyncClient` in the process. It does not dial SMB
-  for that account again during the cool-down. Clients created in a burst
-  wait for the first one's answer, so a burst spends at most one strike.
+  username, the warning says that a domain account needs its domain, and that
+  a local DSM account should check its password;
+- uses HTTP for that account (host, username, domain, and password) for the
+  next `SYNOLOGY_FS_SMB_AUTH_COOLDOWN_S` seconds (default 86400, DSM's
+  window), across every `Client`/`AsyncClient` in the process. During the
+  cool-down, nothing authenticates that account over SMB again: not a new
+  client's probe, and not an existing client rebuilding a dropped session.
+  Changing the domain or the password makes it a different account, which is
+  tried once.
+
+Clients created in a burst wait for the first one's answer, so a burst spends
+at most one strike. When that answer is that SMB is unreachable, the others
+fall back to HTTP at once rather than each waiting out the timeout. When the
+login is accepted, they all connect in parallel.
+
+Only a refused login counts. A signing or access-denied error is a server
+setting rather than the account, and like a network failure it is neither
+remembered nor warned about.
 
 The memory is per process, so N worker processes can still spend N strikes
 between them. Fix the account name instead of relying on the cool-down. Set

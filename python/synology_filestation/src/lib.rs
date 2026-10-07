@@ -25,33 +25,33 @@ struct TransportChoice {
 }
 
 impl TransportChoice {
+    /// Why the client is on HTTP right now, or `None` while SMB serves: the
+    /// probe's answer, or for an attached transport, its own — so a session
+    /// lost or refused after login shows up here too.
+    fn current(&self) -> Option<Fallback> {
+        match &self.smb {
+            Some(smb) => smb.fallback(),
+            None => self.fallback.clone(),
+        }
+    }
+
     /// `"smb"` while the SMB session is up; `"http"` otherwise.
     fn name(&self) -> &'static str {
-        match &self.smb {
-            Some(smb) if smb.is_connected() => "smb",
-            _ => "http",
+        if self.current().is_none() {
+            "smb"
+        } else {
+            "http"
         }
     }
 
     /// Why the client is on HTTP: a stable code, or `None` on SMB.
     fn reason(&self) -> Option<&'static str> {
-        match (&self.smb, &self.fallback) {
-            (Some(smb), _) if smb.is_connected() => None,
-            // Attached, but the link has since gone; it is rebuilt on the
-            // next operation that can use it.
-            (Some(_), _) => Some("disconnected"),
-            (None, Some(f)) => Some(f.kind.as_str()),
-            (None, None) => None,
-        }
+        self.current().map(|f| f.kind.as_str())
     }
 
     /// The fallback in words, for a person; `None` on SMB.
     fn detail(&self) -> Option<String> {
-        match (&self.smb, &self.fallback) {
-            (Some(smb), _) if smb.is_connected() => None,
-            (Some(_), _) => Some("the SMB session was lost; HTTP until it is rebuilt".into()),
-            (None, f) => f.as_ref().map(|f| f.detail.clone()),
-        }
+        self.current().map(|f| f.detail)
     }
 }
 
@@ -347,10 +347,36 @@ fn fileinfo_to_pydict<'py>(py: Python<'py>, info: &SynoFileInfo) -> PyResult<Bou
 
 // ─── Client (sync) ───────────────────────────────────────────────────────────
 
+/// A `Client`'s own Tokio runtime, shut down without waiting when the client
+/// goes.
+///
+/// Dropping a multi-threaded runtime blocks until its worker and blocking
+/// threads finish, and PyO3 drops a `Client` with the GIL held. A thread that
+/// logs at that moment — any `tracing` event, which pyo3-log forwards to
+/// `logging` — waits for the GIL, which waits for the thread: a deadlock in
+/// `del client`. Shutting down in the background waits for nothing.
+struct ClientRuntime(Option<Runtime>);
+
+impl std::ops::Deref for ClientRuntime {
+    type Target = Runtime;
+
+    fn deref(&self) -> &Runtime {
+        self.0.as_ref().expect("present until dropped")
+    }
+}
+
+impl Drop for ClientRuntime {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.0.take() {
+            runtime.shutdown_background();
+        }
+    }
+}
+
 #[pyclass]
 struct Client {
     inner: Arc<SynologyClient>,
-    runtime: Arc<Runtime>,
+    runtime: Arc<ClientRuntime>,
     transport: TransportChoice,
 }
 
@@ -394,7 +420,7 @@ impl Client {
         backoff_max_ms: u64,
         domain: Option<&str>,
     ) -> PyResult<Self> {
-        let runtime = Arc::new(
+        let runtime = Arc::new(ClientRuntime(Some(
             tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
                 .enable_all()
@@ -402,7 +428,7 @@ impl Client {
                 .map_err(|e| {
                     PyErr::new::<TransportError, _>(format!("failed to start runtime: {e}"))
                 })?,
-        );
+        )));
         let client = if auto_relogin {
             SynologyClient::with_auto_relogin(host, port, https)
         } else {
