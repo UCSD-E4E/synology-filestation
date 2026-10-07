@@ -39,12 +39,89 @@ pub(super) struct DirEntry {
     pub name: String,
 }
 
-/// A directory's entries, `.` and `..` included, in the order offsets count.
-pub(super) type Snapshot = Arc<Vec<DirEntry>>;
+/// What one pass over a directory reads: the listing, shared, and nothing
+/// else per handle.
+///
+/// Every reader of a listing holds the same `Arc` of it. Entries are turned
+/// into [`DirEntry`]s, and their inodes registered, only as `readdir` hands
+/// them out, a chunk at a time. Converting the whole listing up front cloned
+/// every name into a vector per handle (memory that grew with the readers of
+/// a million-entry directory) and did it in one pass that held a runtime
+/// worker for as long as it took.
+pub(super) struct Snapshot {
+    listing: Arc<Vec<SynoFileInfo>>,
+    ino: u64,
+    parent_ino: u64,
+    cache: Arc<InodeCache>,
+}
+
+impl Snapshot {
+    fn new(cache: Arc<InodeCache>, ino: u64, path: &str, listing: Arc<Vec<SynoFileInfo>>) -> Self {
+        let parent_ino = if path == VIRTUAL_ROOT_PATH {
+            ROOT_INO
+        } else {
+            path.rfind('/')
+                .map(|i| match &path[..i] {
+                    // The parent of a top-level share is the virtual root.
+                    "" => ROOT_INO,
+                    parent => cache.get_or_alloc_ino(parent),
+                })
+                .unwrap_or(ROOT_INO)
+        };
+        Self {
+            listing,
+            ino,
+            parent_ino,
+            cache,
+        }
+    }
+
+    /// Entries in the pass, `.` and `..` included.
+    pub fn len(&self) -> usize {
+        self.listing.len() + 2
+    }
+
+    /// The entry at `i` in the order offsets count, registering its inode as
+    /// it is handed out.
+    pub fn entry(&self, i: usize) -> Option<DirEntry> {
+        match i {
+            0 => Some(DirEntry {
+                ino: self.ino,
+                kind: FileType::Directory,
+                name: ".".to_string(),
+            }),
+            1 => Some(DirEntry {
+                ino: self.parent_ino,
+                kind: FileType::Directory,
+                name: "..".to_string(),
+            }),
+            _ => {
+                let info = self.listing.get(i - 2)?;
+                let ino = self.cache.get_or_alloc_ino(&info.path);
+                self.cache.insert(ino, info.clone());
+                Some(DirEntry {
+                    ino,
+                    kind: if info.isdir {
+                        FileType::Directory
+                    } else {
+                        FileType::RegularFile
+                    },
+                    name: info.name.clone(),
+                })
+            }
+        }
+    }
+
+    /// Whether `other` reads the very same listing, not a copy of it.
+    #[cfg(test)]
+    pub fn shares_listing_with(&self, other: &Snapshot) -> bool {
+        Arc::ptr_eq(&self.listing, &other.listing)
+    }
+}
 
 /// Open directory handles, each with the snapshot its pass is reading, once
 /// it has one.
-pub(super) type DirHandles = Arc<Mutex<HashMap<u64, Option<Snapshot>>>>;
+pub(super) type DirHandles = Arc<Mutex<HashMap<u64, Option<Arc<Snapshot>>>>>;
 
 /// A listing being fetched, which later readers of the same directory wait on.
 type Flight = Arc<OnceCell<Arc<Vec<SynoFileInfo>>>>;
@@ -87,57 +164,22 @@ impl Lister {
             .await
             .cloned();
         // A finished flight must not answer the next reader: that is the
-        // cache's job, and the cache knows when to stop.
-        if result.is_ok() {
-            let mut flights = self.flights.lock().unwrap();
-            if flights.get(&key).is_some_and(|f| Arc::ptr_eq(f, &flight)) {
-                flights.remove(&key);
-            }
+        // cache's job, and the cache knows when to stop. A failed one stays
+        // while other readers still wait on it, so they retry on it one at a
+        // time, and goes with the last of them; otherwise a directory that
+        // stayed unreadable would hold its place for the life of the mount.
+        // Our hold is let go under the lock, so two readers failing together
+        // cannot each see the other's and each leave the removal to the other.
+        let mut flights = self.flights.lock().unwrap();
+        let ours = flights.get(&key).is_some_and(|f| Arc::ptr_eq(f, &flight));
+        drop(flight);
+        if ours && (result.is_ok() || flights.get(&key).is_some_and(|f| Arc::strong_count(f) == 1))
+        {
+            flights.remove(&key);
         }
+        drop(flights);
         result
     }
-}
-
-/// `path`'s entries in `readdir` order, registering an inode for each.
-fn snapshot(cache: &InodeCache, ino: u64, path: &str, listing: &[SynoFileInfo]) -> Snapshot {
-    let parent_ino = if path == VIRTUAL_ROOT_PATH {
-        ROOT_INO
-    } else {
-        path.rfind('/')
-            .map(|i| match &path[..i] {
-                // The parent of a top-level share is the virtual root.
-                "" => ROOT_INO,
-                parent => cache.get_or_alloc_ino(parent),
-            })
-            .unwrap_or(ROOT_INO)
-    };
-
-    let mut entries = Vec::with_capacity(listing.len() + 2);
-    entries.push(DirEntry {
-        ino,
-        kind: FileType::Directory,
-        name: ".".to_string(),
-    });
-    entries.push(DirEntry {
-        ino: parent_ino,
-        kind: FileType::Directory,
-        name: "..".to_string(),
-    });
-    for info in listing {
-        let child_ino = cache.get_or_alloc_ino(&info.path);
-        let kind = if info.isdir {
-            FileType::Directory
-        } else {
-            FileType::RegularFile
-        };
-        cache.insert(child_ino, info.clone());
-        entries.push(DirEntry {
-            ino: child_ino,
-            kind,
-            name: info.name.clone(),
-        });
-    }
-    Arc::new(entries)
 }
 
 impl SynologyFS {
@@ -158,10 +200,14 @@ impl SynologyFS {
 
     /// Let go of a handle's snapshot.
     pub(super) fn release_dir(&self, fh: u64) {
-        self.dir_handles.lock().unwrap().remove(&fh);
+        // Bound first, so that if this was the last hold on a listing of a
+        // million entries, it is freed after the lock is let go, not while
+        // every other open, read and close waits on it.
+        let released = self.dir_handles.lock().unwrap().remove(&fh);
+        drop(released);
     }
 
-    /// The entries `readdir` at `offset` on `fh` answers from, handed to
+    /// The snapshot `readdir` at `offset` on `fh` answers from, handed to
     /// `done`.
     ///
     /// Served at once from the handle's snapshot when the pass already has
@@ -170,7 +216,7 @@ impl SynologyFS {
     /// returns.
     pub(super) fn start_readdir<F>(&self, fh: u64, ino: u64, path: String, offset: u64, done: F)
     where
-        F: FnOnce(Result<Snapshot, SynoFsError>) + Send + 'static,
+        F: FnOnce(Result<Arc<Snapshot>, SynoFsError>) + Send + 'static,
     {
         if offset > 0 {
             let kept = self.dir_handles.lock().unwrap().get(&fh).cloned().flatten();
@@ -187,13 +233,18 @@ impl SynologyFS {
             let result = lister
                 .get(&path)
                 .await
-                .map(|listing| snapshot(&cache, ino, &path, &listing));
-            if let Ok(entries) = &result {
+                .map(|listing| Arc::new(Snapshot::new(cache, ino, &path, listing)));
+            if let Ok(snapshot) = &result {
                 // Only a handle that is still open keeps it; one released
-                // while this was fetching is gone, and must stay gone.
-                if let Some(slot) = handles.lock().unwrap().get_mut(&fh) {
-                    *slot = Some(Arc::clone(entries));
-                }
+                // while this was fetching is gone, and must stay gone. The
+                // snapshot a rewind replaces is freed after the lock, for the
+                // same reason as in `release_dir`.
+                let replaced = handles
+                    .lock()
+                    .unwrap()
+                    .get_mut(&fh)
+                    .and_then(|slot| slot.replace(Arc::clone(snapshot)));
+                drop(replaced);
             }
             done(result);
         });

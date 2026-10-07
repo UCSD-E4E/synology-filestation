@@ -47,11 +47,7 @@ fn listings_asked_for(f: &Fixture) -> usize {
 }
 
 /// Start a `readdir` and hand back where its answer will arrive.
-fn start(
-    f: &Fixture,
-    fh: u64,
-    offset: u64,
-) -> mpsc::Receiver<Result<Arc<Vec<DirEntry>>, SynoFsError>> {
+fn start(f: &Fixture, fh: u64, offset: u64) -> mpsc::Receiver<Result<Arc<Snapshot>, SynoFsError>> {
     let (tx, rx) = mpsc::channel();
     f.fs.start_readdir(fh, DIR_INO, DIR.to_string(), offset, move |r| {
         let _ = tx.send(r);
@@ -60,15 +56,17 @@ fn start(
 }
 
 /// A `readdir`, waited for.
-fn readdir(f: &Fixture, fh: u64, offset: u64) -> Arc<Vec<DirEntry>> {
+fn readdir(f: &Fixture, fh: u64, offset: u64) -> Arc<Snapshot> {
     start(f, fh, offset)
         .recv_timeout(Duration::from_secs(10))
         .expect("readdir answered")
         .expect("readdir succeeded")
 }
 
-fn names(entries: &[DirEntry]) -> Vec<&str> {
-    entries.iter().map(|e| e.name.as_str()).collect()
+fn names(snapshot: &Snapshot) -> Vec<String> {
+    (0..snapshot.len())
+        .map(|i| snapshot.entry(i).unwrap().name)
+        .collect()
 }
 
 /// Regression: the wedge. The kernel reads a directory a few hundred entries
@@ -132,6 +130,13 @@ fn two_readers_of_one_directory_share_one_listing() {
         1,
         "the second reader waited for the first"
     );
+    // And they hold one copy of it. Each handle used to keep its own
+    // converted vector, every name cloned: for a directory of a million
+    // entries, memory that grew with the number of readers.
+    assert!(
+        first.shares_listing_with(&second),
+        "two handles on one listing hold one copy of it"
+    );
 }
 
 /// Regression: `readdir` fetched its listing on the FUSE event-loop thread.
@@ -174,5 +179,33 @@ fn closing_a_directory_lets_go_of_its_listing() {
         listings_asked_for(&f),
         2,
         "nothing was left behind for a closed handle to be served from"
+    );
+}
+
+/// Regression: a failed listing left its path in the map of listings in
+/// flight, because only a success removed it. A directory that stayed
+/// unreadable, or a walk over many that were, grew that map for the life of
+/// the mount.
+#[test]
+fn a_failed_listing_leaves_nothing_behind() {
+    let f = fixture_with(DEFAULT_PREFETCH_BLOCKS, 0);
+    f.rt.block_on(
+        Mock::given(http_method("GET"))
+            .and(query_param("method", "list"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": false, "error": {"code": 408}
+            })))
+            .mount(&f.server),
+    );
+    let fh = f.fs.open_dir();
+
+    let answer = start(&f, fh, 0)
+        .recv_timeout(Duration::from_secs(10))
+        .expect("readdir answered");
+
+    assert!(answer.is_err(), "the listing failed");
+    assert!(
+        f.fs.flights.lock().unwrap().is_empty(),
+        "nothing left in flight for a listing that is over"
     );
 }

@@ -26,7 +26,7 @@ mod transfer;
 use attr::file_attr;
 pub use attr::Ownership;
 #[cfg(test)]
-use dirs::DirEntry;
+use dirs::Snapshot;
 use dirs::{DirHandles, Flights};
 use prefetch::{
     is_indexed_media, open_window, InflightGuard, ReadAhead, MAX_INFLIGHT_PREFETCH_BLOCKS,

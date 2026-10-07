@@ -213,15 +213,20 @@ impl Filesystem for SynologyFS {
 
         let shown = path.clone();
         self.start_readdir(fh.0, ino, path, offset, move |listed| {
-            let entries = match listed {
-                Ok(entries) => entries,
+            let snapshot = match listed {
+                Ok(snapshot) => snapshot,
                 Err(e) => {
                     error!("readdir {}: {}", shown, e);
                     reply.error(errno(e.to_errno()));
                     return;
                 }
             };
-            for (i, entry) in entries.iter().enumerate().skip(offset as usize) {
+            // Only as far as the kernel's buffer takes: each entry is made, and
+            // its inode registered, as it is handed over.
+            for i in offset as usize..snapshot.len() {
+                let Some(entry) = snapshot.entry(i) else {
+                    break;
+                };
                 if reply.add(INodeNo(entry.ino), (i + 1) as u64, entry.kind, &entry.name) {
                     break;
                 }
