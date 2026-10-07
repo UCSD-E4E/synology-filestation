@@ -18,6 +18,9 @@ from synology_filestation import Client, NoSuchFile, PermissionDenied
 from synology_filestation.aio import AsyncClient
 
 DIGEST = "9e107d9d372bb6826bd81d3542a419d6"
+# What `start` hands back, and how `status` must name it: JSON, quoted.
+TASKID = "FileStation_6A1B2C3D4E5F"
+TASKID_ON_THE_WIRE = json.dumps(TASKID)
 
 
 class FakeMd5Task:
@@ -41,16 +44,21 @@ class FakeMd5Task:
             if self.start_error is not None:
                 body = {"success": False, "error": {"code": self.start_error}}
             else:
-                body = {"success": True, "data": {"taskid": "MD5-task-1"}}
+                body = {"success": True, "data": {"taskid": TASKID}}
         elif method == "status":
-            assert args.get("taskid") == "MD5-task-1"
-            if self.unfinished_polls > 0:
+            if args.get("taskid") != TASKID_ON_THE_WIRE:
+                # DSM decodes the id as JSON; a bare one names no task.
+                body = {"success": False, "error": {"code": 599}}
+            elif self.unfinished_polls > 0:
                 self.unfinished_polls -= 1
                 body = {"success": True, "data": {"finished": False}}
             else:
                 body = {"success": True, "data": {"finished": True, "md5": DIGEST}}
         elif method == "stop":
-            body = {"success": True}
+            if args.get("taskid") != TASKID_ON_THE_WIRE:
+                body = {"success": False, "error": {"code": 599}}
+            else:
+                body = {"success": True}
         else:  # pragma: no cover - a request the protocol does not have
             body = {"success": False, "error": {"code": 101}}
         return Response(json.dumps(body), content_type="application/json")
@@ -80,6 +88,17 @@ class TestSyncMd5:
         assert c.md5("/share/photos/img.orf") == DIGEST
         assert task.methods() == ["start", "status", "status"]
         assert task.calls[0]["file_path"] == "/share/photos/img.orf"
+
+    def test_task_finished_before_the_first_poll(self, httpserver, host_port):
+        # Regression (0.9.0): DSM 599 "no such task" on a 15 MB .ORF. The
+        # status poll named the task bare; DSM reads the id as JSON.
+        task = FakeMd5Task(unfinished_polls=0)
+        _serve(httpserver, task)
+        c = _sync_client(host_port)
+
+        assert c.md5("/share/photos/img.orf") == DIGEST
+        assert task.methods() == ["start", "status"]
+        assert task.calls[1]["taskid"] == TASKID_ON_THE_WIRE
 
     def test_missing_file_raises_no_such_file(self, httpserver, host_port):
         task = FakeMd5Task(start_error=414)
@@ -116,6 +135,18 @@ class TestAsyncMd5:
         assert await c.md5("/share/photos/img.orf") == DIGEST
         assert task.methods() == ["start", "status", "status"]
         assert task.calls[0]["file_path"] == "/share/photos/img.orf"
+
+    async def test_task_finished_before_the_first_poll(self, httpserver, host_port):
+        task = FakeMd5Task(unfinished_polls=0)
+        _serve(httpserver, task)
+        host, port = host_port
+        c = await AsyncClient.login(
+            host, port, "alice", "secret", https=False, auto_relogin=False
+        )
+
+        assert await c.md5("/share/photos/img.orf") == DIGEST
+        assert task.methods() == ["start", "status"]
+        assert task.calls[1]["taskid"] == TASKID_ON_THE_WIRE
 
     async def test_missing_file_raises_no_such_file(self, httpserver, host_port):
         task = FakeMd5Task(start_error=414)

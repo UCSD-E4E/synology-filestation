@@ -18,6 +18,41 @@ pub fn to_syno_error(err: &smb2::Error) -> SynoFsError {
     kind_to_syno(err.kind(), &err.to_string())
 }
 
+/// Whether the server turned the credentials down: the logon-rejection
+/// family (`STATUS_LOGON_FAILURE`, a locked or expired account, …). Each one
+/// is a strike towards DSM's auto-block.
+///
+/// Narrower than "maps to `PermissionDenied`" on purpose. Signing and
+/// access-denied failures map there too, but they are the server's
+/// configuration rather than the account's, cost no strike, and are fixed on
+/// the NAS — remembering them as a refusal kept SMB off for a day after the
+/// fix, with advice about domains that did not apply.
+pub fn is_login_refusal(err: &smb2::Error) -> bool {
+    err.kind() == ErrorKind::AuthRequired
+}
+
+/// [`is_login_refusal`], after a session-setup failure has been mapped by
+/// [`session_error`]: a refusal is the one `LoginFailed` this crate makes.
+pub fn is_refused_login(err: &SynoFsError) -> bool {
+    // The exact shape, not any `LoginFailed`: core wraps HTTP re-login
+    // failures in it too, and one handed back through a redial is not the
+    // SMB server refusing the account.
+    matches!(err, SynoFsError::LoginFailed(inner) if matches!(**inner, SynoFsError::PermissionDenied))
+}
+
+/// Map a failure to build a session. As [`to_syno_error`], except that a
+/// refused login becomes `LoginFailed(PermissionDenied)`, so the difference
+/// between a refusal and every other `PermissionDenied` survives the trip.
+/// The category is unchanged.
+pub(crate) fn session_error(err: &smb2::Error) -> SynoFsError {
+    if is_login_refusal(err) {
+        tracing::debug!(error = %err, "SMB: the server refused the login");
+        SynoFsError::LoginFailed(Box::new(SynoFsError::PermissionDenied))
+    } else {
+        to_syno_error(err)
+    }
+}
+
 /// Map `smb2`'s high-level [`ErrorKind`] to a [`SynoFsError`]. `context` is the
 /// human-readable detail carried into the `Io` variants.
 pub(crate) fn kind_to_syno(kind: ErrorKind, context: &str) -> SynoFsError {
@@ -56,6 +91,25 @@ pub(crate) fn kind_to_syno(kind: ErrorKind, context: &str) -> SynoFsError {
 mod tests {
     use super::*;
     use synology_filestation_core::error::ErrorCategory;
+
+    /// Regression (Copilot, #315): any `LoginFailed` counted, and core wraps
+    /// HTTP re-login failures in it too — a TLS error or a DSM 400 handed
+    /// back through a redial was latched as an SMB credential refusal.
+    #[test]
+    fn only_the_marker_session_error_makes_is_a_refused_login() {
+        let marker = SynoFsError::LoginFailed(Box::new(SynoFsError::PermissionDenied));
+        assert!(is_refused_login(&marker));
+        assert!(is_refused_login(&session_error(&smb2::Error::Auth {
+            message: "STATUS_LOGON_FAILURE".into()
+        })));
+        for other in [
+            SynoFsError::LoginFailed(Box::new(SynoFsError::Io("tls handshake".into()))),
+            SynoFsError::LoginFailed(Box::new(SynoFsError::ApiError(400))),
+            SynoFsError::PermissionDenied,
+        ] {
+            assert!(!is_refused_login(&other), "{other:?}");
+        }
+    }
 
     fn cat(kind: ErrorKind) -> ErrorCategory {
         kind_to_syno(kind, "detail").category()

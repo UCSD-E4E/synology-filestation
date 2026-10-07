@@ -92,3 +92,21 @@ def respond_dsm_error_then_bytes(
     httpserver.expect_request(uri).respond_with_data(
         payload, content_type="application/octet-stream"
     )
+
+
+def _closed_port() -> int:
+    """A local port nothing listens on, so an SMB dial is refused at once."""
+    import socket
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+@pytest.fixture
+def smb_unreachable(monkeypatch):
+    """Let the SMB probe run, against a port that refuses the connection."""
+    monkeypatch.delenv("SYNOLOGY_FS_SMB_DISABLE", raising=False)
+    monkeypatch.delenv("SYNOLOGY_FS_SMB_DOMAIN", raising=False)
+    monkeypatch.setenv("SYNOLOGY_FS_SMB_PORT", str(_closed_port()))
+    monkeypatch.setenv("SYNOLOGY_FS_SMB_TIMEOUT_MS", "1000")

@@ -432,7 +432,7 @@ async fn md5_polls_the_task_until_it_finishes() {
             r.url
                 .query_pairs()
                 .find(|(k, _)| k == "taskid")
-                .map(|(_, v)| v.to_string())
+                .map(|(_, v)| sent_task_id(&v))
         })
         .collect();
     assert_eq!(
@@ -715,6 +715,12 @@ async fn slice_upload_notices_the_file_landed_before_starting_over() {
     std::fs::remove_file(&local).ok();
 }
 
+/// The task id a request named, decoded from the JSON DSM reads it as. A bare
+/// id, which DSM answers with 599, comes back marked so it cannot pass for one.
+fn sent_task_id(raw: &str) -> String {
+    serde_json::from_str::<String>(raw).unwrap_or_else(|_| format!("<bare {raw}>"))
+}
+
 /// The `SYNO.FileStation.MD5` calls made with `method`, by task id.
 async fn md5_method_calls(server: &MockServer, wanted: &str) -> Vec<String> {
     server
@@ -731,7 +737,7 @@ async fn md5_method_calls(server: &MockServer, wanted: &str) -> Vec<String> {
             r.url
                 .query_pairs()
                 .find(|(k, _)| k == "taskid")
-                .map(|(_, v)| v.to_string())
+                .map(|(_, v)| sent_task_id(&v))
                 .unwrap_or_default()
         })
         .collect()
@@ -924,7 +930,7 @@ async fn md5_stops_the_old_task_on_the_new_session_when_the_session_expires() {
     Mock::given(method("GET"))
         .and(path("/webapi/entry.cgi"))
         .and(query_param("method", "status"))
-        .and(query_param("taskid", "md5-a"))
+        .and(query_param("taskid", "\"md5-a\""))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "success": false, "error": {"code": 119}
         })))
@@ -933,7 +939,7 @@ async fn md5_stops_the_old_task_on_the_new_session_when_the_session_expires() {
     Mock::given(method("GET"))
         .and(path("/webapi/entry.cgi"))
         .and(query_param("method", "status"))
-        .and(query_param("taskid", "md5-b"))
+        .and(query_param("taskid", "\"md5-b\""))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "success": true, "data": {"finished": true, "md5": "d41d8cd98f00b204e9800998ecf8427e"}
         })))
@@ -967,7 +973,10 @@ async fn md5_stops_the_old_task_on_the_new_session_when_the_session_expires() {
             format!(
                 "{} {}",
                 q["method"],
-                q.get("taskid").map(String::as_str).unwrap_or("-")
+                q.get("taskid")
+                    .map(|v| sent_task_id(v))
+                    .as_deref()
+                    .unwrap_or("-")
             )
         })
         .collect();
@@ -1033,7 +1042,7 @@ async fn mount_md5_status_for(
     Mock::given(method("GET"))
         .and(path("/webapi/entry.cgi"))
         .and(query_param("method", "status"))
-        .and(query_param("taskid", taskid))
+        .and(query_param("taskid", format!("\"{taskid}\"").as_str()))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_json(body)
@@ -1183,4 +1192,93 @@ async fn md5_does_not_invite_another_retry_after_two_expired_sessions() {
         2,
         "no third hash"
     );
+}
+
+// ── The task id is JSON, as DSM reads it ─────────────────────────────────
+//
+// Regression (0.9.0, fishsense): `md5` raised DSM 599, "no such task", on a
+// file that downloaded fine. `start` worked and handed back a task id;
+// `status` sent it bare — `taskid=FileStation_…` — and DSM decodes the v2
+// task APIs' parameters as JSON, so the id it looked up was not the one it
+// had issued. File Station's own UI, and the `synology-api` package, send
+// `taskid="FileStation_…"`. These mocks answer the way DSM does: 599 for any
+// id that is not the quoted one `start` returned.
+
+const DSM_TASKID: &str = "FileStation_6A1B2C3D4E5F";
+
+/// `status`/`stop` as DSM answers them: the task only under its JSON name.
+async fn mount_dsm_md5_task(server: &MockServer, status: serde_json::Value) {
+    mount_md5_start(server, DSM_TASKID).await;
+    let quoted = format!("\"{DSM_TASKID}\"");
+    for (m, body) in [
+        ("status", status),
+        ("stop", serde_json::json!({"success": true})),
+    ] {
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", m))
+            .and(query_param("taskid", quoted.as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .with_priority(1)
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/webapi/entry.cgi"))
+            .and(query_param("method", m))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": false, "error": {"code": 599}
+            })))
+            .with_priority(2)
+            .mount(server)
+            .await;
+    }
+}
+
+/// start → status (already finished) → digest: the case where DSM hashes a
+/// small file before the first poll arrives. One poll, and nothing after the
+/// task reported finished — DSM reaps a finished task, so a second status or
+/// a stop would itself be a 599.
+#[tokio::test]
+async fn md5_sends_the_task_id_json_encoded_and_reads_a_task_finished_before_the_first_poll() {
+    let server = MockServer::start().await;
+    mount_dsm_md5_task(
+        &server,
+        serde_json::json!({
+            "success": true,
+            "data": {"finished": true, "md5": "9e107d9d372bb6826bd81d3542a419d6"}
+        }),
+    )
+    .await;
+
+    let digest = client_for(&server)
+        .md5("/fishsense_data/REEF/img.ORF")
+        .await
+        .expect("a task DSM knows answers");
+
+    assert_eq!(digest, "9e107d9d372bb6826bd81d3542a419d6");
+    assert_eq!(md5_method_calls(&server, "status").await, vec![DSM_TASKID]);
+    assert!(
+        md5_method_calls(&server, "stop").await.is_empty(),
+        "a finished task is not stopped"
+    );
+}
+
+/// The stop for a task given up on has to name it the same way, or it never
+/// lands and the NAS reads the whole file regardless.
+#[tokio::test]
+async fn md5_stops_a_task_by_its_json_encoded_id() {
+    let server = MockServer::start().await;
+    mount_dsm_md5_task(
+        &server,
+        serde_json::json!({"success": true, "data": {"finished": false}}),
+    )
+    .await;
+
+    let err = client_for(&server)
+        .md5_within("/share/huge.bin", Duration::from_millis(1200))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, SynoFsError::Io(_)), "timed out, got {err:?}");
+    assert_eq!(md5_method_calls(&server, "stop").await, vec![DSM_TASKID]);
 }

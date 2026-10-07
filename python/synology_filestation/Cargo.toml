@@ -23,11 +23,11 @@ synology-filestation-smb = { path = "../../rust/synology-filestation-smb" }
 pyo3 = { version = "0.29", features = ["extension-module", "abi3-py310"] }
 pyo3-async-runtimes = { version = "0.29", features = ["tokio-runtime"] }
 
-# pyo3-log routes Rust `log` records into Python's `logging`. tracing-log
-# adapts our existing `tracing` events to the `log` crate so the bridge is
-# end-to-end.
+# pyo3-log routes Rust `log` records into Python's `logging`. `tracing`'s `log`
+# feature turns every crate's `tracing` events into `log` records (there is no
+# `tracing` subscriber in a Python process), so the bridge is end-to-end.
 pyo3-log = "0.13"
-tracing-log = "0.2"
+tracing = { version = "0.1", features = ["log"] }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 

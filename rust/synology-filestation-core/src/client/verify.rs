@@ -277,7 +277,7 @@ impl SynologyClient {
             ("api", "SYNO.FileStation.MD5"),
             ("version", "2"),
             ("method", "stop"),
-            ("taskid", taskid),
+            ("taskid", &task_param(taskid)),
         ]))
     }
 
@@ -297,7 +297,7 @@ impl SynologyClient {
                         ("api", "SYNO.FileStation.MD5"),
                         ("version", "2"),
                         ("method", "status"),
-                        ("taskid", taskid),
+                        ("taskid", &task_param(taskid)),
                     ],
                 )
                 .await?;
@@ -356,7 +356,7 @@ impl SynologyClient {
                     ("api", "SYNO.FileStation.MD5"),
                     ("version", "2"),
                     ("method", "stop"),
-                    ("taskid", taskid),
+                    ("taskid", &task_param(taskid)),
                 ],
             )
             .await
@@ -372,6 +372,13 @@ impl SynologyClient {
             Err(e) => Some(SynoFsError::Io(format!("md5 stop parse error: {e}"))),
         }
     }
+}
+
+/// A task id as DSM reads it: JSON. `start` hands back `FileStation_…`, and
+/// `status`/`stop` look up the decoded parameter, so a bare id names no task
+/// and is answered with 599. File Station's own UI sends it quoted.
+fn task_param(taskid: &str) -> String {
+    serde_json::to_string(taskid).expect("a string always encodes")
 }
 
 /// When an MD5 call gives up, kept whole across its attempts.

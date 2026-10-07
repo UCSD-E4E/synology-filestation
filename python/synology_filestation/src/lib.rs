@@ -11,7 +11,77 @@ use pyo3::types::{PyBytes, PyDict};
 use synology_filestation_core::error::{dsm_code_to_category, ErrorCategory, SynoFsError};
 use synology_filestation_core::types::SynoFileInfo;
 use synology_filestation_core::{SynologyClient, ThrottleConfig};
+use synology_filestation_smb::{Fallback, Probe, SmbTransport};
 use tokio::runtime::Runtime;
+
+/// Which transport a client was given at login, and why.
+///
+/// Kept because the fallback to HTTP used to be silent: a username SMB would
+/// not accept spent weeks failing its probe — each failure a strike towards
+/// DSM's auto-block — while every transfer quietly went through FileStation.
+struct TransportChoice {
+    smb: Option<Arc<SmbTransport>>,
+    fallback: Option<Fallback>,
+}
+
+impl TransportChoice {
+    /// Why the client is on HTTP right now, or `None` while SMB serves: the
+    /// probe's answer, or for an attached transport, its own — so a session
+    /// lost or refused after login shows up here too.
+    fn current(&self) -> Option<Fallback> {
+        match &self.smb {
+            Some(smb) => smb.fallback(),
+            None => self.fallback.clone(),
+        }
+    }
+
+    /// `"smb"` while the SMB session is up; `"http"` otherwise.
+    fn name(&self) -> &'static str {
+        if self.current().is_none() {
+            "smb"
+        } else {
+            "http"
+        }
+    }
+
+    /// Why the client is on HTTP: a stable code, or `None` on SMB.
+    fn reason(&self) -> Option<&'static str> {
+        self.current().map(|f| f.kind.as_str())
+    }
+
+    /// The fallback in words, for a person; `None` on SMB.
+    fn detail(&self) -> Option<String> {
+        self.current().map(|f| f.detail)
+    }
+}
+
+/// Probe SMB with the login's credentials and put it in front of HTTP when it
+/// answers. Injecting a backend consumes the client, so this runs before the
+/// client is frozen into an `Arc`.
+async fn prefer_smb(
+    client: SynologyClient,
+    host: &str,
+    username: &str,
+    password: &str,
+    domain: Option<&str>,
+) -> (SynologyClient, TransportChoice) {
+    match synology_filestation_smb::probe_as(host, username, password, domain).await {
+        Probe::Smb(smb) => (
+            synology_filestation_smb::attach(client, smb.clone()),
+            TransportChoice {
+                smb: Some(smb),
+                fallback: None,
+            },
+        ),
+        Probe::Http(fallback) => (
+            client,
+            TransportChoice {
+                smb: None,
+                fallback: Some(fallback),
+            },
+        ),
+    }
+}
 
 /// Apply the request throttle (concurrency cap + rate belt + bounded jittered
 /// backoff) to a freshly built client. Enabled by default for the Python
@@ -277,10 +347,37 @@ fn fileinfo_to_pydict<'py>(py: Python<'py>, info: &SynoFileInfo) -> PyResult<Bou
 
 // ─── Client (sync) ───────────────────────────────────────────────────────────
 
+/// A `Client`'s own Tokio runtime, shut down without waiting when the client
+/// goes.
+///
+/// Dropping a multi-threaded runtime blocks until its worker and blocking
+/// threads finish, and PyO3 drops a `Client` with the GIL held. A thread that
+/// logs at that moment — any `tracing` event, which pyo3-log forwards to
+/// `logging` — waits for the GIL, which waits for the thread: a deadlock in
+/// `del client`. Shutting down in the background waits for nothing.
+struct ClientRuntime(Option<Runtime>);
+
+impl std::ops::Deref for ClientRuntime {
+    type Target = Runtime;
+
+    fn deref(&self) -> &Runtime {
+        self.0.as_ref().expect("present until dropped")
+    }
+}
+
+impl Drop for ClientRuntime {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.0.take() {
+            runtime.shutdown_background();
+        }
+    }
+}
+
 #[pyclass]
 struct Client {
     inner: Arc<SynologyClient>,
-    runtime: Arc<Runtime>,
+    runtime: Arc<ClientRuntime>,
+    transport: TransportChoice,
 }
 
 impl Client {
@@ -303,7 +400,7 @@ impl Client {
 #[pymethods]
 impl Client {
     #[staticmethod]
-    #[pyo3(signature = (host, port, username, password, *, https=true, verify_ssl=true, otp=None, auto_relogin=true, throttle=true, max_concurrency=4, min_interval_ms=150, max_attempts=5, backoff_base_ms=1000, backoff_max_ms=60000))]
+    #[pyo3(signature = (host, port, username, password, *, https=true, verify_ssl=true, otp=None, auto_relogin=true, throttle=true, max_concurrency=4, min_interval_ms=150, max_attempts=5, backoff_base_ms=1000, backoff_max_ms=60000, domain=None))]
     #[allow(clippy::too_many_arguments)] // mirrors the Python kwargs surface
     fn login(
         py: Python<'_>,
@@ -321,8 +418,9 @@ impl Client {
         max_attempts: u32,
         backoff_base_ms: u64,
         backoff_max_ms: u64,
+        domain: Option<&str>,
     ) -> PyResult<Self> {
-        let runtime = Arc::new(
+        let runtime = Arc::new(ClientRuntime(Some(
             tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
                 .enable_all()
@@ -330,7 +428,7 @@ impl Client {
                 .map_err(|e| {
                     PyErr::new::<TransportError, _>(format!("failed to start runtime: {e}"))
                 })?,
-        );
+        )));
         let client = if auto_relogin {
             SynologyClient::with_auto_relogin(host, port, https)
         } else {
@@ -361,17 +459,14 @@ impl Client {
         // code (wrong password / OTP required / …); wrap in LoginFailed so
         // synofs_to_pyerr routes to the AuthError class.
         let rt = runtime.clone();
-        let client = py
+        let (client, transport) = py
             .detach(move || {
                 rt.block_on(async move {
                     client
                         .login(username, password, otp)
                         .await
                         .map_err(|e| SynoFsError::LoginFailed(Box::new(e)))?;
-                    let client =
-                        synology_filestation_smb::auto_attach(client, host, username, password)
-                            .await;
-                    Ok::<_, SynoFsError>(client)
+                    Ok::<_, SynoFsError>(prefer_smb(client, host, username, password, domain).await)
                 })
             })
             .map_err(|e| synofs_to_pyerr(py, e))?;
@@ -379,7 +474,29 @@ impl Client {
         Ok(Self {
             inner: Arc::new(client),
             runtime,
+            transport,
         })
+    }
+
+    /// `"smb"` or `"http"`: which transport file operations prefer. SMB keeps
+    /// bulk transfers off FileStation, so `"http"` on a host that can reach SMB
+    /// is worth reading `transport_reason` for.
+    #[getter]
+    fn transport(&self) -> &'static str {
+        self.transport.name()
+    }
+
+    /// Why the client is on HTTP, or `None` on SMB: `"disabled"`,
+    /// `"unreachable"`, `"auth_refused"`, `"auth_cooldown"` or `"disconnected"`.
+    #[getter]
+    fn transport_reason(&self) -> Option<&'static str> {
+        self.transport.reason()
+    }
+
+    /// The fallback in words — for a refusal, what to change. `None` on SMB.
+    #[getter]
+    fn transport_detail(&self) -> Option<String> {
+        self.transport.detail()
     }
 
     fn logout(&self, py: Python<'_>) -> PyResult<()> {
@@ -636,12 +753,13 @@ fn getinfo_err_gil(e: SynoFsError) -> PyErr {
 #[pyclass]
 struct AsyncClient {
     inner: Arc<SynologyClient>,
+    transport: TransportChoice,
 }
 
 #[pymethods]
 impl AsyncClient {
     #[staticmethod]
-    #[pyo3(signature = (host, port, username, password, *, https=true, verify_ssl=true, otp=None, auto_relogin=true, throttle=true, max_concurrency=4, min_interval_ms=150, max_attempts=5, backoff_base_ms=1000, backoff_max_ms=60000))]
+    #[pyo3(signature = (host, port, username, password, *, https=true, verify_ssl=true, otp=None, auto_relogin=true, throttle=true, max_concurrency=4, min_interval_ms=150, max_attempts=5, backoff_base_ms=1000, backoff_max_ms=60000, domain=None))]
     #[allow(clippy::too_many_arguments)] // mirrors the Python kwargs surface
     fn login<'py>(
         py: Python<'py>,
@@ -659,6 +777,7 @@ impl AsyncClient {
         max_attempts: u32,
         backoff_base_ms: u64,
         backoff_max_ms: u64,
+        domain: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         future_into_py(py, async move {
             let client = if auto_relogin {
@@ -684,13 +803,35 @@ impl AsyncClient {
                 .login(&username, &password, otp.as_deref())
                 .await
                 .map_err(|e| synofs_to_pyerr_gil(SynoFsError::LoginFailed(Box::new(e))))?;
-            // Transparently prefer SMB when reachable; None → HTTP only.
-            let client =
-                synology_filestation_smb::auto_attach(client, &host, &username, &password).await;
+            // Transparently prefer SMB when reachable; HTTP otherwise.
+            let (client, transport) =
+                prefer_smb(client, &host, &username, &password, domain.as_deref()).await;
             Ok(AsyncClient {
                 inner: Arc::new(client),
+                transport,
             })
         })
+    }
+
+    /// `"smb"` or `"http"`: which transport file operations prefer. SMB keeps
+    /// bulk transfers off FileStation, so `"http"` on a host that can reach SMB
+    /// is worth reading `transport_reason` for.
+    #[getter]
+    fn transport(&self) -> &'static str {
+        self.transport.name()
+    }
+
+    /// Why the client is on HTTP, or `None` on SMB: `"disabled"`,
+    /// `"unreachable"`, `"auth_refused"`, `"auth_cooldown"` or `"disconnected"`.
+    #[getter]
+    fn transport_reason(&self) -> Option<&'static str> {
+        self.transport.reason()
+    }
+
+    /// The fallback in words — for a refusal, what to change. `None` on SMB.
+    #[getter]
+    fn transport_detail(&self) -> Option<String> {
+        self.transport.detail()
     }
 
     fn logout<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
@@ -914,7 +1055,12 @@ impl AsyncClient {
 
 #[pymodule]
 fn _native(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
-    let _ = tracing_log::LogTracer::init();
+    // `tracing` (built with its `log` feature, below) emits `log` records when
+    // no subscriber is installed, and pyo3-log hands those to `logging`.
+    // `tracing_log::LogTracer` used to be installed here first; it is the
+    // bridge the other way, `log` into `tracing`, and by taking the one global
+    // `log` slot it left pyo3-log uninstalled — no Rust warning ever reached
+    // Python.
     let _ = pyo3_log::try_init();
 
     m.add_class::<Client>()?;

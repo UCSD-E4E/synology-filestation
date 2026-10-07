@@ -389,3 +389,71 @@ async fn a_slow_listing_does_not_hold_up_a_lookup() {
     assert!(entries.iter().any(|e| e.name == "beside-a-listing.txt"));
     smb.delete(path).await.ok();
 }
+
+// ── The login probe: one strike, then HTTP ───────────────────────────────────
+
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn a_probe_refused_by_the_server_is_not_dialled_again() {
+    // What got krg-nat blocked: a client per task, each probing SMB with a
+    // username SMB would not accept. Every refusal was a DSM strike.
+    use synology_filestation_smb::{probe_as, FallbackKind, Probe};
+
+    let _servers = TestServers::start().await.expect("docker compose up");
+    let host = format!("127.0.0.1:{}", smb2::testing::auth_port());
+
+    let Probe::Http(first) = probe_as(&host, "testuser", "not the password", Some("")).await else {
+        panic!("the server turns the login down");
+    };
+    assert_eq!(first.kind, FallbackKind::AuthRefused, "{}", first.detail);
+    assert!(first.detail.contains("bare username"), "{}", first.detail);
+
+    let Probe::Http(second) = tokio::time::timeout(
+        Duration::from_secs(1),
+        probe_as(&host, "testuser", "not the password", Some("")),
+    )
+    .await
+    .expect("answered without a round trip") else {
+        panic!("still HTTP");
+    };
+    assert_eq!(second.kind, FallbackKind::AuthCooldown, "{}", second.detail);
+}
+
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn a_refusal_seen_by_the_probe_stops_another_transport_rebuilding_a_session() {
+    // The gate covers every way this crate authenticates, not only the
+    // first probe: N transports rebuilding sessions after the NAS restarts
+    // were N strikes.
+    use synology_filestation_smb::{probe_as, Probe};
+
+    let _servers = TestServers::start().await.expect("docker compose up");
+    let host = format!("127.0.0.1:{}", smb2::testing::auth_port());
+    let Probe::Http(_) = probe_as(&host, "testuser", "rotated away", Some("")).await else {
+        panic!("the server turns the login down");
+    };
+
+    let mut cfg = config_with("rotated away");
+    cfg.host = host.clone();
+    let other = SmbTransport::unconnected(&cfg, no_redial());
+    // Nobody on the far end: if it tried to authenticate, it would hang.
+    let (ours, _theirs) = tokio::io::duplex(1024);
+    let refused = tokio::time::timeout(Duration::from_secs(2), other.adopt(Box::new(ours), &host))
+        .await
+        .expect("answered without a round trip")
+        .expect_err("still refused");
+    assert!(
+        synology_filestation_smb::error::is_refused_login(&refused),
+        "{refused:?}"
+    );
+    assert!(
+        other.refused().is_some(),
+        "and latched on that transport too"
+    );
+    // Regression (Copilot, #315): it asked nobody, so it was not refused —
+    // the gate turned it away, and it says so.
+    assert_eq!(
+        other.fallback().map(|f| f.kind),
+        Some(synology_filestation_smb::FallbackKind::AuthCooldown)
+    );
+}
