@@ -82,6 +82,10 @@ struct ReconnectState {
     /// this is set nothing here builds a session again. A remount is what
     /// clears it, because that is when the credentials can have changed.
     refused: std::sync::Mutex<Option<String>>,
+    /// Whether that refusal was the gate's rather than the server's: another
+    /// transport's login for this account was refused within the cool-down,
+    /// so this one was turned away without asking.
+    turned_away: AtomicBool,
     /// Whether a session has ever been built. Kept here rather than read off
     /// the session slot so that asking never waits on the lock an operation
     /// holds.
@@ -94,6 +98,7 @@ impl Default for ReconnectState {
             needs: AtomicBool::new(false),
             possible: true,
             refused: std::sync::Mutex::new(None),
+            turned_away: AtomicBool::new(false),
             has_session: AtomicBool::new(true),
         }
     }
@@ -119,6 +124,17 @@ impl ReconnectState {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    /// The gate turned a login away without asking the server; the refusal
+    /// that follows is its, not the server's.
+    fn skipped_by_gate(&self) {
+        self.turned_away.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether the refusal recorded was the gate's.
+    fn was_turned_away(&self) -> bool {
+        self.turned_away.load(Ordering::SeqCst)
     }
 
     /// Remember that the credentials were refused, and say so once.
@@ -581,9 +597,12 @@ impl SmbTransport {
     /// refused within the cool-down is not asked again, and comes back as
     /// `LoginFailed(PermissionDenied)`.
     pub async fn connect(cfg: &SmbConfig) -> Result<Self, SynoFsError> {
-        crate::probe::gated(cfg, crate::probe::Route::Address, || {
-            Self::connect_ungated(cfg)
-        })
+        crate::probe::gated(
+            cfg,
+            crate::probe::Route::Address,
+            || (),
+            || Self::connect_ungated(cfg),
+        )
         .await
     }
 
@@ -693,6 +712,16 @@ impl SmbTransport {
     pub fn fallback(&self) -> Option<crate::probe::Fallback> {
         use crate::probe::{Fallback, FallbackKind};
         if let Some(why) = self.reconnect.refused() {
+            if self.reconnect.was_turned_away() {
+                return Some(Fallback {
+                    kind: FallbackKind::AuthCooldown,
+                    detail: format!(
+                        "SMB was not tried when the session was rebuilt: this account's \
+                         login was refused within the cool-down ({why}); this client \
+                         stays on HTTP"
+                    ),
+                });
+            }
             return Some(Fallback {
                 kind: FallbackKind::AuthRefused,
                 detail: format!(
@@ -749,9 +778,12 @@ impl SmbTransport {
         }
         let mut cfg = self.config();
         cfg.host = host.to_string();
-        let fresh = match crate::probe::gated(&cfg, crate::probe::Route::Stream, || {
-            client_over(stream, &cfg)
-        })
+        let fresh = match crate::probe::gated(
+            &cfg,
+            crate::probe::Route::Stream,
+            || self.reconnect.skipped_by_gate(),
+            || client_over(stream, &cfg),
+        )
         .await
         {
             Ok(client) => client,
@@ -863,9 +895,12 @@ impl SmbTransport {
             return Err(SynoFsError::InvalidArg);
         }
 
-        let client = crate::probe::gated(cfg, crate::probe::Route::Stream, || {
-            client_over(stream, cfg)
-        })
+        let client = crate::probe::gated(
+            cfg,
+            crate::probe::Route::Stream,
+            || (),
+            || client_over(stream, cfg),
+        )
         .await?;
 
         // Only a caller that can reopen the stream makes recovery possible;
@@ -912,6 +947,8 @@ impl SmbTransport {
         // supplied stream asks the caller for a new stream and rebuilds the
         // session on it, because the address at the far end of a tunnel is
         // reachable only from inside that tunnel.
+        // For the gate to say a refusal was its own, not the server's.
+        let state: &ReconnectState = &self.reconnect;
         let reconnected = match &self.redial {
             Some(redialer) => {
                 let open = Arc::clone(&redialer.open);
@@ -921,11 +958,16 @@ impl SmbTransport {
                 let slot = &mut *live;
                 self.reconnect
                     .reconnect_if_needed(move || async move {
-                        crate::probe::gated_smb2(&cfg, crate::probe::Route::Stream, || async {
-                            let stream = open().await.map_err(redial_failed)?;
-                            *slot = client_over(stream, &cfg).await.map_err(redial_failed)?;
-                            Ok(())
-                        })
+                        crate::probe::gated_smb2(
+                            &cfg,
+                            crate::probe::Route::Stream,
+                            || state.skipped_by_gate(),
+                            || async {
+                                let stream = open().await.map_err(redial_failed)?;
+                                *slot = client_over(stream, &cfg).await.map_err(redial_failed)?;
+                                Ok(())
+                            },
+                        )
                         .await
                     })
                     .await
@@ -935,9 +977,12 @@ impl SmbTransport {
                 let session = &mut *live;
                 self.reconnect
                     .reconnect_if_needed(|| async move {
-                        crate::probe::gated_smb2(&cfg, crate::probe::Route::Address, || {
-                            session.reconnect()
-                        })
+                        crate::probe::gated_smb2(
+                            &cfg,
+                            crate::probe::Route::Address,
+                            || state.skipped_by_gate(),
+                            || session.reconnect(),
+                        )
                         .await
                     })
                     .await
@@ -1667,6 +1712,17 @@ mod tests {
             "{}",
             refused.detail
         );
+    }
+
+    /// Regression (Copilot, #315): a transport the gate turned away, because
+    /// another one had just been refused, reported a refusal of its own.
+    #[test]
+    fn a_transport_the_gate_turned_away_says_so() {
+        let smb = SmbTransport::unconnected(&a_config(), never_redialled());
+        smb.reconnect.skipped_by_gate();
+        smb.reconnect.refuse("refused 3s ago".into());
+        let cooled = smb.fallback().expect("not serving");
+        assert_eq!(cooled.kind, crate::probe::FallbackKind::AuthCooldown);
     }
 
     fn a_config() -> SmbConfig {

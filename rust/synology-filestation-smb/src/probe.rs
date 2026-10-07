@@ -150,17 +150,21 @@ pub async fn probe_as(host: &str, username: &str, password: &str, domain: Option
 }
 
 /// Build a session for `cfg`'s account through the process-wide gate, for a
-/// caller that speaks [`SynoFsError`].
+/// caller that speaks [`SynoFsError`]. `on_skip` runs when the gate turned the
+/// login away without asking, because the account was refused earlier in the
+/// cool-down: the caller was not refused itself, and should say so.
 ///
 /// A refusal, now or earlier in the cool-down, comes back as
 /// `LoginFailed(PermissionDenied)` — the one shape [`is_refused_login`]
 /// recognises — so the caller latches it as final rather than retrying.
-pub(crate) async fn gated<T, F, Fut>(
+pub(crate) async fn gated<T, S, F, Fut>(
     cfg: &SmbConfig,
     route: Route,
+    on_skip: S,
     dial: F,
 ) -> Result<T, SynoFsError>
 where
+    S: FnOnce(),
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<T, SynoFsError>>,
 {
@@ -172,6 +176,10 @@ where
         Err(Gated::Failed(e)) => Err(e),
         Err(Gated::Fallback(f)) => Err(match f.kind {
             FallbackKind::Unreachable => SynoFsError::Io(f.detail),
+            FallbackKind::AuthCooldown => {
+                on_skip();
+                SynoFsError::LoginFailed(Box::new(SynoFsError::PermissionDenied))
+            }
             _ => SynoFsError::LoginFailed(Box::new(SynoFsError::PermissionDenied)),
         }),
     }
@@ -179,12 +187,14 @@ where
 
 /// [`gated`], for a session rebuilt by `smb2` itself: a refusal comes back
 /// as `smb2::Error::Auth`, which the reconnect bookkeeping latches.
-pub(crate) async fn gated_smb2<T, F, Fut>(
+pub(crate) async fn gated_smb2<T, S, F, Fut>(
     cfg: &SmbConfig,
     route: Route,
+    on_skip: S,
     dial: F,
 ) -> Result<T, smb2::Error>
 where
+    S: FnOnce(),
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<T, smb2::Error>>,
 {
@@ -204,6 +214,10 @@ where
             // Another transport's dial for this account just found the link
             // down; this one would find the same, so it stays flagged.
             FallbackKind::Unreachable => smb2::Error::Disconnected,
+            FallbackKind::AuthCooldown => {
+                on_skip();
+                smb2::Error::Auth { message: f.detail }
+            }
             _ => smb2::Error::Auth { message: f.detail },
         }),
     }
@@ -341,10 +355,14 @@ impl AuthGate {
         if let Some(last) = state.last.as_ref().filter(|last| last.at >= asked) {
             match &last.unreachable {
                 Some(why) if route == Route::Address && last.route == Route::Address => {
-                    return Err(Gated::Fallback(Fallback {
+                    let shared = Fallback {
                         kind: FallbackKind::Unreachable,
                         detail: why.clone(),
-                    }));
+                    };
+                    drop(state);
+                    // The last one out takes the slot with it.
+                    self.release(cfg, slot);
+                    return Err(Gated::Fallback(shared));
                 }
                 _ => {
                     drop(state);
@@ -636,6 +654,13 @@ mod tests {
             assert!(t.await.unwrap().is_err());
         }
         assert_eq!(dials.load(Ordering::SeqCst), 1, "one timeout, shared");
+        // Regression (Copilot, #315): the dials that took the shared answer
+        // returned without letting go of the slot, leaving it in the map.
+        assert_eq!(
+            gate.remembered(),
+            0,
+            "nothing to remember about a link that was down"
+        );
         assert!(
             started.elapsed() < Duration::from_millis(800),
             "{:?}",
@@ -884,23 +909,43 @@ mod tests {
         let mut account = cfg("shared", "");
         account.host = "shared-gate.example".into();
 
-        let refused = gated_smb2(&account, Route::Address, || async {
-            Err::<(), _>(smb2::Error::Auth {
-                message: "STATUS_LOGON_FAILURE".into(),
-            })
-        })
+        // Regression (Copilot, #315): both came back as the same refusal, so a
+        // transport the gate stopped reported a login it never attempted.
+        let mut skipped_first = false;
+        let refused = gated_smb2(
+            &account,
+            Route::Address,
+            || skipped_first = true,
+            || async {
+                Err::<(), _>(smb2::Error::Auth {
+                    message: "STATUS_LOGON_FAILURE".into(),
+                })
+            },
+        )
         .await
         .unwrap_err();
         assert!(crate::error::is_login_refusal(&refused));
+        assert!(!skipped_first, "that one was asked, and refused");
 
-        let skipped = gated(&account, Route::Stream, || async {
-            panic!("dialled an account refused moments ago");
-            #[allow(unreachable_code)]
-            Ok::<(), SynoFsError>(())
-        })
+        let mut skipped_second = false;
+
+        let skipped = gated(
+            &account,
+            Route::Stream,
+            || skipped_second = true,
+            || async {
+                panic!("dialled an account refused moments ago");
+                #[allow(unreachable_code)]
+                Ok::<(), SynoFsError>(())
+            },
+        )
         .await
         .unwrap_err();
         assert!(is_refused_login(&skipped), "{skipped:?}");
+        assert!(
+            skipped_second,
+            "and that one was turned away without asking"
+        );
     }
 
     #[test]

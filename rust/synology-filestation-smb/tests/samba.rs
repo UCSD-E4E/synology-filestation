@@ -450,4 +450,10 @@ async fn a_refusal_seen_by_the_probe_stops_another_transport_rebuilding_a_sessio
         other.refused().is_some(),
         "and latched on that transport too"
     );
+    // Regression (Copilot, #315): it asked nobody, so it was not refused —
+    // the gate turned it away, and it says so.
+    assert_eq!(
+        other.fallback().map(|f| f.kind),
+        Some(synology_filestation_smb::FallbackKind::AuthCooldown)
+    );
 }
