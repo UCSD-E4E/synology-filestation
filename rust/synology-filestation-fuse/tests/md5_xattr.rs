@@ -9,6 +9,10 @@
 //!
 //! Ignored by default: it needs a real FUSE mount, which CI containers do not
 //! have. Run it deliberately with `--ignored`, on a machine with `/dev/fuse`.
+//!
+//! Linux only, like the attribute: it calls `getxattr(2)` and `listxattr(2)`
+//! as Linux spells them, and the other backends do not offer it yet.
+#![cfg(target_os = "linux")]
 
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
