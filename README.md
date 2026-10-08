@@ -20,6 +20,7 @@ Tools for working with Synology [FileStation](https://www.synology.com/en-global
 - 2FA / TOTP support
 - Uses `rustls` — no OpenSSL dependency required
 - **Linux:** metadata cache with configurable TTL; block-level read cache (default 256 MiB) with background prefetch
+- **Linux:** ask the NAS for a file's MD5 without reading it back — see [Verifying a file without downloading it](#verifying-a-file-without-downloading-it)
 - **macOS:** no kernel extension; uses macOS's built-in WebDAV filesystem support
 - **Windows:** user-mode filesystem via WinFsp; mounts as a drive letter (e.g. `Z:`)
 - **GUI (all platforms):** Avalonia app that calls the Rust core directly through a native library (no subprocess) — connecting spinner, **Test Connection**, typed error messages, inline 2FA prompt, live log output, a pre-mount file browser (browse / download / upload / delete / new folder with transfer progress), and settings persistence
@@ -644,6 +645,35 @@ File data is cached in fixed-size 256 KiB blocks using a `moka` LRU cache (defau
 ### Write buffering (all platforms)
 
 The Synology Upload API requires the complete file body as a single multipart upload. Write data is accumulated in an in-memory buffer per open file handle and flushed to the NAS on close. Large file writes consume proportional memory.
+
+## Verifying a file without downloading it
+
+On Linux, the mount answers one extended attribute, `user.synology.md5`, with
+the file's MD5 as computed **by the NAS**. Only the 32-character digest comes
+back over the network:
+
+```bash
+getfattr -n user.synology.md5 --only-values ~/mnt/fishsense_data/REEF/img.ORF
+md5sum /local/copy/img.ORF        # compare
+```
+
+`md5sum` on the mount would read every byte back to hash them locally. There
+is no filesystem operation for "this file's checksum" for it to ask instead,
+which is why this is an attribute you ask for by name.
+
+- **It takes time.** The NAS reads the whole file to answer, so a
+  multi-gigabyte file takes minutes, and the call waits that long. It puts
+  the same read load on the NAS as a download, and counts as one of the
+  mount's four concurrent transfers while it runs.
+- **Close the file first.** A file with writes the NAS has not received yet
+  answers `Device or resource busy` rather than the digest of a half-uploaded
+  file. Wait for the `cp` (or whatever is writing) to exit.
+- **It is not listed.** `getfattr -d` and `listxattr` don't show it.
+  Otherwise `cp -a`, `rsync -X` and file managers, which copy every listed
+  attribute, would make the NAS hash every file they copied off the mount.
+- Directories have no digest (`No such attribute`). The macOS and Windows
+  backends don't offer the attribute yet; the Python client's
+  `Client.md5(path)` does the same job from any platform.
 
 ## Known Limitations
 

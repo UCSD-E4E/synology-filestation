@@ -55,11 +55,32 @@ pub(super) struct WriteBuffer {
     pub(super) broken: bool,
 }
 
+/// An open handle: its buffer, and the file it is on.
+///
+/// The inode is kept outside the buffer's lock, which an upload holds for
+/// the whole transfer. Asking "is anything still being written to this file?"
+/// must not mean waiting for an unrelated upload to finish to find out which
+/// file it was.
+#[derive(Clone)]
+pub(super) struct OpenHandle {
+    pub(super) ino: u64,
+    pub(super) buffer: Arc<tokio::sync::Mutex<WriteBuffer>>,
+}
+
+impl OpenHandle {
+    pub(super) fn new(buffer: WriteBuffer) -> Self {
+        Self {
+            ino: buffer.ino,
+            buffer: Arc::new(tokio::sync::Mutex::new(buffer)),
+        }
+    }
+}
+
 /// Open write handles, keyed by file handle. The outer lock guards the map and
 /// is never held across I/O; each buffer has its own lock so a transfer on one
 /// handle never blocks work on another. Shared with spawned transfer tasks,
 /// hence the `Arc`.
-pub(super) type Buffers = Arc<Mutex<HashMap<u64, Arc<tokio::sync::Mutex<WriteBuffer>>>>>;
+pub(super) type Buffers = Arc<Mutex<HashMap<u64, OpenHandle>>>;
 
 /// How many file transfers may be on the wire at once.
 ///
@@ -108,7 +129,11 @@ pub(super) fn forget_parent_listing(dir_cache: &DirCache, path: &str) {
 
 impl Transfers {
     pub(super) fn buffer(&self, fh: u64) -> Option<Arc<tokio::sync::Mutex<WriteBuffer>>> {
-        self.buffers.lock().unwrap().get(&fh).cloned()
+        self.buffers
+            .lock()
+            .unwrap()
+            .get(&fh)
+            .map(|h| h.buffer.clone())
     }
 
     /// Wait for a slot on the wire. Held only for the network call itself, so a
