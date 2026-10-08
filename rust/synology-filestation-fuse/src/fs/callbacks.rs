@@ -11,12 +11,13 @@ use std::time::SystemTime;
 use fuser::{
     BsdFileFlags, Errno, FileHandle, Filesystem, FopenFlags, INodeNo, LockOwner, OpenFlags,
     RenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
-    ReplyOpen, ReplyWrite, Request, WriteFlags,
+    ReplyOpen, ReplyWrite, ReplyXattr, Request, WriteFlags,
 };
 use tracing::{debug, error, info, warn};
 
 use super::attr::{dir_open_flags, errno, file_attr};
 use super::transfer::forget_parent_listing;
+use super::xattr::XattrAnswer;
 use super::{SynologyFS, ROOT_INO, TTL};
 use synology_filestation_core::error::SynoFsError;
 use synology_filestation_core::types::{SynoFileInfo, VIRTUAL_ROOT_PATH};
@@ -344,6 +345,27 @@ impl Filesystem for SynologyFS {
                 error!("write: buffering failed: {}", e);
                 reply.error(Errno::EIO);
             }
+        }
+    }
+
+    /// `user.synology.md5`: the NAS hashes the file and the digest is the
+    /// value. See `xattr` for why it is the only attribute, and unlisted.
+    fn getxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
+        self.start_getxattr(ino.0, name, size, move |answer| match answer {
+            XattrAnswer::Size(len) => reply.size(len),
+            XattrAnswer::Value(value) => reply.data(&value),
+            XattrAnswer::Error(e) => reply.error(e),
+        });
+    }
+
+    fn listxattr(&self, _req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
+        let names = self.listed_xattrs(ino.0);
+        if size == 0 {
+            reply.size(names.len() as u32);
+        } else if (size as usize) < names.len() {
+            reply.error(Errno::ERANGE);
+        } else {
+            reply.data(&names);
         }
     }
 

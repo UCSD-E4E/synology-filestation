@@ -22,6 +22,10 @@ mod prefetch;
 #[cfg(test)]
 mod tests;
 mod transfer;
+mod xattr;
+
+#[cfg(test)]
+use xattr::{XattrAnswer, MD5_XATTR};
 
 use attr::file_attr;
 pub use attr::Ownership;
@@ -32,7 +36,7 @@ use prefetch::{
     is_indexed_media, open_window, InflightGuard, ReadAhead, MAX_INFLIGHT_PREFETCH_BLOCKS,
     MAX_PREFETCH_SPAN,
 };
-use transfer::{Buffers, Transfers, WriteBuffer, WriteSink, MAX_CONCURRENT_TRANSFERS};
+use transfer::{Buffers, OpenHandle, Transfers, WriteBuffer, WriteSink, MAX_CONCURRENT_TRANSFERS};
 
 const TTL: Duration = Duration::from_secs(1);
 
@@ -337,7 +341,7 @@ impl SynologyFS {
         };
         self.write_buffers.lock().unwrap().insert(
             fh,
-            Arc::new(tokio::sync::Mutex::new(WriteBuffer {
+            OpenHandle::new(WriteBuffer {
                 sink,
                 nas_path,
                 ino,
@@ -345,7 +349,7 @@ impl SynologyFS {
                 dirty: new_file,
                 new_file,
                 broken: false,
-            })),
+            }),
         );
     }
 
@@ -353,7 +357,11 @@ impl SynologyFS {
     /// ever held long enough to clone the `Arc` — never across a transfer —
     /// so one handle's upload cannot stall lookups of another's.
     fn buffer(&self, fh: u64) -> Option<Arc<tokio::sync::Mutex<WriteBuffer>>> {
-        self.write_buffers.lock().unwrap().get(&fh).cloned()
+        self.write_buffers
+            .lock()
+            .unwrap()
+            .get(&fh)
+            .map(|h| h.buffer.clone())
     }
 
     // ── Speculative prefetch ──────────────────────────────────────────────
