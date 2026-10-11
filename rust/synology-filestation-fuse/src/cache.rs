@@ -94,6 +94,13 @@ impl InodeCache {
         self.by_ino.get(&ino)
     }
 
+    /// Drop `ino`'s details as their TTL would, keeping its path: what a
+    /// test needs to reproduce an entry that has aged out.
+    #[cfg(test)]
+    pub fn expire(&self, ino: u64) {
+        self.by_ino.invalidate(&ino);
+    }
+
     /// Look up the path for a given inode (even if metadata is evicted).
     pub fn get_path_for_ino(&self, ino: u64) -> Option<String> {
         // Prefer the live metadata cache (freshest data).

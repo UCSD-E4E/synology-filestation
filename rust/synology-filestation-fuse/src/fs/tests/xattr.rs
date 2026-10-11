@@ -7,6 +7,7 @@
 //! it by hashing the file on its own disk (`SYNO.FileStation.MD5`).
 
 use super::*;
+use crate::fs::xattr::{XattrAnswer, MD5_XATTR};
 use fuser::Errno;
 use std::ffi::OsStr;
 
@@ -243,12 +244,233 @@ fn an_unknown_inode_is_enoent() {
     );
 }
 
-/// Not listed. `cp -a`, `rsync -X` and file managers copy every attribute a
-/// file lists by reading it, so a listed digest would have copying a folder
-/// off the mount hash every file in it on the NAS.
+// ── Review of #317 ────────────────────────────────────────────────────────
+
+/// Seed an open handle with writes still to land on `path`, under the
+/// inode the path had when it was opened.
+fn seed_writer(f: &Fixture, path: &str) -> u64 {
+    seed_dirty_buffer(f, path, b"not uploaded yet");
+    seed(f, path, false)
+}
+
+/// Regression: a handle was matched by the inode it was opened under. Any
+/// invalidation of the path — a flush on a second descriptor, a rename over
+/// it, a truncate — gives the next lookup a new inode, and the handle still
+/// writing under the old one was missed: the NAS hashed a half-written file.
 #[test]
-fn the_digest_is_not_listed() {
+fn a_writer_is_found_by_path_even_after_the_inode_changes() {
     let f = fixture();
+    mount_md5(&f, Duration::ZERO);
+    let opened_as = seed_writer(&f, "/share/a.bin");
+    f.fs.cache.invalidate_path("/share/a.bin");
+    let now = seed(&f, "/share/a.bin", false);
+    assert_ne!(opened_as, now, "the path has a new inode");
+
+    assert_eq!(
+        ask(&f, now, MD5_XATTR, 64),
+        XattrAnswer::Error(Errno::EBUSY)
+    );
+    assert_eq!(md5_requests(&f), 0);
+}
+
+/// Regression: a truncate rewrites the file with no open handle, so nothing
+/// marked it busy.
+#[test]
+fn a_file_being_truncated_is_not_hashed() {
+    let f = fixture();
+    mount_md5(&f, Duration::ZERO);
+    mount_download_slow(&f, ramp(4096), Duration::from_millis(800));
+    mount_delete_ok(&f);
+    mount_getinfo_gone(&f);
+    mount_upload_ok(&f);
     let ino = seed(&f, "/share/f.bin", false);
-    assert!(f.fs.listed_xattrs(ino).is_empty());
+
+    f.fs.start_truncate(ino, "/share/f.bin".into(), 100, |_| {});
+    std::thread::sleep(Duration::from_millis(200));
+
+    assert_eq!(
+        ask(&f, ino, MD5_XATTR, 64),
+        XattrAnswer::Error(Errno::EBUSY)
+    );
+}
+
+/// Same for a cross-directory move, at both ends: the source is about to go,
+/// and the destination is being written.
+#[test]
+fn both_ends_of_a_move_in_flight_are_not_hashed() {
+    let f = fixture();
+    mount_md5(&f, Duration::ZERO);
+    mount_download_slow(&f, ramp(4096), Duration::from_millis(800));
+    mount_delete_ok(&f);
+    mount_getinfo_gone(&f);
+    mount_upload_ok(&f);
+    let from = seed(&f, "/a/f.bin", false);
+    let to = seed(&f, "/b/f.bin", false);
+
+    f.fs.start_move_across_dirs("/a/f.bin".into(), "/b".into(), "f.bin".into(), |_| {});
+    std::thread::sleep(Duration::from_millis(200));
+
+    assert_eq!(
+        ask(&f, from, MD5_XATTR, 64),
+        XattrAnswer::Error(Errno::EBUSY)
+    );
+    assert_eq!(ask(&f, to, MD5_XATTR, 64), XattrAnswer::Error(Errno::EBUSY));
+}
+
+/// Regression: the file was checked once, before the hash queued for a slot.
+/// A writer that started during the wait was hashed half-written.
+#[test]
+fn a_writer_that_starts_while_the_hash_waits_is_noticed() {
+    let f = fixture();
+    mount_md5(&f, Duration::ZERO);
+    let ino = seed(&f, "/share/f.bin", false);
+    let slots =
+        f.rt.block_on(
+            f.fs.hash_limit
+                .clone()
+                .acquire_many_owned(MAX_CONCURRENT_HASHES as u32),
+        )
+        .unwrap();
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    f.fs.start_getxattr(ino, OsStr::new(MD5_XATTR), 64, move |a| {
+        let _ = tx.send(a);
+    });
+    std::thread::sleep(Duration::from_millis(100));
+    seed_dirty_buffer(&f, "/share/f.bin", b"arrived while it waited");
+    drop(slots);
+
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+        XattrAnswer::Error(Errno::EBUSY)
+    );
+    assert_eq!(md5_requests(&f), 0);
+}
+
+/// Regression: hashes took the mount's transfer slots, so a few big ones in
+/// flight stalled every `close(2)` on the mount behind them. They have their
+/// own, smaller allowance.
+#[test]
+fn hashes_leave_the_upload_slots_alone_and_have_a_cap_of_their_own() {
+    let f = fixture();
+    mount_md5(&f, Duration::from_millis(800));
+    let inos: Vec<_> = (0..MAX_CONCURRENT_HASHES + 1)
+        .map(|i| seed(&f, &format!("/share/f{i}.bin"), false))
+        .collect();
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    for ino in &inos {
+        let tx = tx.clone();
+        f.fs.start_getxattr(*ino, OsStr::new(MD5_XATTR), 64, move |a| {
+            let _ = tx.send(a);
+        });
+    }
+    std::thread::sleep(Duration::from_millis(300));
+
+    assert_eq!(
+        f.fs.transfer_limit.available_permits(),
+        MAX_CONCURRENT_TRANSFERS,
+        "an upload starting now does not wait behind a hash"
+    );
+    let started =
+        f.rt.block_on(f.server.received_requests())
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r.url.query().is_some_and(|q| q.contains("method=start")))
+            .count();
+    assert_eq!(started, MAX_CONCURRENT_HASHES, "the rest wait their turn");
+
+    for _ in &inos {
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+            XattrAnswer::Value(DIGEST.as_bytes().to_vec())
+        );
+    }
+}
+
+/// fuser drops FUSE_INTERRUPT, so a hash outlives a `getfattr` that was
+/// killed. Asking again — the natural next step — joins the hash still
+/// running rather than starting another.
+#[test]
+fn asking_again_while_a_hash_runs_joins_it() {
+    let f = fixture();
+    mount_md5(&f, Duration::from_millis(500));
+    let ino = seed(&f, "/share/f.bin", false);
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    for _ in 0..3 {
+        let tx = tx.clone();
+        f.fs.start_getxattr(ino, OsStr::new(MD5_XATTR), 64, move |a| {
+            let _ = tx.send(a);
+        });
+    }
+    for _ in 0..3 {
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+            XattrAnswer::Value(DIGEST.as_bytes().to_vec())
+        );
+    }
+    let started =
+        f.rt.block_on(f.server.received_requests())
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r.url.query().is_some_and(|q| q.contains("method=start")))
+            .count();
+    assert_eq!(started, 1, "one hash, three answers");
+}
+
+/// The length was promised as 32 before the value existed. Anything else
+/// from the NAS is an I/O error, not a value of a different size.
+#[test]
+fn a_digest_that_is_not_32_hex_characters_is_eio() {
+    let f = fixture();
+    f.rt.block_on(async {
+        Mock::given(http_method("GET"))
+            .and(query_param("method", "start"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true, "data": {"taskid": TASKID}
+            })))
+            .mount(&f.server)
+            .await;
+        Mock::given(http_method("GET"))
+            .and(query_param("method", "status"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true, "data": {"finished": true, "md5": "not-a-digest"}
+            })))
+            .mount(&f.server)
+            .await;
+    });
+    let ino = seed(&f, "/share/f.bin", false);
+
+    assert_eq!(ask(&f, ino, MD5_XATTR, 64), XattrAnswer::Error(Errno::EIO));
+}
+
+/// Regression: the length was answered before anything was checked, so a
+/// tool probing with no buffer was told the attribute existed where the
+/// value then failed.
+#[test]
+fn the_length_is_only_promised_where_a_value_would_follow() {
+    let f = fixture();
+    f.rt.block_on(
+        Mock::given(http_method("GET"))
+            .and(query_param("method", "getinfo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "data": {"files": [{"name": "photos", "path": "/share/photos", "isdir": true}]}
+            })))
+            .mount(&f.server),
+    );
+    // A directory whose details have aged out of the cache.
+    let dir = seed(&f, "/share/photos", true);
+    f.fs.cache.expire(dir);
+    assert_eq!(
+        ask(&f, dir, MD5_XATTR, 0),
+        XattrAnswer::Error(Errno::ENODATA)
+    );
+
+    let writing = seed_writer(&f, "/share/new.bin");
+    assert_eq!(
+        ask(&f, writing, MD5_XATTR, 0),
+        XattrAnswer::Error(Errno::EBUSY)
+    );
 }

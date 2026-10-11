@@ -663,11 +663,15 @@ which is why this is an attribute you ask for by name.
 
 - **It takes time.** The NAS reads the whole file to answer, so a
   multi-gigabyte file takes minutes, and the call waits that long. It puts
-  the same read load on the NAS as a download, and counts as one of the
-  mount's four concurrent transfers while it runs.
-- **Close the file first.** A file with writes the NAS has not received yet
-  answers `Device or resource busy` rather than the digest of a half-uploaded
-  file. Wait for the `cp` (or whatever is writing) to exit.
+  the same read load on the NAS as a download. At most two hashes run at
+  once, separately from uploads, so a hash never holds up a `close()`.
+  Asking again while one runs (say, after a Ctrl-C) waits for that hash
+  rather than starting another; an interrupted `getfattr` cannot stop the
+  hash it started.
+- **Close the file first.** A file with writes the NAS has not received yet,
+  or one a truncate or move is rewriting, answers `Device or resource busy`
+  rather than the digest of a half-written file. Wait for the `cp` (or
+  whatever is writing) to exit.
 - **It is not listed.** `getfattr -d` and `listxattr` don't show it.
   Otherwise `cp -a`, `rsync -X` and file managers, which copy every listed
   attribute, would make the NAS hash every file they copied off the mount.

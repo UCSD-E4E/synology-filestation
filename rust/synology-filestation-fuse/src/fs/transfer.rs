@@ -57,20 +57,22 @@ pub(super) struct WriteBuffer {
 
 /// An open handle: its buffer, and the file it is on.
 ///
-/// The inode is kept outside the buffer's lock, which an upload holds for
+/// The path is kept outside the buffer's lock, which an upload holds for
 /// the whole transfer. Asking "is anything still being written to this file?"
 /// must not mean waiting for an unrelated upload to finish to find out which
 /// file it was.
 #[derive(Clone)]
 pub(super) struct OpenHandle {
-    pub(super) ino: u64,
+    /// The NAS path, fixed at open. Matched on rather than the inode, which
+    /// the path is given anew whenever the cache forgets it.
+    pub(super) path: String,
     pub(super) buffer: Arc<tokio::sync::Mutex<WriteBuffer>>,
 }
 
 impl OpenHandle {
     pub(super) fn new(buffer: WriteBuffer) -> Self {
         Self {
-            ino: buffer.ino,
+            path: buffer.nas_path.clone(),
             buffer: Arc::new(tokio::sync::Mutex::new(buffer)),
         }
     }
@@ -81,6 +83,38 @@ impl OpenHandle {
 /// handle never blocks work on another. Shared with spawned transfer tasks,
 /// hence the `Arc`.
 pub(super) type Buffers = Arc<Mutex<HashMap<u64, OpenHandle>>>;
+
+/// Paths being rewritten without an open handle — by a truncate, or at either
+/// end of a cross-directory move — with a count of how many operations each.
+pub(super) type Rewrites = Arc<Mutex<HashMap<String, usize>>>;
+
+/// A path registered in [`Rewrites`] for as long as this is held.
+pub(super) struct Rewriting {
+    rewrites: Rewrites,
+    path: String,
+}
+
+impl Rewriting {
+    pub(super) fn new(rewrites: &Rewrites, path: String) -> Self {
+        *rewrites.lock().unwrap().entry(path.clone()).or_default() += 1;
+        Self {
+            rewrites: rewrites.clone(),
+            path,
+        }
+    }
+}
+
+impl Drop for Rewriting {
+    fn drop(&mut self) {
+        let mut rewrites = self.rewrites.lock().unwrap();
+        if let Some(n) = rewrites.get_mut(&self.path) {
+            *n -= 1;
+            if *n == 0 {
+                rewrites.remove(&self.path);
+            }
+        }
+    }
+}
 
 /// How many file transfers may be on the wire at once.
 ///
@@ -107,6 +141,7 @@ pub(super) struct Transfers {
     pub(super) dir_cache: Arc<DirCache>,
     pub(super) read_cache: Arc<ReadCache>,
     pub(super) buffers: Buffers,
+    pub(super) rewrites: Rewrites,
     pub(super) limit: Arc<tokio::sync::Semaphore>,
 }
 
@@ -134,6 +169,25 @@ impl Transfers {
             .unwrap()
             .get(&fh)
             .map(|h| h.buffer.clone())
+    }
+
+    /// Whether `path` has writes the NAS does not have yet: an open handle with
+    /// data unflushed, mid-upload or from a failed write, or a truncate or
+    /// move rewriting it with no handle at all.
+    pub(super) fn busy(&self, path: &str) -> bool {
+        if self.rewrites.lock().unwrap().contains_key(path) {
+            return true;
+        }
+        self.buffers.lock().unwrap().values().any(|h| {
+            h.path == path
+                // An upload holds the buffer's lock for the whole transfer.
+                && h.buffer.try_lock().map_or(true, |b| b.dirty || b.broken)
+        })
+    }
+
+    /// Mark `path` as being rewritten until the guard is dropped.
+    pub(super) fn rewriting(&self, path: impl Into<String>) -> Rewriting {
+        Rewriting::new(&self.rewrites, path.into())
     }
 
     /// Wait for a slot on the wire. Held only for the network call itself, so a
@@ -244,6 +298,7 @@ impl Transfers {
         path: &str,
         new_size: u64,
     ) -> Result<SynoFileInfo, SynoFsError> {
+        let _rewriting = self.rewriting(path);
         // The client picks how: a backend that can set a length does it in one
         // round trip, and only the HTTP fallback still has to move the file's
         // contents to change one number.
@@ -266,6 +321,9 @@ impl Transfers {
         new_parent: &str,
         new_name: &str,
     ) -> Result<(), SynoFsError> {
+        let _source = self.rewriting(old_path);
+        let _destination =
+            self.rewriting(format!("{}/{}", new_parent.trim_end_matches('/'), new_name));
         // `length = 0` means "the whole file". Sizing this request from the
         // inode cache instead would silently truncate the file whenever that
         // cached size is stale-low — and this path deletes the source

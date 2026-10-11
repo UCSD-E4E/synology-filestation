@@ -358,14 +358,12 @@ impl Filesystem for SynologyFS {
         });
     }
 
-    fn listxattr(&self, _req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
-        let names = self.listed_xattrs(ino.0);
+    /// No names: the digest is deliberately unlisted (see `xattr`).
+    fn listxattr(&self, _req: &Request, _ino: INodeNo, size: u32, reply: ReplyXattr) {
         if size == 0 {
-            reply.size(names.len() as u32);
-        } else if (size as usize) < names.len() {
-            reply.error(Errno::ERANGE);
+            reply.size(0);
         } else {
-            reply.data(&names);
+            reply.data(&[]);
         }
     }
 
