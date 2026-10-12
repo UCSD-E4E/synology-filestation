@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.11.0](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-fuse-v0.10.0...synology-filestation-fuse-v0.11.0) (2026-10-12)
+
+
+### Features
+
+* **fuse:** ask the NAS for a file's MD5 with getfattr ([67c331d](https://github.com/UCSD-E4E/synology-filestation/commit/67c331de1258fd30e51ecf9dcc2d2a1033fb8833))
+
+
+### Bug Fixes
+
+* **fuse:** close the gaps the review found in the md5 attribute ([301965e](https://github.com/UCSD-E4E/synology-filestation/commit/301965e75e8cf6b98b581ae12f2128486bbfe957))
+
 ## [0.10.0](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-fuse-v0.9.0...synology-filestation-fuse-v0.10.0) (2026-10-07)
 
 
