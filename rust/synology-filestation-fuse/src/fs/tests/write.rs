@@ -607,7 +607,7 @@ fn streamed_handle_with(f: &Fixture, nas_path: &str, new_file: bool) -> u64 {
     );
     f.fs.write_buffers.lock().unwrap().insert(
         fh,
-        Arc::new(tokio::sync::Mutex::new(WriteBuffer {
+        OpenHandle::new(WriteBuffer {
             nas_path: nas_path.to_string(),
             ino: 42,
             sink,
@@ -615,7 +615,7 @@ fn streamed_handle_with(f: &Fixture, nas_path: &str, new_file: bool) -> u64 {
             dirty: false,
             new_file,
             broken: false,
-        })),
+        }),
     );
     fh
 }
@@ -775,7 +775,7 @@ fn a_failed_buffered_write_is_not_uploaded_as_a_truncated_file() {
     let fh = f.fs.next_fh.fetch_add(1, Ordering::Relaxed);
     f.fs.write_buffers.lock().unwrap().insert(
         fh,
-        Arc::new(tokio::sync::Mutex::new(WriteBuffer {
+        OpenHandle::new(WriteBuffer {
             nas_path: "/share/big.zip".to_string(),
             ino: 9,
             sink: WriteSink::Buffered(SpillBuffer::with_spill_at_in(8, dir)),
@@ -783,7 +783,7 @@ fn a_failed_buffered_write_is_not_uploaded_as_a_truncated_file() {
             dirty: false,
             new_file: true,
             broken: false,
-        })),
+        }),
     );
 
     f.fs.write_buffer_at(fh, 0, b"12345678")
@@ -815,7 +815,7 @@ fn creating_a_file_and_writing_nothing_still_puts_it_on_the_nas() {
     let fh = f.fs.next_fh.fetch_add(1, Ordering::Relaxed);
     f.fs.write_buffers.lock().unwrap().insert(
         fh,
-        Arc::new(tokio::sync::Mutex::new(WriteBuffer {
+        OpenHandle::new(WriteBuffer {
             nas_path: "/share/touched.txt".to_string(),
             ino: 7,
             sink: WriteSink::Buffered(SpillBuffer::new()),
@@ -824,7 +824,7 @@ fn creating_a_file_and_writing_nothing_still_puts_it_on_the_nas() {
             dirty: true,
             new_file: true,
             broken: false,
-        })),
+        }),
     );
 
     f.fs.finish_upload(fh).expect("close");

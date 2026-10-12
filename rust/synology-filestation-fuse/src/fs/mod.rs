@@ -22,6 +22,9 @@ mod prefetch;
 #[cfg(test)]
 mod tests;
 mod transfer;
+mod xattr;
+
+use xattr::{Hashes, MAX_CONCURRENT_HASHES};
 
 use attr::file_attr;
 pub use attr::Ownership;
@@ -32,7 +35,9 @@ use prefetch::{
     is_indexed_media, open_window, InflightGuard, ReadAhead, MAX_INFLIGHT_PREFETCH_BLOCKS,
     MAX_PREFETCH_SPAN,
 };
-use transfer::{Buffers, Transfers, WriteBuffer, WriteSink, MAX_CONCURRENT_TRANSFERS};
+use transfer::{
+    Buffers, OpenHandle, Rewrites, Transfers, WriteBuffer, WriteSink, MAX_CONCURRENT_TRANSFERS,
+};
 
 const TTL: Duration = Duration::from_secs(1);
 
@@ -50,6 +55,13 @@ pub struct SynologyFS {
     /// Bounds how many transfers are on the wire at once, now that they are no
     /// longer implicitly serialised by the event loop.
     transfer_limit: Arc<tokio::sync::Semaphore>,
+    /// Bounds NAS-side hashes; see [`MAX_CONCURRENT_HASHES`].
+    hash_limit: Arc<tokio::sync::Semaphore>,
+    /// Paths a truncate or move is rewriting. See [`Rewrites`].
+    rewrites: Rewrites,
+    /// Hashes in flight, by path, with everyone waiting on each. See
+    /// `xattr`: asking again joins the hash already running.
+    hashes: Hashes,
     next_fh: AtomicU64,
     owner: Ownership,
     /// Bounds speculative block downloads. One permit is one block on the
@@ -105,6 +117,9 @@ impl SynologyFS {
             rt,
             write_buffers: Arc::new(Mutex::new(HashMap::new())),
             transfer_limit: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TRANSFERS)),
+            hash_limit: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_HASHES)),
+            rewrites: Arc::new(Mutex::new(HashMap::new())),
+            hashes: Arc::new(Mutex::new(HashMap::new())),
             next_fh: AtomicU64::new(1),
             owner,
             prefetch_limit: Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_PREFETCH_BLOCKS)),
@@ -124,6 +139,7 @@ impl SynologyFS {
             dir_cache: self.dir_cache.clone(),
             read_cache: self.read_cache.clone(),
             buffers: self.write_buffers.clone(),
+            rewrites: self.rewrites.clone(),
             limit: self.transfer_limit.clone(),
         }
     }
@@ -164,8 +180,13 @@ impl SynologyFS {
         F: FnOnce(Result<SynoFileInfo, SynoFsError>) + Send + 'static,
     {
         let xfer = self.transfers();
-        self.rt
-            .spawn(async move { done(xfer.truncate(ino, &path, new_size).await) });
+        // Registered before the task starts, not when it first runs, so a
+        // `getfattr` arriving the moment after cannot miss it.
+        let rewriting = xfer.rewriting(path.clone());
+        self.rt.spawn(async move {
+            let _rewriting = rewriting;
+            done(xfer.truncate(ino, &path, new_size).await)
+        });
     }
 
     /// Same, for the download→upload→delete behind a cross-directory rename.
@@ -179,7 +200,12 @@ impl SynologyFS {
         F: FnOnce(Result<(), SynoFsError>) + Send + 'static,
     {
         let xfer = self.transfers();
+        let ends = (
+            xfer.rewriting(old_path.clone()),
+            xfer.rewriting(format!("{}/{}", new_parent.trim_end_matches('/'), new_name)),
+        );
         self.rt.spawn(async move {
+            let _ends = ends;
             done(
                 xfer.move_across_dirs(&old_path, &new_parent, &new_name)
                     .await,
@@ -337,7 +363,7 @@ impl SynologyFS {
         };
         self.write_buffers.lock().unwrap().insert(
             fh,
-            Arc::new(tokio::sync::Mutex::new(WriteBuffer {
+            OpenHandle::new(WriteBuffer {
                 sink,
                 nas_path,
                 ino,
@@ -345,7 +371,7 @@ impl SynologyFS {
                 dirty: new_file,
                 new_file,
                 broken: false,
-            })),
+            }),
         );
     }
 
@@ -353,7 +379,11 @@ impl SynologyFS {
     /// ever held long enough to clone the `Arc` — never across a transfer —
     /// so one handle's upload cannot stall lookups of another's.
     fn buffer(&self, fh: u64) -> Option<Arc<tokio::sync::Mutex<WriteBuffer>>> {
-        self.write_buffers.lock().unwrap().get(&fh).cloned()
+        self.write_buffers
+            .lock()
+            .unwrap()
+            .get(&fh)
+            .map(|h| h.buffer.clone())
     }
 
     // ── Speculative prefetch ──────────────────────────────────────────────

@@ -5,6 +5,7 @@ mod attr;
 mod dirs;
 mod read;
 mod write;
+mod xattr;
 
 use super::attr::*;
 use super::transfer::*;
@@ -190,7 +191,7 @@ fn seed_dirty_buffer_fh(f: &Fixture, fh: u64, nas_path: &str, data: &[u8]) -> u6
     buf.write_at(0, data).unwrap();
     f.fs.write_buffers.lock().unwrap().insert(
         fh,
-        Arc::new(tokio::sync::Mutex::new(WriteBuffer {
+        OpenHandle::new(WriteBuffer {
             nas_path: nas_path.to_string(),
             ino,
             sink: WriteSink::Buffered(buf),
@@ -198,7 +199,7 @@ fn seed_dirty_buffer_fh(f: &Fixture, fh: u64, nas_path: &str, data: &[u8]) -> u6
             dirty: true,
             new_file: true,
             broken: false,
-        })),
+        }),
     );
     fh
 }
