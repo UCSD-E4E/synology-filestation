@@ -171,6 +171,18 @@ pub trait MetadataTransport: Send + Sync {
         let _ = (path, size);
         Err(SynoFsError::NotSupported)
     }
+
+    /// Move `from` to the full path `to` — another directory, another name, or
+    /// both — without the bytes leaving the server. A file already at `to` is
+    /// replaced, as `rename(2)` replaces it.
+    ///
+    /// Declining is the default and the right answer for anything that would
+    /// have to copy: [`SynologyClient::move_to`](crate::SynologyClient::move_to)
+    /// then asks FileStation, which moves on the appliance too.
+    async fn move_to(&self, from: &str, to: &str) -> Result<(), SynoFsError> {
+        let _ = (from, to);
+        Err(SynoFsError::NotSupported)
+    }
 }
 
 /// What opening a file for writing may create, and what it promises about a

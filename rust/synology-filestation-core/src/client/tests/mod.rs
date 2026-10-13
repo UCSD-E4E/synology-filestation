@@ -3,6 +3,7 @@
 
 mod download;
 mod metadata;
+mod moves;
 mod session;
 mod setup;
 mod throttle;
@@ -228,5 +229,8 @@ impl MetadataTransport for FakeMeta {
     }
     async fn truncate(&self, _path: &str, _size: u64) -> Result<(), SynoFsError> {
         self.entry("truncated").map(|_| ())
+    }
+    async fn move_to(&self, _from: &str, _to: &str) -> Result<(), SynoFsError> {
+        self.entry("moved").map(|_| ())
     }
 }

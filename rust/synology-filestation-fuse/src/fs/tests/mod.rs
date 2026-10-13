@@ -240,3 +240,16 @@ fn eventually(mut cond: impl FnMut() -> bool) -> bool {
     }
     false
 }
+
+/// FileStation refuses the CopyMove task before it starts, as a DSM without
+/// it would: a cross-directory move falls back to copying.
+fn mount_copymove_refused(f: &Fixture) {
+    f.rt.block_on(
+        Mock::given(http_method("GET"))
+            .and(query_param("api", "SYNO.FileStation.CopyMove"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": false, "error": {"code": 103}
+            })))
+            .mount(&f.server),
+    );
+}

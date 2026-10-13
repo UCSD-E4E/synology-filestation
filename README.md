@@ -15,7 +15,7 @@ Tools for working with Synology [FileStation](https://www.synology.com/en-global
 - Browse and navigate directories
 - Read and write files
 - Create and delete files and directories
-- Rename files (same-directory) and move files (cross-directory)
+- Rename files, and move files and folders between directories. On Linux a move happens on the NAS, so no file data passes through your machine
 - Interactive password prompt with hidden input when password is not set via flag or environment variable
 - 2FA / TOTP support
 - Uses `rustls` — no OpenSSL dependency required
@@ -681,8 +681,8 @@ which is why this is an attribute you ask for by name.
 
 ## Known Limitations
 
-- **Cross-directory directory moves are not supported.** Moving a directory to a different parent returns `ENOSYS` / `STATUS_UNSUCCESSFUL`. Only same-directory renames use the efficient `SYNO.FileStation.Rename` API.
-- **Cross-directory file moves are not atomic.** They are implemented as download → upload → delete. A failure mid-sequence may leave data duplicated or missing.
+- **Moves between directories (Linux).** These happen on the NAS: over SMB as one rename, otherwise with FileStation's CopyMove. Only if the NAS refuses the move is a file copied (download → upload → delete), and that copy is not atomic. A folder is never copied: if the NAS can't move it, the move fails with `ENOSYS`. Over HTTP, a move that also renames is a rename followed by a move, not one atomic step.
+- **Moves between directories (macOS, Windows).** These are still download → upload → delete, so files only, not atomic, and folders return `ENOSYS` / `STATUS_UNSUCCESSFUL`.
 - **Large files require large in-memory write buffers.** Writing to a file buffers the entire file content in process memory until the file is closed or flushed.
 - **Overwriting a file is not atomic.** The existing file is deleted before the new content is uploaded; a crash between those two steps would result in data loss.
 - **No support for symlinks, hard links, or special files.**
@@ -705,6 +705,7 @@ All requests go to `/webapi/entry.cgi` (authentication uses `/webapi/auth.cgi`).
 | Delete | `SYNO.FileStation.Delete` | `delete` |
 | Create folder | `SYNO.FileStation.CreateFolder` | `create` |
 | Rename | `SYNO.FileStation.Rename` | `rename` |
+| Move (server-side) | `SYNO.FileStation.CopyMove` | `start` / `status` (with `remove_src`) |
 
 ## Contributing
 

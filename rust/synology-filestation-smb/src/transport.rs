@@ -1717,6 +1717,21 @@ mod tests {
 
     // ── A transport with no session yet ───────────────────────────────────────
 
+    #[test]
+    fn a_move_across_shares_is_declined_without_asking_the_server() {
+        // Two shares are two trees; SMB has no rename between them, and a
+        // copy is not ours to fake. FileStation's CopyMove can, so decline.
+        let smb = SmbTransport::unconnected(&a_config(), never_redialled());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let declined = rt
+            .block_on(smb.move_to("/share/a.bin", "/other/a.bin"))
+            .unwrap_err();
+        assert!(
+            matches!(declined, SynoFsError::NotSupported),
+            "{declined:?}"
+        );
+    }
+
     /// Regression: a transport whose redial was refused reported itself as
     /// "disconnected", HTTP "until it is rebuilt" — but a refused transport is
     /// never rebuilt, and the reason it is on HTTP is the credentials.
@@ -2066,6 +2081,35 @@ impl MetadataTransport for SmbTransport {
             unix_secs(info.modified),
             unix_secs(info.created),
         ))
+    }
+
+    /// One `SET_INFO` rename, replacing whatever is at `to`: the server swaps
+    /// the names, so `to` never stops resolving and no byte moves. Within a
+    /// share only — two shares are two trees, and a move between them is a
+    /// copy, which FileStation's CopyMove does on the appliance instead.
+    async fn move_to(&self, from: &str, to: &str) -> Result<(), SynoFsError> {
+        let src = SmbPath::from_logical(from)?;
+        let dst = SmbPath::from_logical(to)?;
+        if src.share != dst.share {
+            return Err(SynoFsError::NotSupported);
+        }
+        // Handles opened under either name name something else afterwards.
+        self.forget_handles_under(from).await;
+        self.forget_handles_under(to).await;
+
+        let mut guard = self.inner.lock().await;
+        let (client, tree) = self.ready(&mut guard, &src.share).await?;
+        client
+            .rename_with_options(
+                tree,
+                &src.path,
+                &dst.path,
+                RenameOptions {
+                    replace_if_exists: true,
+                },
+            )
+            .await
+            .map_err(|e| self.mark_and_map(&e))
     }
 
     async fn delete(&self, path: &str) -> Result<(), SynoFsError> {

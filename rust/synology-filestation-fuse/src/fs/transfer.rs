@@ -321,9 +321,53 @@ impl Transfers {
         new_parent: &str,
         new_name: &str,
     ) -> Result<(), SynoFsError> {
+        let new_path = format!("{}/{}", new_parent.trim_end_matches('/'), new_name);
         let _source = self.rewriting(old_path);
-        let _destination =
-            self.rewriting(format!("{}/{}", new_parent.trim_end_matches('/'), new_name));
+        let _destination = self.rewriting(new_path.clone());
+
+        // On the NAS if it can: SMB renames across directories in one call,
+        // and FileStation's CopyMove moves on the appliance. Neither sends a
+        // byte through here.
+        match self.client.move_to(old_path, &new_path).await {
+            Ok(()) => {}
+            Err(SynoFsError::NotSupported) => {
+                // A folder was never copied through here, and is not now. The
+                // cache usually knows which this is; ask the NAS only if not.
+                let cached = self
+                    .cache
+                    .get_ino_for_path(old_path)
+                    .and_then(|ino| self.cache.get_by_ino(ino))
+                    .map(|e| e.info.isdir);
+                let is_dir = match cached {
+                    Some(isdir) => isdir,
+                    // Unanswerable is not a folder: the copy then fails, or not,
+                    // on its own terms, with its own error.
+                    None => self
+                        .client
+                        .get_info(old_path)
+                        .await
+                        .is_ok_and(|info| info.isdir),
+                };
+                if is_dir {
+                    return Err(SynoFsError::NotSupported);
+                }
+                self.copy_across_dirs(old_path, new_parent, new_name)
+                    .await?;
+            }
+            Err(e) => return Err(e),
+        }
+        self.forget_moved(old_path, &new_path);
+        Ok(())
+    }
+
+    /// What a cross-directory move falls back to when the NAS will not move
+    /// the file itself: download it whole, upload it, delete the original.
+    async fn copy_across_dirs(
+        &self,
+        old_path: &str,
+        new_parent: &str,
+        new_name: &str,
+    ) -> Result<(), SynoFsError> {
         // `length = 0` means "the whole file". Sizing this request from the
         // inode cache instead would silently truncate the file whenever that
         // cached size is stale-low — and this path deletes the source
@@ -348,5 +392,22 @@ impl Transfers {
             );
         }
         Ok(())
+    }
+
+    /// Forget what a move changed: the old name and anything under it (a
+    /// folder's contents moved with it), whatever the new name replaced, and
+    /// both directories' listings.
+    fn forget_moved(&self, old_path: &str, new_path: &str) {
+        for path in [old_path, new_path] {
+            if let Some(ino) = self.cache.get_ino_for_path(path) {
+                self.read_cache.invalidate_ino(ino);
+            }
+            self.cache.invalidate_path(path);
+            // The separator keeps `/a/photos2` out of a sweep of `/a/photos`.
+            self.cache
+                .invalidate_prefix(&format!("{}/", path.trim_end_matches('/')));
+            self.dir_cache.invalidate_prefix(path);
+            forget_parent_listing(&self.dir_cache, path);
+        }
     }
 }

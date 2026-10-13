@@ -665,25 +665,11 @@ impl Filesystem for SynologyFS {
             return;
         }
 
-        // Cross-directory: check if it's a directory (not supported atomically)
-        let is_dir = self
-            .cache
-            .get_by_ino(self.cache.get_or_alloc_ino(&old_path))
-            .map(|e| e.info.isdir)
-            .unwrap_or(false);
-
-        if is_dir {
-            // Cross-directory move of directories is not supported
-            warn!("rename: cross-directory move of directories not supported");
-            reply.error(Errno::ENOSYS);
-            return;
-        }
-
-        // Cross-directory file move: download, upload, delete. A whole-file
-        // transfer, so it goes to the runtime rather than sitting on this
-        // event-loop thread for the length of the copy.
-        let cache = self.cache.clone();
-        let dir_cache = self.dir_cache.clone();
+        // Cross-directory: a move on the NAS where it can (SMB rename,
+        // FileStation CopyMove), files or folders alike; otherwise a file is
+        // copied and a folder is not supported. On the runtime either way,
+        // since the fallback is a whole-file transfer. The caches are settled
+        // there too, once the move has landed.
         let old = old_path.clone();
         let new = new_path.clone();
         self.start_move_across_dirs(
@@ -691,15 +677,7 @@ impl Filesystem for SynologyFS {
             new_parent_path,
             new_name_str.to_string(),
             move |r| match r {
-                Ok(()) => {
-                    cache.invalidate_path(&old);
-                    // Both ends changed, and the move only lands when the
-                    // transfer does — so this cannot be done up front with the
-                    // same-directory case above.
-                    forget_parent_listing(&dir_cache, &old);
-                    forget_parent_listing(&dir_cache, &new);
-                    reply.ok();
-                }
+                Ok(()) => reply.ok(),
                 Err(e) => {
                     error!("rename {} -> {}: {}", old, new, e);
                     reply.error(errno(e.to_errno()));

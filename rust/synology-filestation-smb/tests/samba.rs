@@ -457,3 +457,60 @@ async fn a_refusal_seen_by_the_probe_stops_another_transport_rebuilding_a_sessio
         Some(synology_filestation_smb::FallbackKind::AuthCooldown)
     );
 }
+
+// ── Moving without copying ───────────────────────────────────────────────────
+
+/// A cross-directory `mv` on the mount was a download, an upload and a
+/// delete. On SMB it is one rename, and it replaces what is at the
+/// destination as `rename(2)` does.
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn a_move_across_directories_is_one_rename_that_replaces() {
+    let servers = TestServers::start().await.expect("docker compose up");
+    let smb = connect(&servers).await;
+    for dir in ["mv-a", "mv-b"] {
+        let _ = smb.create_folder("/private", dir).await;
+    }
+    smb.write_atomic("/private/mv-a/img.ORF", b"the raw")
+        .await
+        .unwrap();
+    smb.write_atomic("/private/mv-b/img.ORF", b"stale")
+        .await
+        .unwrap();
+
+    smb.move_to("/private/mv-a/img.ORF", "/private/mv-b/img.ORF")
+        .await
+        .expect("moved");
+    assert_eq!(
+        &smb.read_full("/private/mv-b/img.ORF").await.unwrap()[..],
+        b"the raw"
+    );
+    assert!(
+        smb.get_info("/private/mv-a/img.ORF").await.is_err(),
+        "the source is gone"
+    );
+
+    // Another directory and another name, in the same one operation.
+    smb.move_to("/private/mv-b/img.ORF", "/private/mv-a/renamed.ORF")
+        .await
+        .expect("moved and renamed");
+    assert_eq!(
+        &smb.read_full("/private/mv-a/renamed.ORF").await.unwrap()[..],
+        b"the raw"
+    );
+
+    // A folder moves the same way, with what is in it.
+    smb.move_to("/private/mv-a", "/private/mv-b/mv-a")
+        .await
+        .expect("folder moved");
+    assert_eq!(
+        &smb.read_full("/private/mv-b/mv-a/renamed.ORF")
+            .await
+            .unwrap()[..],
+        b"the raw"
+    );
+
+    smb.delete("/private/mv-b/mv-a/renamed.ORF").await.ok();
+    smb.delete("/private/mv-b/mv-a").await.ok();
+    smb.delete("/private/mv-b").await.ok();
+}
