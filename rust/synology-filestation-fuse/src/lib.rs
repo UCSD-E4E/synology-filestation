@@ -1403,14 +1403,22 @@ mod log_capture {
 
     /// Only one capturing test at a time, and where its output goes.
     static CAPTURING: Mutex<()> = Mutex::new(());
-    static ACTIVE: Mutex<Option<Sink>> = Mutex::new(None);
+    /// The sink, and the thread whose records it takes. The subscriber is
+    /// process-wide, so without the thread a capture also took whatever every
+    /// other test running alongside it logged, and a test asserting that
+    /// something was *not* said failed on the timing of the others.
+    static ACTIVE: Mutex<Option<(Sink, std::thread::ThreadId)>> = Mutex::new(None);
 
     #[derive(Clone, Default)]
     struct RouteToActiveCapture;
 
     impl std::io::Write for RouteToActiveCapture {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            if let Some(sink) = ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            let active = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((sink, _)) = active
+                .as_ref()
+                .filter(|(_, thread)| *thread == std::thread::current().id())
+            {
                 sink.0
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -1454,7 +1462,10 @@ mod log_capture {
                 let _ = tracing::subscriber::set_global_default(subscriber);
             });
             let sink = Sink::default();
-            *ACTIVE.lock().unwrap_or_else(|e| e.into_inner()) = Some(sink.clone());
+            // Records are written on the thread that logs them, and a
+            // capturing test runs on one: `#[tokio::test]` is single-threaded.
+            *ACTIVE.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some((sink.clone(), std::thread::current().id()));
             Self {
                 sink,
                 _capturing: capturing,
@@ -1471,6 +1482,22 @@ mod log_capture {
         fn drop(&mut self) {
             *ACTIVE.lock().unwrap_or_else(|e| e.into_inner()) = None;
         }
+    }
+
+    /// Regression: the capture took every thread's records, so a test
+    /// asserting nothing was warned failed on Windows CI whenever another
+    /// test's warnings landed during it.
+    #[test]
+    fn a_capture_takes_only_its_own_threads_records() {
+        let logs = LogCapture::at_the_default_level();
+        std::thread::spawn(|| tracing::warn!("from a test running alongside"))
+            .join()
+            .expect("the other thread ran");
+        tracing::warn!("from the capturing test");
+
+        let text = logs.text();
+        assert!(text.contains("from the capturing test"), "got: {text}");
+        assert!(!text.contains("alongside"), "got: {text}");
     }
 }
 
