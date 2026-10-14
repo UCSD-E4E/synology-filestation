@@ -1238,7 +1238,7 @@ pub unsafe extern "C" fn syno_mount(
             c.runtime.handle().clone(),
             mountpoint,
             opts,
-            live_read_connections(c.legs.as_ref()),
+            live_read_connections(c.legs.as_ref(), &c.inner),
         ) {
             Ok(handle) => {
                 let mount = Box::new(SynoMount {

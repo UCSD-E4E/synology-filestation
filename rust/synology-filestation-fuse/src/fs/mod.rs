@@ -32,8 +32,8 @@ pub use attr::Ownership;
 use dirs::Snapshot;
 use dirs::{DirHandles, Flights};
 use prefetch::{
-    is_indexed_media, open_window, InflightGuard, ReadAhead, MAX_INFLIGHT_PREFETCH_BLOCKS,
-    MAX_PREFETCH_SPAN, PREFETCH_PERMITS,
+    is_indexed_media, open_window, streaming_depth, Budget, InflightGuard, ReadAhead,
+    MAX_INFLIGHT_PREFETCH_BLOCKS, MAX_PREFETCH_SPAN,
 };
 use transfer::{
     Buffers, OpenHandle, Rewrites, Transfers, WriteBuffer, WriteSink, MAX_CONCURRENT_TRANSFERS,
@@ -64,9 +64,9 @@ pub struct SynologyFS {
     hashes: Hashes,
     next_fh: AtomicU64,
     owner: Ownership,
-    /// Bounds speculative block downloads. One permit is one block on the
-    /// wire. See [`MAX_INFLIGHT_PREFETCH_BLOCKS`].
-    prefetch_limit: Arc<tokio::sync::Semaphore>,
+    /// Bounds speculative block downloads, claimed per block on the wire:
+    /// [`MAX_INFLIGHT_PREFETCH_BLOCKS`] for each connection reads go over.
+    prefetch_budget: Arc<Budget>,
     /// Depth of the speculative window, in blocks, per connection reads go
     /// over. `0` switches it off.
     prefetch_blocks: u64,
@@ -74,7 +74,7 @@ pub struct SynologyFS {
     /// count, and 1 on HTTP or with no session. The streaming read-ahead and
     /// the in-flight budget are per connection, so they widen with it — and
     /// stay as they were on HTTP, where the budget protects `synoscgi`.
-    parallel: Arc<dyn Fn() -> usize + Send + Sync>,
+    parallel: crate::ReadConnections,
     /// Per-handle sequential-read state, paired with the inode the handle is
     /// on so that closing one handle only cancels prefetch when it is the last
     /// handle on that file.
@@ -128,7 +128,7 @@ impl SynologyFS {
             hashes: Arc::new(Mutex::new(HashMap::new())),
             next_fh: AtomicU64::new(1),
             owner,
-            prefetch_limit: Arc::new(tokio::sync::Semaphore::new(PREFETCH_PERMITS)),
+            prefetch_budget: Arc::new(Budget::new()),
             prefetch_blocks,
             parallel: Arc::new(|| 1),
             read_ahead: Arc::new(Mutex::new(HashMap::new())),
@@ -140,12 +140,14 @@ impl SynologyFS {
 
     /// Read over however many connections `connections` says, from now on.
     /// See the `parallel` field.
-    pub fn reading_over(mut self, connections: impl Fn() -> usize + Send + Sync + 'static) -> Self {
-        self.parallel = Arc::new(connections);
+    pub fn reading_over(mut self, connections: crate::ReadConnections) -> Self {
+        self.parallel = connections;
         self
     }
 
-    /// How many connections reads go over now; never less than one.
+    /// How many connections reads go over now; never less than one. Asked
+    /// once per decision and passed down, so one read-ahead decision never
+    /// sizes its window for one count and its budget for another.
     fn connections(&self) -> usize {
         (self.parallel)().max(1)
     }
@@ -453,7 +455,7 @@ impl SynologyFS {
             return;
         };
         let window = open_window(total_blocks, self.prefetch_blocks, is_indexed_media(&head));
-        self.spawn_prefetch(ino, path, window);
+        self.spawn_prefetch(ino, path, window, self.connections());
     }
 
     /// Start whatever read-ahead this read has earned.
@@ -465,14 +467,19 @@ impl SynologyFS {
     pub(super) fn read_ahead(&self, fh: u64, ino: u64, path: &str, offset: u64, size: u64) {
         let block_size = self.read_cache.block_size;
         let total_blocks = self.total_blocks(ino);
+        let connections = self.connections();
         let blocks = {
             let mut handles = self.read_ahead.lock().unwrap();
             let (_, state) = handles.entry(fh).or_insert((ino, ReadAhead::default()));
             // Per connection: each keeps its share of the window in flight.
-            let depth = self.prefetch_blocks * self.connections() as u64;
+            let depth = streaming_depth(
+                self.prefetch_blocks,
+                connections,
+                self.read_cache.capacity_blocks(),
+            );
             state.advance(offset, size, block_size, total_blocks, depth)
         };
-        self.spawn_prefetch(ino, path, blocks);
+        self.spawn_prefetch(ino, path, blocks, connections);
     }
 
     /// Forget a handle, and abandon the file's speculation once the last
@@ -515,7 +522,7 @@ impl SynologyFS {
     ///
     /// A block already cached or already claimed by somebody else ends the run
     /// rather than joining it, so a run only ever covers blocks this call owns.
-    fn spawn_prefetch(&self, ino: u64, path: &str, blocks: Vec<u64>) {
+    fn spawn_prefetch(&self, ino: u64, path: &str, blocks: Vec<u64>, connections: usize) {
         let mut run: Vec<u64> = Vec::new();
         for block_idx in blocks {
             let ours = !self.read_cache.contains(ino, block_idx)
@@ -523,13 +530,13 @@ impl SynologyFS {
             let continues = run.last().is_some_and(|last| last + 1 == block_idx)
                 && run.len() < MAX_PREFETCH_SPAN;
             if !ours || !continues {
-                self.spawn_run(ino, path, std::mem::take(&mut run));
+                self.spawn_run(ino, path, std::mem::take(&mut run), connections);
             }
             if ours {
                 run.push(block_idx);
             }
         }
-        self.spawn_run(ino, path, run);
+        self.spawn_run(ino, path, run, connections);
     }
 
     /// Fetch one contiguous run of already-claimed blocks in a single request.
@@ -545,7 +552,7 @@ impl SynologyFS {
     /// an idle one, so the owner must never be idle. Dropping the run leaves
     /// the blocks unclaimed and the reader simply fetches what it needs; the
     /// ramp in [`ReadAhead`] re-earns the window as the reader goes on.
-    fn spawn_run(&self, ino: u64, path: &str, blocks: Vec<u64>) {
+    fn spawn_run(&self, ino: u64, path: &str, blocks: Vec<u64>, connections: usize) {
         let Some(&first) = blocks.first() else {
             return;
         };
@@ -557,19 +564,10 @@ impl SynologyFS {
             .iter()
             .map(|&idx| InflightGuard::new(self.read_cache.clone(), ino, idx))
             .collect();
-        // The budget is per connection. The semaphore is sized for the most
-        // connections there could be, and this is what holds it to the ones
-        // there are; two runs passing it together overshoot by a run at most.
-        let budget = MAX_INFLIGHT_PREFETCH_BLOCKS * self.connections();
-        let in_flight = PREFETCH_PERMITS.saturating_sub(self.prefetch_limit.available_permits());
-        let permit = if in_flight + blocks.len() > budget {
-            Err(tokio::sync::TryAcquireError::NoPermits)
-        } else {
-            self.prefetch_limit
-                .clone()
-                .try_acquire_many_owned(blocks.len() as u32)
-        };
-        let Ok(permit) = permit else {
+        // Per connection reads go over, and claimed in one step: the claim is
+        // the check, so threads racing for it cannot pass the limit together.
+        let limit = MAX_INFLIGHT_PREFETCH_BLOCKS.saturating_mul(connections);
+        let Some(claim) = self.prefetch_budget.try_claim(blocks.len(), limit) else {
             debug!(
                 "prefetch: budget full, dropping {} block(s) from {} at block {}",
                 blocks.len(),
@@ -585,7 +583,7 @@ impl SynologyFS {
         let task = self.rt.spawn(async move {
             // Held for the life of the download and released by dropping it,
             // so an abort gives the budget back with the claims.
-            let _permit = permit;
+            let _claim = claim;
             let mut guards = guards;
             let Ok(data) = client.download(&path, first * block_size, span).await else {
                 return; // the guards release every claim in the run

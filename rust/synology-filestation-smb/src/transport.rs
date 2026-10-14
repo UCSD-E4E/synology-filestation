@@ -135,6 +135,14 @@ impl ReconnectState {
             .clone()
     }
 
+    /// Whether the credentials were refused, without copying why.
+    fn is_refused(&self) -> bool {
+        self.refused
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+    }
+
     /// The gate turned a login away without asking the server; the refusal
     /// that follows is its, not the server's.
     fn skipped_by_gate(&self) {
@@ -363,6 +371,17 @@ const LANE_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a retired connection is kept to close its handles as its reads
 /// finish, before whatever is left goes with the connection.
 const DRAIN_FOR: Duration = Duration::from_secs(60);
+
+/// How many connections reads go over, from whether the session is live,
+/// whether its login was refused, and how many extra ones are up: the same
+/// conditions [`SmbTransport::read`] reads under.
+fn connections_reads_use(live: bool, refused: bool, extra: usize) -> usize {
+    match (live, refused) {
+        (false, _) => 0,
+        (true, true) => 1,
+        (true, false) => 1 + extra,
+    }
+}
 
 /// Whether an extra connection that failed a piece should be let go of: its
 /// link is gone, or this session served the piece it could not — in which
@@ -906,11 +925,16 @@ impl SmbTransport {
 
     /// How many connections block reads are spread over now: none without a
     /// live session, otherwise this one and every extra one that is up.
+    ///
+    /// What reads actually use, as [`read`](Self::read) decides it: after a
+    /// refused login that is the session alone. Cheap enough to ask on every
+    /// read: no allocation, one uncontended lock.
     pub fn read_connections(&self) -> usize {
-        if !self.reconnect.is_live() {
-            return 0;
-        }
-        1 + self.pool.live().len()
+        connections_reads_use(
+            self.reconnect.is_live(),
+            self.reconnect.is_refused(),
+            self.pool.live_count(),
+        )
     }
 
     /// The extra connections to read over now, asking for more in the
@@ -2222,6 +2246,26 @@ mod tests {
     /// mount, each failure a wasted round trip and a re-read, so reading was
     /// slower than on one connection. If this session serves the piece the
     /// extra one could not, the extra one is what failed.
+    /// Regression: after a refused login, reads stopped using the extra
+    /// connections but this still counted them, so the mount went on reading
+    /// ahead for four connections while every block went over one. What it
+    /// reports has to be what reads use.
+    #[test]
+    fn the_connections_counted_are_the_ones_reads_use() {
+        assert_eq!(connections_reads_use(true, false, 3), 4);
+        assert_eq!(
+            connections_reads_use(true, false, 0),
+            1,
+            "the session alone"
+        );
+        assert_eq!(
+            connections_reads_use(true, true, 3),
+            1,
+            "refused: reads go over the session alone"
+        );
+        assert_eq!(connections_reads_use(false, false, 3), 0, "no live session");
+    }
+
     #[test]
     fn an_extra_connection_is_let_go_of_when_it_is_the_one_at_fault() {
         assert!(should_retire(true, false), "its link is gone");

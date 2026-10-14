@@ -647,15 +647,33 @@ fn session_config(allow_other: bool, opts: &MountOptions) -> fuser::Config {
 pub type ReadConnections = Arc<dyn Fn() -> usize + Send + Sync>;
 
 /// How many connections a mount on `legs` reads over, asked live: the SMB
-/// transport's count while its session is up, and 1 otherwise — including
-/// with no SMB at all, where reads take the one HTTP path.
-pub fn live_read_connections(legs: Option<&Arc<legs::Legs>>) -> ReadConnections {
+/// transport's count while its session is up and `client` is sending reads
+/// to it, and 1 otherwise — with no SMB at all, with no session, and once
+/// core's breaker has tripped and reads have gone to HTTP with the session
+/// still up. On HTTP the read-ahead budget is what protects `synoscgi`.
+pub fn live_read_connections(
+    legs: Option<&Arc<legs::Legs>>,
+    client: &Arc<SynologyClient>,
+) -> ReadConnections {
+    let client = client.clone();
     match legs {
         Some(legs) => {
             let smb = legs.session().clone();
-            Arc::new(move || smb.read_connections().max(1))
+            Arc::new(move || {
+                connections_now(smb.read_connections(), client.read_backends_healthy())
+            })
         }
         None => Arc::new(|| 1),
+    }
+}
+
+/// The connections reads go over, from the SMB transport's count and whether
+/// reads are still going to it: one whenever they are not, or there is none.
+fn connections_now(smb: usize, reads_go_to_smb: bool) -> usize {
+    if reads_go_to_smb {
+        smb.max(1)
+    } else {
+        1
     }
 }
 
@@ -717,7 +735,7 @@ pub fn spawn_mount_reading_over(
         owner,
         opts.prefetch_blocks,
     )
-    .reading_over(move || connections());
+    .reading_over(connections);
 
     // As a non-root user, allow_other requires `user_allow_other` in
     // /etc/fuse.conf; running as root always permits it.
@@ -1848,9 +1866,21 @@ mod another_connection_tests {
     /// A mount with no SMB at all, and one whose SMB has no session yet, both
     /// read over the one HTTP path: their read-ahead must not widen, since
     /// on HTTP its budget is what protects the NAS's CGI backend.
+    /// Regression: the count followed the SMB session alone, but core skips a
+    /// backend whose breaker has tripped and sends its reads to HTTP with the
+    /// session still up. Read-ahead stayed widened for four connections and
+    /// landed on `synoscgi`, the thing its budget protects.
+    #[test]
+    fn reads_that_have_gone_to_http_count_as_one_connection() {
+        assert_eq!(connections_now(4, true), 4);
+        assert_eq!(connections_now(4, false), 1, "the breaker has tripped");
+        assert_eq!(connections_now(0, true), 1, "no session");
+    }
+
     #[test]
     fn with_no_smb_session_reads_go_over_one_connection() {
-        assert_eq!(live_read_connections(None)(), 1, "no SMB at all");
+        let client = Arc::new(SynologyClient::new("127.0.0.1", 9, false));
+        assert_eq!(live_read_connections(None, &client)(), 1, "no SMB at all");
 
         let cfg = synology_filestation_smb::SmbConfig::new("127.0.0.1", "u", "p");
         let smb = Arc::new(
@@ -1865,7 +1895,7 @@ mod another_connection_tests {
             DIAL,
         ));
         assert_eq!(
-            live_read_connections(Some(&legs))(),
+            live_read_connections(Some(&legs), &client)(),
             1,
             "four asked for, none up yet"
         );

@@ -53,7 +53,7 @@ fn fixture_reading_over(connections: usize) -> Fixture {
 
 fn fixture_with_prefetch_over(depth: u64, connections: usize) -> Fixture {
     let mut f = fixture_with(depth, 30);
-    f.fs = f.fs.reading_over(move || connections);
+    f.fs = f.fs.reading_over(Arc::new(move || connections));
     f
 }
 

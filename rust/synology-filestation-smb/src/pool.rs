@@ -179,6 +179,11 @@ impl Pool {
         self.lock().clone()
     }
 
+    /// How many extra connections are up now, without copying the list.
+    pub fn live_count(&self) -> usize {
+        self.lock().len()
+    }
+
     /// Whether more connections are wanted and it is time to try for them.
     /// Claims the right to: a `true` must be followed by [`opened`] when the
     /// attempt is over.

@@ -535,7 +535,7 @@ fn run(args: Args) -> anyhow::Result<()> {
         rt.handle().clone(),
         args.mountpoint,
         opts,
-        live_read_connections(legs.as_ref()),
+        live_read_connections(legs.as_ref(), &client),
     )?;
 
     // Block until Ctrl-C, then unmount and log out — preserving the previous

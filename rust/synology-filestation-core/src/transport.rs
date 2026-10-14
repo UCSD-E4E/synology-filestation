@@ -307,6 +307,11 @@ impl CircuitBreaker {
         }
     }
 
+    /// Whether the backend is trusted: not skipped, and not on trial.
+    pub fn is_closed(&self) -> bool {
+        matches!(self.state, State::Closed)
+    }
+
     /// Record a healthy response (bytes, or a definitive error the backend
     /// answered): the backend is trusted again.
     pub fn on_success(&mut self) {
