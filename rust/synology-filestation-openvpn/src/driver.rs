@@ -19,6 +19,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::ip::Ifconfig;
+use crate::mux::Mux;
 use crate::session::{Session, SessionConfig};
 use crate::stack::{LinkFailure, Mtu, TunnelStream};
 use crate::Error;
@@ -186,16 +187,27 @@ impl Tunnel {
     /// any other stream, and nothing on this machine has — or needs — a route
     /// to the address at the far end.
     ///
-    /// The tunnel is consumed. One connection is what this exists to carry,
-    /// the packets have to go somewhere exclusively, and it means the tunnel
-    /// failing arrives where a caller is already looking: as an error on the
-    /// stream rather than as silence.
+    /// The tunnel is consumed, and kept up for as long as the connection is:
+    /// the tunnel failing then arrives where a caller is already looking, as
+    /// an error on the stream rather than as silence. A caller that wants more
+    /// than one connection over it wants [`share`](Self::share).
     pub async fn open_stream(
         self,
         remote: (Ipv4Addr, u16),
         patience: Duration,
         mtu: Mtu,
     ) -> Result<TunnelStream, Error> {
+        self.share(mtu)?.connect(remote, patience).await
+    }
+
+    /// Hand the tunnel over to carry as many TCP connections as are opened on
+    /// what comes back.
+    ///
+    /// It stays up while any of them, or the [`Mux`] itself, is held, and goes
+    /// when the last is let go of. See [`crate::mux`] for why one tunnel
+    /// carries several connections rather than one each. `mtu` is the largest
+    /// IP packet any of them puts in the tunnel.
+    pub fn share(self, mtu: Mtu) -> Result<Mux, Error> {
         let ifconfig = self
             .ifconfig
             .ok_or_else(|| Error::Io("the server pushed no address for us".into()))?;
@@ -210,7 +222,7 @@ impl Tunnel {
         }
         let failure = self.failure.clone();
 
-        // Two channels and a pump, because the stack wants somewhere to put
+        // Two channels and a pump, because the stacks want somewhere to put
         // packets and somewhere to take them from, while the tunnel wants to
         // be sent and received on.
         let (to_tunnel, mut from_stack) = mpsc::channel::<Vec<u8>>(64);
@@ -226,8 +238,8 @@ impl Tunnel {
                                 return;
                             }
                         }
-                        // The stack has gone, so nothing more will be sent and
-                        // nothing more is worth receiving.
+                        // Every connection has gone, so nothing more will be
+                        // sent and nothing more is worth receiving.
                         None => return,
                     },
                     inbound = tunnel.recv() => match inbound {
@@ -243,15 +255,7 @@ impl Tunnel {
             }
         });
 
-        match TunnelStream::connect(to_tunnel, from_tunnel, ifconfig, remote, patience, mtu).await {
-            // And the same question again on the way out: the tunnel may have
-            // stopped while the connection was being made, in which case what
-            // happened is not that nobody answered.
-            Err(unanswered) => Err(failure.reason().unwrap_or(unanswered)),
-            // From here on the stream is what the caller holds, so it is where
-            // the reason has to arrive.
-            Ok(stream) => Ok(stream.explaining(failure)),
-        }
+        Ok(Mux::new(to_tunnel, from_tunnel, ifconfig, mtu, failure))
     }
 
     /// Why the tunnel stopped, if it has.

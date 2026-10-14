@@ -24,7 +24,7 @@ use synology_filestation_core::error::SynoFsError;
 use synology_filestation_smb::{SmbConfig, SmbTransport};
 use tracing::{info, warn};
 
-use crate::{dial_direct, reopen_through, Dial};
+use crate::{another_connection, dial_direct, reopen_through, Dial};
 
 /// How often a mount on a degraded leg looks for a better one.
 ///
@@ -88,7 +88,15 @@ impl Legs<SmbTransport> {
     /// back whether or not a leg answered: attached without a session it
     /// stands aside for HTTP, and [`watch`](Self::watch) hands it one when
     /// SMB becomes reachable.
-    pub async fn start(chain: Arc<Chain>, cfg: &SmbConfig) -> Option<Arc<Self>> {
+    ///
+    /// Block reads are spread over `connections` connections on whichever leg
+    /// the session is on — see [`SmbTransport::with_read_connections`]. On the
+    /// tunnel leg they share the one tunnel, so this costs no VPN logins.
+    pub async fn start(
+        chain: Arc<Chain>,
+        cfg: &SmbConfig,
+        connections: usize,
+    ) -> Option<Arc<Self>> {
         if !chain.may_use_smb() {
             info!("Transport: the HTTP API (SMB is disabled)");
             return None;
@@ -96,10 +104,10 @@ impl Legs<SmbTransport> {
         // The redial is what a session that dies between looks uses to come
         // straight back; the watch covers everything the redial cannot.
         let dial = Dial::for_config(cfg);
-        let smb = Arc::new(SmbTransport::unconnected(
-            cfg,
-            reopen_through(chain.clone(), dial),
-        ));
+        let smb = Arc::new(
+            SmbTransport::unconnected(cfg, reopen_through(chain.clone(), dial))
+                .with_read_connections(connections, another_connection(chain.clone(), dial)),
+        );
         let legs = Arc::new(Self::new(chain, smb, dial));
         legs.step().await;
         Some(legs)

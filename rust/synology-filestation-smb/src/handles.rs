@@ -61,29 +61,36 @@ impl<H> HandleCache<H> {
         Some(handle)
     }
 
-    /// Keep `handle` for `path`, returning whatever that displaced — a handle
-    /// already open on the same path, and the least recently used one if the
-    /// cache is now over capacity. The caller closes what comes back.
-    pub(crate) fn insert(&self, path: &str, handle: Arc<H>) -> Vec<Arc<H>> {
-        let mut displaced = Vec::new();
-        // Capacity zero is caching switched off. Handing the handle straight
-        // back keeps the "one open handle per cached path" invariant true at
-        // zero as well, rather than making it a special case everywhere else.
+    /// Keep `handle` for `path` unless one is already open there, in which
+    /// case that one is kept and handed back, and `handle` is returned to be
+    /// closed. Otherwise what comes back to close is whatever going over
+    /// capacity evicted, the least recently used first.
+    ///
+    /// For a reader that opened a handle after missing the cache. Another may
+    /// have done the same meanwhile and be reading through its handle now, so
+    /// the newcomer — which nothing has read through yet — is the one to go.
+    pub(crate) fn insert_or_existing(&self, path: &str, handle: Arc<H>) -> (Arc<H>, Vec<Arc<H>>) {
+        // Caching off: used once and closed. Handed back to
+        // close while the caller still holds it, which parks it until the read
+        // is done.
         if self.capacity == 0 {
-            return vec![handle];
+            return (handle.clone(), vec![handle]);
         }
         let mut state = self.state.lock().unwrap();
-        if let Some(old) = state.handles.insert(path.to_string(), handle) {
-            displaced.push(old);
+        if let Some(existing) = state.handles.get(path).cloned() {
+            state.touch(path);
+            return (existing, vec![handle]);
         }
+        state.handles.insert(path.to_string(), handle.clone());
         state.touch(path);
+        let mut evicted = Vec::new();
         while state.handles.len() > self.capacity {
             let oldest = state.order.remove(0);
-            if let Some(evicted) = state.handles.remove(&oldest) {
-                displaced.push(evicted);
+            if let Some(gone) = state.handles.remove(&oldest) {
+                evicted.push(gone);
             }
         }
-        displaced
+        (handle, evicted)
     }
 
     /// Forget the handle for exactly `path`.
@@ -127,6 +134,13 @@ impl<H> HandleCache<H> {
     /// Park a handle the caller could not close because a read still held it.
     pub(crate) fn defer(&self, handle: Arc<H>) {
         self.state.lock().unwrap().deferred.push(handle);
+    }
+
+    /// Whether nothing is cached and nothing is parked: every handle this
+    /// cache ever held has been handed back.
+    pub(crate) fn is_empty(&self) -> bool {
+        let state = self.state.lock().unwrap();
+        state.handles.is_empty() && state.deferred.is_empty()
     }
 
     /// Parked handles nothing is reading through any more.
@@ -186,7 +200,37 @@ mod tests {
     }
 
     fn put(c: &HandleCache<Handle>, path: &str, tag: &'static str) -> Vec<Arc<Handle>> {
-        c.insert(path, Arc::new(Handle(tag)))
+        c.insert_or_existing(path, Arc::new(Handle(tag))).1
+    }
+
+    #[test]
+    fn a_handle_opened_for_a_path_already_open_loses_to_the_one_there() {
+        // Two readers that both missed the cache both open the file. The one
+        // already cached may be mid-read, so it stays, and the newcomer —
+        // which nothing has read through yet — is the one handed back to
+        // close. The other way round parked a busy handle where nothing
+        // invalidating the path would ever find it.
+        let c = cache();
+        let (first, closing) = c.insert_or_existing("/s/a.mov", Arc::new(Handle("first")));
+        assert_eq!(*first, Handle("first"));
+        assert!(closing.is_empty());
+
+        let (kept, closing) = c.insert_or_existing("/s/a.mov", Arc::new(Handle("second")));
+        assert_eq!(*kept, Handle("first"), "the handle already there is used");
+        assert_eq!(closing.len(), 1);
+        assert_eq!(*closing[0], Handle("second"), "and the newcomer goes");
+        assert_eq!(c.get("/s/a.mov").as_deref(), Some(&Handle("first")));
+    }
+
+    #[test]
+    fn keeping_a_new_handle_still_evicts_past_capacity() {
+        let c = cache();
+        for (path, tag) in [("/a", "a"), ("/b", "b"), ("/c", "c")] {
+            c.insert_or_existing(path, Arc::new(Handle(tag)));
+        }
+        let (_, closing) = c.insert_or_existing("/d", Arc::new(Handle("d")));
+        assert_eq!(closing.len(), 1);
+        assert_eq!(*closing[0], Handle("a"), "the least recently used");
     }
 
     #[test]
@@ -241,18 +285,6 @@ mod tests {
 
         assert_eq!(*evicted[0], Handle("b"));
         assert!(c.get("/s/a").is_some());
-    }
-
-    #[test]
-    fn reopening_a_path_displaces_the_handle_it_had() {
-        let c = cache();
-        put(&c, "/s/a", "first");
-        let displaced = put(&c, "/s/a", "second");
-
-        assert_eq!(displaced.len(), 1);
-        assert_eq!(*displaced[0], Handle("first"), "the old handle must close");
-        assert_eq!(c.get("/s/a").as_deref(), Some(&Handle("second")));
-        assert_eq!(c.len(), 1, "one path, one handle");
     }
 
     #[test]

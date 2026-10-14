@@ -20,7 +20,7 @@ use std::time::Duration;
 use synology_filestation_connect::{Chain, SmbRoute};
 use synology_filestation_core::client::SynologyClient;
 use synology_filestation_core::error::SynoFsError;
-use synology_filestation_smb::{BoxedStream, RedialFuture};
+use synology_filestation_smb::{BoxedStream, ConnectionFuture, RedialFuture};
 
 /// Default umask for the synthetic mode the Linux backend reports, matching the
 /// 0o755 directories / 0o644 files a process with the usual umask creates.
@@ -109,6 +109,50 @@ pub fn reopen_through(
                     );
                     Err(SynoFsError::Io(format!("{e}")))
                 }
+            }
+        })
+    }
+}
+
+/// How many connections a mount reads over unless told otherwise: its session
+/// and three more.
+///
+/// Measured, not guessed: from a home uplink losing about 3% of what the NAS
+/// sent, one connection ran at 1.7 MB/s and three at 5.1, so each adds about
+/// as much as the first. Four is still a small number of sessions to hold on
+/// the NAS for one mount, and past it a home link's own bandwidth starts to
+/// be the limit instead.
+pub const DEFAULT_SMB_CONNECTIONS: usize = 4;
+
+/// How to open one more stream to the NAS on the leg the mount is on, for
+/// [`SmbTransport::with_read_connections`](synology_filestation_smb::SmbTransport::with_read_connections).
+///
+/// A dial on the direct leg, another connection through the tunnel already up
+/// on the other: [`Chain::another_smb_connection`], which reads the leg the
+/// chain settled on and changes nothing about it. Not [`Chain::reach_smb`],
+/// the redial's question: its failure path marks the tunnel failed and
+/// re-decides, so one extra connection timing out on a lossy link would put
+/// the main session's next redial on HTTP. And it says nothing above debug,
+/// where the redial warns: its "the stream lasted Ns" is the record of a
+/// session that keeps falling over, and a mount opening its read connections
+/// would bury it.
+pub fn another_connection(
+    chain: Arc<Chain>,
+    dial: Dial,
+) -> impl Fn() -> ConnectionFuture + Send + Sync + 'static + use<> {
+    move || {
+        let chain = chain.clone();
+        Box::pin(async move {
+            match chain.another_smb_connection().await {
+                Ok(SmbRoute::Tunnelled { host, connection }) => {
+                    Ok((Box::new(connection) as BoxedStream, host))
+                }
+                Ok(SmbRoute::Direct { host }) => {
+                    let stream = dial_direct(&host, dial).await?;
+                    Ok((stream, host))
+                }
+                Ok(SmbRoute::Unavailable) => Err(SynoFsError::NotSupported),
+                Err(e) => Err(SynoFsError::Io(format!("{e}"))),
             }
         })
     }
@@ -1359,14 +1403,22 @@ mod log_capture {
 
     /// Only one capturing test at a time, and where its output goes.
     static CAPTURING: Mutex<()> = Mutex::new(());
-    static ACTIVE: Mutex<Option<Sink>> = Mutex::new(None);
+    /// The sink, and the thread whose records it takes. The subscriber is
+    /// process-wide, so without the thread a capture also took whatever every
+    /// other test running alongside it logged, and a test asserting that
+    /// something was *not* said failed on the timing of the others.
+    static ACTIVE: Mutex<Option<(Sink, std::thread::ThreadId)>> = Mutex::new(None);
 
     #[derive(Clone, Default)]
     struct RouteToActiveCapture;
 
     impl std::io::Write for RouteToActiveCapture {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            if let Some(sink) = ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            let active = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((sink, _)) = active
+                .as_ref()
+                .filter(|(_, thread)| *thread == std::thread::current().id())
+            {
                 sink.0
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -1410,7 +1462,10 @@ mod log_capture {
                 let _ = tracing::subscriber::set_global_default(subscriber);
             });
             let sink = Sink::default();
-            *ACTIVE.lock().unwrap_or_else(|e| e.into_inner()) = Some(sink.clone());
+            // Records are written on the thread that logs them, and a
+            // capturing test runs on one: `#[tokio::test]` is single-threaded.
+            *ACTIVE.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some((sink.clone(), std::thread::current().id()));
             Self {
                 sink,
                 _capturing: capturing,
@@ -1427,6 +1482,22 @@ mod log_capture {
         fn drop(&mut self) {
             *ACTIVE.lock().unwrap_or_else(|e| e.into_inner()) = None;
         }
+    }
+
+    /// Regression: the capture took every thread's records, so a test
+    /// asserting nothing was warned failed on Windows CI whenever another
+    /// test's warnings landed during it.
+    #[test]
+    fn a_capture_takes_only_its_own_threads_records() {
+        let logs = LogCapture::at_the_default_level();
+        std::thread::spawn(|| tracing::warn!("from a test running alongside"))
+            .join()
+            .expect("the other thread ran");
+        tracing::warn!("from the capturing test");
+
+        let text = logs.text();
+        assert!(text.contains("from the capturing test"), "got: {text}");
+        assert!(!text.contains("alongside"), "got: {text}");
     }
 }
 
@@ -1640,5 +1711,93 @@ mod fuse_connection_tests {
 
         let text = read_mountinfo(&path).expect("mountinfo was read");
         assert_eq!(fuse_connection(&text, (0, 75)), Some(75));
+    }
+}
+
+#[cfg(test)]
+mod another_connection_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use synology_filestation_connect::{
+        Endpoints, NoTunnel, Prober, TransportPolicy, DEFAULT_RECHECK,
+    };
+
+    use crate::log_capture::LogCapture;
+
+    struct Answers(bool);
+
+    #[async_trait]
+    impl Prober for Answers {
+        async fn smb_reachable(&self, _host: &str) -> bool {
+            self.0
+        }
+    }
+
+    fn chain_to(host: &str, answers: bool) -> Arc<Chain> {
+        Arc::new(Chain::new(
+            TransportPolicy::default(),
+            Endpoints::public_only(host),
+            Box::new(Answers(answers)),
+            Box::new(NoTunnel),
+            DEFAULT_RECHECK,
+        ))
+    }
+
+    const DIAL: Dial = Dial {
+        port: 445,
+        patience: Duration::from_secs(5),
+    };
+
+    /// The extra connections a mount reads over go where its session went,
+    /// and say which server they reached, since that is the name the session
+    /// on them authenticates against.
+    #[tokio::test]
+    async fn another_connection_on_the_direct_leg_is_a_dial_to_that_host() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a port to answer on");
+        let host = listener.local_addr().expect("its address").to_string();
+        let accepted = tokio::spawn(async move { listener.accept().await.map(|_| ()) });
+
+        let chain = chain_to(&host, true);
+        chain.reach_smb().await.expect("settled on the direct leg");
+        let (_stream, named) = another_connection(chain, DIAL)()
+            .await
+            .unwrap_or_else(|e| panic!("a stream: {e}"));
+
+        assert_eq!(named, host);
+        assert!(accepted.await.expect("the accept task ran").is_ok());
+    }
+
+    /// Opening one more connection is not a recovery, and must not read like
+    /// one: the redial's "the stream lasted Ns; reopened" warning is the
+    /// diagnostic for a session that keeps dying, and a mount opening its
+    /// read connections would bury it.
+    #[tokio::test]
+    async fn opening_another_connection_does_not_warn() {
+        let logs = LogCapture::at_the_default_level();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a port to answer on");
+        let host = listener.local_addr().expect("its address").to_string();
+        let accepting = tokio::spawn(async move { listener.accept().await.map(|_| ()) });
+
+        let chain = chain_to(&host, true);
+        chain.reach_smb().await.expect("settled on the direct leg");
+        another_connection(chain, DIAL)()
+            .await
+            .unwrap_or_else(|e| panic!("a stream: {e}"));
+        let _ = accepting.await;
+
+        let text = logs.text();
+        assert!(!text.contains("lasted"), "got: {text}");
+        assert!(!text.contains("WARN"), "got: {text}");
+    }
+
+    /// No SMB leg, no connection — and no dial to find that out.
+    #[tokio::test]
+    async fn with_no_leg_to_smb_there_is_no_other_connection() {
+        let opened = another_connection(chain_to("127.0.0.1:9", false), DIAL)().await;
+        assert!(opened.is_err());
     }
 }

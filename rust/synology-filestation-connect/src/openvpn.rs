@@ -11,14 +11,21 @@
 //! `CAP_NET_ADMIN`, no privileged helper, no installer component, and no
 //! effect on anything else the machine is doing.
 //!
-//! ## One tunnel per connection
+//! ## One tunnel, shared by its connections
 //!
-//! Every call raises a fresh one. That sounds wasteful and is the honest
-//! shape: the connection is what the caller asked for, an OpenVPN session
-//! carries exactly one here, and a session that has died is usually why the
-//! caller is asking again. Keeping a tunnel alive between calls would mean
-//! deciding when to tear it down, which is a question nothing here can answer
-//! and [`Chain`](crate::Chain) already answers in its own terms.
+//! A tunnel carries as many TCP connections as are opened on it, and a
+//! connection asked for while one is up goes over that one. Loss on the path
+//! caps each TCP connection rather than the link, so a mount reads over
+//! several; a tunnel apiece would cost a VPN login and a session on the NAS
+//! for each.
+//!
+//! What is kept between calls is only a weak handle. The tunnel goes when its
+//! last connection does, exactly as it did when it carried one, so deciding
+//! when to tear it down is still not a question anything here has to answer
+//! — [`Chain`](crate::Chain) answers it in its own terms. A tunnel that has
+//! stopped is not reused: the caller asking again is usually asking because
+//! of that. One that is running is never replaced because a connection
+//! through it failed: that is a second login for an account already logged in.
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -26,7 +33,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use synology_filestation_openvpn::{
-    credentials, Error as VpnError, Mtu as VpnMtu, Profile, Tunnel as OpenVpn,
+    credentials, Error as VpnError, Mtu as VpnMtu, Mux, Profile, Tunnel as OpenVpn, WeakMux,
 };
 use tracing::{debug, info};
 use zeroize::Zeroizing;
@@ -49,6 +56,8 @@ pub struct OpenVpnTunnel {
     /// The largest IP packet either end puts in the tunnel. See
     /// [`OpenVpnTunnel::with_mtu`].
     mtu: VpnMtu,
+    /// The tunnel already up, if one is.
+    shared: SharedTunnel,
 }
 
 /// Hand-written so the password never reaches a log.
@@ -82,6 +91,7 @@ impl OpenVpnTunnel {
             password: Zeroizing::new(password.into()),
             patience,
             mtu: VpnMtu::default(),
+            shared: SharedTunnel::default(),
         }
     }
 
@@ -90,19 +100,37 @@ impl OpenVpnTunnel {
     ///
     /// The client-side `--mssfix`: the NAS sizes what it sends by the MSS our
     /// SYN offers, so a smaller MTU here keeps its wrapped packets under a path
-    /// that would otherwise split each one in two.
+    /// that would otherwise split each one in two. Every connection through
+    /// the shared tunnel uses it.
     pub fn with_mtu(mut self, mtu: VpnMtu) -> Self {
         self.mtu = mtu;
         self
     }
 
-    /// Raise a tunnel and open a connection through it, by `deadline`.
-    async fn raise(
+    /// A connection to `host:port` through the tunnel already up, or through
+    /// a new one, by `deadline`.
+    async fn reach(
         &self,
         host: Ipv4Addr,
         port: u16,
         deadline: tokio::time::Instant,
     ) -> Result<Connection, TunnelUnavailable> {
+        let (stream, fresh) = through(
+            &self.shared,
+            || self.raise(host, port),
+            |tunnel: Mux| async move { connect_through(&tunnel, host, port, deadline).await },
+        )
+        .await?;
+        if fresh {
+            info!("tunnel: up, and {host}:{port} answered through it");
+        } else {
+            debug!("tunnel: another connection to {host}:{port} through the one already up");
+        }
+        Ok(stream)
+    }
+
+    /// Raise a tunnel, ready to carry connections.
+    async fn raise(&self, host: Ipv4Addr, port: u16) -> Result<Mux, TunnelUnavailable> {
         let text = Zeroizing::new(read_profile(&self.profile).await?);
         let profile = Profile::parse(&text).map_err(|e| {
             TunnelUnavailable::Transient(format!(
@@ -149,29 +177,87 @@ impl OpenVpnTunnel {
             }
         })?;
 
-        // What is left of the budget, not the whole of it again. Handing the
-        // full patience here means the outer bound always fires first, so
-        // every failure is reported as the tunnel not coming up — erasing the
-        // difference between a tunnel that never came up and a NAS not
-        // listening behind one, which is the difference this layer exists to
-        // draw.
-        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
-        let stream = tunnel
-            .open_stream((host, port), left, self.mtu)
-            .await
-            .map_err(|e| {
-                TunnelUnavailable::Transient(format!(
-                    "the tunnel is up, but nothing answered at {host}:{port} inside it: {e}"
-                ))
-            })?;
-
-        info!(
-            "tunnel: up, and {host}:{port} answered through it (MTU {}, MSS {})",
-            self.mtu,
-            self.mtu.mss()
-        );
-        Ok(Box::new(stream))
+        let shared = tunnel.share(self.mtu).map_err(|e| {
+            TunnelUnavailable::Transient(format!(
+                "the vpn tunnel to {server} came up but cannot carry a connection: {e}"
+            ))
+        })?;
+        debug!("tunnel: up (MTU {}, MSS {})", self.mtu, self.mtu.mss());
+        Ok(shared)
     }
+}
+
+/// Open a connection through `tunnel`, by `deadline`.
+///
+/// What is left of the budget, not the whole of it again. Handing the full
+/// patience here means the outer bound always fires first, so every failure is
+/// reported as the tunnel not coming up — erasing the difference between a
+/// tunnel that never came up and a NAS not listening behind one, which is the
+/// difference this layer exists to draw.
+async fn connect_through(
+    tunnel: &Mux,
+    host: Ipv4Addr,
+    port: u16,
+    deadline: tokio::time::Instant,
+) -> Result<Connection, TunnelUnavailable> {
+    let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+    let stream = tunnel.connect((host, port), left).await.map_err(|e| {
+        TunnelUnavailable::Transient(format!(
+            "the tunnel is up, but nothing answered at {host}:{port} inside it: {e}"
+        ))
+    })?;
+    Ok(Box::new(stream))
+}
+
+/// The tunnel connections share, held weakly: found while something uses it,
+/// gone once nothing does.
+#[derive(Default)]
+struct SharedTunnel {
+    /// Locked across a raise, so callers arriving together raise one tunnel —
+    /// one login — rather than one each.
+    held: tokio::sync::Mutex<WeakMux>,
+}
+
+impl SharedTunnel {
+    /// The tunnel already up and carrying, or one `raise` brings up. The flag
+    /// says which: `true` when this call raised it.
+    async fn get_or_raise<F, Fut>(&self, raise: F) -> Result<(Mux, bool), TunnelUnavailable>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<Mux, TunnelUnavailable>>,
+    {
+        let mut held = self.held.lock().await;
+        if let Some(tunnel) = held.upgrade().filter(Mux::is_running) {
+            return Ok((tunnel, false));
+        }
+        let tunnel = raise().await?;
+        *held = tunnel.downgrade();
+        Ok((tunnel, true))
+    }
+}
+
+/// A connection through the shared tunnel: the one running, or one `raise`
+/// brings up when none is. The flag is `true` when this call raised it.
+///
+/// A connection that fails is that connection's failure, and the tunnel is
+/// kept. Replacing a running tunnel because one connection through it would
+/// not open is a second VPN login for an account already logged in, on
+/// exactly the lossy links that make connections time out. A tunnel that has
+/// really died says so (`Mux::is_running`), and the next call raises another.
+async fn through<R, RF, C, CF>(
+    shared: &SharedTunnel,
+    raise: R,
+    connect: C,
+) -> Result<(Connection, bool), TunnelUnavailable>
+where
+    R: FnOnce() -> RF,
+    RF: std::future::Future<Output = Result<Mux, TunnelUnavailable>>,
+    C: FnOnce(Mux) -> CF,
+    CF: std::future::Future<Output = Result<Connection, TunnelUnavailable>>,
+{
+    let (tunnel, fresh) = shared.get_or_raise(raise).await?;
+    let connection = connect(tunnel).await?;
+    Ok((connection, fresh))
 }
 
 #[async_trait]
@@ -195,7 +281,7 @@ impl Tunnel for OpenVpnTunnel {
         // and each says what it was doing, so this only fires if one of them
         // fails to bound itself.
         let deadline = tokio::time::Instant::now() + self.patience;
-        match tokio::time::timeout_at(deadline, self.raise(address, port, deadline)).await {
+        match tokio::time::timeout_at(deadline, self.reach(address, port, deadline)).await {
             Ok(outcome) => outcome,
             Err(_) => Err(TunnelUnavailable::Transient(format!(
                 "the vpn tunnel did not come up within {:?}",
@@ -257,6 +343,189 @@ async fn read_profile(path: &Path) -> Result<String, TunnelUnavailable> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use synology_filestation_openvpn::LinkFailure;
+
+    /// The far end of an in-memory link: what we send, and how it answers.
+    type FarEnd = (
+        tokio::sync::mpsc::Receiver<Vec<u8>>,
+        tokio::sync::mpsc::Sender<Vec<u8>>,
+    );
+
+    /// A tunnel that is up, over an in-memory link nobody answers on, and the
+    /// far end of it so it stays up for as long as the test holds that.
+    fn a_live_mux() -> (Mux, FarEnd) {
+        let (to_far_end, far_end) = tokio::sync::mpsc::channel(8);
+        let (from_far_end, inbound) = tokio::sync::mpsc::channel(8);
+        let ifconfig = synology_filestation_openvpn::Ifconfig {
+            address: Ipv4Addr::new(10, 90, 24, 6),
+            prefix: 24,
+        };
+        let mux = Mux::new(
+            to_far_end,
+            inbound,
+            ifconfig,
+            synology_filestation_openvpn::Mtu::default(),
+            LinkFailure::new(),
+        );
+        (mux, (far_end, from_far_end))
+    }
+
+    /// Raises an in-memory tunnel, counting how often it was asked to.
+    struct Raiser {
+        raised: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        /// Kept so the links it raised stay up.
+        ends: std::sync::Mutex<Vec<FarEnd>>,
+    }
+
+    impl Raiser {
+        fn new() -> Self {
+            Self {
+                raised: Default::default(),
+                ends: Default::default(),
+            }
+        }
+
+        async fn raise(&self) -> Result<Mux, TunnelUnavailable> {
+            self.raised
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // Long enough for a second caller to arrive while this one is
+            // still raising.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let (mux, far_end) = a_live_mux();
+            self.ends.lock().unwrap().push(far_end);
+            Ok(mux)
+        }
+
+        fn count(&self) -> usize {
+            self.raised.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tunnel_in_use_is_reused_rather_than_raised_again() {
+        // A VPN login and a session on the NAS per connection is the cost
+        // this exists to avoid.
+        let shared = SharedTunnel::default();
+        let raiser = Raiser::new();
+
+        let (first, fresh) = shared
+            .get_or_raise(|| raiser.raise())
+            .await
+            .expect("raised");
+        assert!(fresh);
+        let (_second, fresh) = shared
+            .get_or_raise(|| raiser.raise())
+            .await
+            .expect("reused");
+        assert!(!fresh, "the second caller got the tunnel already up");
+        assert_eq!(raiser.count(), 1);
+        drop(first);
+    }
+
+    #[tokio::test]
+    async fn a_tunnel_nothing_uses_any_more_is_not_kept_for_later() {
+        // An idle tunnel is an authenticated session nobody wants. It goes
+        // with its last connection, and the next caller raises another.
+        let shared = SharedTunnel::default();
+        let raiser = Raiser::new();
+
+        let (first, _) = shared
+            .get_or_raise(|| raiser.raise())
+            .await
+            .expect("raised");
+        drop(first);
+        let (_again, fresh) = shared
+            .get_or_raise(|| raiser.raise())
+            .await
+            .expect("raised");
+        assert!(fresh);
+        assert_eq!(raiser.count(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_tunnel_that_has_stopped_is_not_reused() {
+        let shared = SharedTunnel::default();
+        let raiser = Raiser::new();
+
+        let (dead, _) = shared
+            .get_or_raise(|| async {
+                let (mux, far_end) = a_live_mux();
+                drop(far_end);
+                Ok(mux)
+            })
+            .await
+            .expect("raised");
+        // The link has gone; give the mux a moment to notice.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while dead.is_running() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("noticed");
+
+        let (_fresh_one, fresh) = shared
+            .get_or_raise(|| raiser.raise())
+            .await
+            .expect("raised");
+        assert!(fresh, "held or not, a stopped tunnel carries nothing");
+        assert_eq!(raiser.count(), 1);
+    }
+
+    #[tokio::test]
+    async fn callers_arriving_together_raise_one_tunnel() {
+        // A redial and a second connection can ask at the same moment, and
+        // two logins at once is two strikes if the password has changed.
+        let shared = std::sync::Arc::new(SharedTunnel::default());
+        let raiser = std::sync::Arc::new(Raiser::new());
+        let mut held = Vec::new();
+        let asks: Vec<_> = (0..3)
+            .map(|_| {
+                let shared = shared.clone();
+                let raiser = raiser.clone();
+                tokio::spawn(async move { shared.get_or_raise(|| raiser.raise()).await })
+            })
+            .collect();
+        for ask in asks {
+            held.push(ask.await.expect("finished").expect("a tunnel").0);
+        }
+        assert_eq!(raiser.count(), 1);
+    }
+
+    /// Regression: a connection that would not open through a tunnel already
+    /// up made `reach` let go of that tunnel and raise another — a second VPN
+    /// login for the same account, while the first tunnel went on carrying
+    /// the mount's session. On a lossy link, where extra connections time out
+    /// now and then, that is a login per timeout, and a server that allows
+    /// one session per account drops the one in use. A tunnel that is still
+    /// running is not replaced because one connection through it failed.
+    #[tokio::test]
+    async fn a_connection_that_fails_through_a_running_tunnel_raises_no_other() {
+        let shared = SharedTunnel::default();
+        let raiser = Raiser::new();
+        let (in_use, _) = shared
+            .get_or_raise(|| raiser.raise())
+            .await
+            .expect("the session's tunnel");
+
+        for _ in 0..3 {
+            let failed = through(
+                &shared,
+                || raiser.raise(),
+                |_tunnel| async { Err(TunnelUnavailable::Transient("timed out".into())) },
+            )
+            .await;
+            assert!(failed.is_err(), "the connection's failure is reported");
+        }
+
+        assert_eq!(raiser.count(), 1, "one tunnel, one login");
+        let (_still, fresh) = shared
+            .get_or_raise(|| raiser.raise())
+            .await
+            .expect("offered");
+        assert!(!fresh, "and the running tunnel is still the one offered");
+        drop(in_use);
+    }
 
     fn addr(text: &str) -> SocketAddr {
         text.parse().expect("an address")

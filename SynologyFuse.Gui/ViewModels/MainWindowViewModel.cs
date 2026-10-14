@@ -52,6 +52,7 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
         _vpnProfile = s.VpnProfile;
         _vpnHost = s.VpnHost;
         _vpnMtu = VpnMtuSetting.FromPersisted(s.VpnMtu);
+        _smbConnections = SmbConnectionsSetting.FromPersisted(s.SmbConnections);
         _vpnProfileNas = s.VpnProfileNas;
 
         _mountService.OutputReceived += OnOutput;
@@ -157,6 +158,12 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
     /// shows as a VPN far slower than the link it runs over.</summary>
     [ObservableProperty]
     private decimal? _vpnMtu;
+
+    /// <summary>How many SMB connections a mount reads over; empty for the
+    /// default (four). Raise it when reads off campus are slow: loss on a home
+    /// link caps each connection rather than the link.</summary>
+    [ObservableProperty]
+    private decimal? _smbConnections;
 
     public IReadOnlyList<string> LogLevels { get; } =
         ["error", "warn", "info", "debug", "trace"];
@@ -471,6 +478,7 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
         VpnProfile = VpnProfile,
         VpnHost = VpnHost,
         VpnMtu = VpnMtuSetting.ToNative(VpnMtu),
+        SmbConnections = SmbConnectionsSetting.ToNative(SmbConnections),
         VpnProfileNas = VpnProfileNas,
     };
 
@@ -492,6 +500,7 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
         VpnProfile = VpnProfile,
         VpnHost = VpnHost,
         VpnMtu = VpnMtu,
+        SmbConnections = SmbConnections,
         VpnProfileNas = VpnProfileNas,
     });
 

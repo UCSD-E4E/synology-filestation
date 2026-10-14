@@ -148,6 +148,12 @@ struct Args {
     /// cannot resume an interrupted transfer
     #[arg(long)]
     disable_https: bool,
+    /// How many SMB connections to read over: the session and up to N-1 more,
+    /// each its own login. Loss on a home link caps each connection rather
+    /// than the link, so a lossy link reads faster over several. Through the
+    /// VPN they share one tunnel. `1` reads on the session alone
+    #[arg(long, value_parser = parse_connections, default_value_t = synology_filestation_fuse::DEFAULT_SMB_CONNECTIONS)]
+    smb_connections: usize,
 
     /// The NAS's address *inside* the tunnel, which its public name does not
     /// resolve to — an OpenVPN server that pushes no DNS is the ordinary case,
@@ -248,6 +254,16 @@ fn probe_timeout(env: Option<String>) -> Duration {
     env.and_then(|s| s.parse().ok())
         .map(Duration::from_millis)
         .unwrap_or(Duration::from_secs(2))
+}
+
+/// The number of SMB connections to read over: at least one, since the
+/// session itself is a connection.
+fn parse_connections(raw: &str) -> Result<usize, String> {
+    match raw.parse::<usize>() {
+        Ok(0) => Err("at least 1: the session itself is one".into()),
+        Ok(n) => Ok(n),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 /// Parse a umask the way `umask(1)` and every mount helper do: octal, with no
@@ -485,7 +501,7 @@ fn run(args: Args) -> anyhow::Result<()> {
     // tunnel moves to a direct connection when that answers. The transport is
     // attached whether or not a leg answered — without a session it stands
     // aside for HTTP — so there is somewhere for the session to go.
-    let legs = rt.block_on(Legs::start(chain.clone(), &smb_cfg));
+    let legs = rt.block_on(Legs::start(chain.clone(), &smb_cfg, args.smb_connections));
     let on = legs
         .as_ref()
         .map_or(Transport::Https, |legs| legs.current());
@@ -587,6 +603,35 @@ mod tests {
             refused.to_string().contains("e4e-nas-vpn.ovpn"),
             "it got as far as looking for the profile: {refused}"
         );
+    }
+
+    #[test]
+    fn a_mount_reads_over_four_connections_unless_told_otherwise() {
+        assert_eq!(
+            args_with(None).smb_connections,
+            synology_filestation_fuse::DEFAULT_SMB_CONNECTIONS
+        );
+        assert_eq!(synology_filestation_fuse::DEFAULT_SMB_CONNECTIONS, 4);
+    }
+
+    #[test]
+    fn the_number_of_connections_can_be_set_and_one_turns_the_extra_ones_off() {
+        let parsed = |n: &str| {
+            Args::try_parse_from([
+                "synology-fuse",
+                "--host",
+                "nas.example",
+                "-u",
+                "someone",
+                "--smb-connections",
+                n,
+                "/mnt/nas",
+            ])
+            .map(|a| a.smb_connections)
+        };
+        assert_eq!(parsed("1").expect("one is the session alone"), 1);
+        assert_eq!(parsed("8").expect("parses"), 8);
+        assert!(parsed("0").is_err(), "there is always at least the session");
     }
 
     /// `--umask 022` must mean 0o022. Parsed as decimal it would be 0o026,

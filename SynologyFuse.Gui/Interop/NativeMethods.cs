@@ -65,7 +65,7 @@ internal static partial class NativeMethods
         [MarshalAs(UnmanagedType.U1)] bool autoRelogin,
         [MarshalAs(UnmanagedType.U1)] bool verifySsl,
         string? domain, string? vpnProfile, string? vpnHost, string? vpnProfileRemote,
-        uint vpnMtu, out IntPtr outClient, ref NativeError err);
+        uint vpnMtu, uint smbConnections, out IntPtr outClient, ref NativeError err);
 
     /// <summary>Which leg the connection is using: 0 HTTP, 1 SMB through a
     /// tunnel, 2 SMB direct, -1 for a null handle. Settled at connect time.</summary>

@@ -7,9 +7,10 @@
 //! somewhere is here: `smoltcp`, an interface holding the address the server
 //! assigned us, and one TCP connection to one port on one host.
 //!
-//! Deliberately one connection. This tunnel exists to carry SMB to a NAS that
-//! terminates it; a general-purpose stack would be more code doing more than
-//! anyone asked for.
+//! One connection per stack. Several can share a tunnel — see [`crate::mux`],
+//! which hands each its own packets — but each is still its own interface and
+//! its own task, because a general-purpose stack would be more code doing more
+//! than anyone asked for.
 //!
 //! ## Why a task rather than a handle to poll
 //!
@@ -401,6 +402,10 @@ pub struct TunnelStream {
     progress: watch::Receiver<Progress>,
     /// What the layer below says about why it stopped, when it knows.
     cause: LinkFailure,
+    /// Whatever has to outlive this connection for it to keep working: the
+    /// shared link it runs on, which is let go of when the last connection
+    /// using it is.
+    _keep: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
     /// Waits in progress, because these are polled repeatedly and the wait has
     /// to survive between calls.
     ///
@@ -465,6 +470,23 @@ impl TunnelStream {
         patience: Duration,
         mtu: Mtu,
     ) -> Result<Self, Error> {
+        // An ephemeral source port. Anything unused will do; the far end only
+        // cares that it is consistent.
+        let port = 49152 + (rand::random::<u16>() % 16000);
+        Self::connect_from(outbound, inbound, ifconfig, remote, port, patience, mtu).await
+    }
+
+    /// [`connect`](Self::connect) from a source port the caller chose, which
+    /// is how connections sharing one link are told apart.
+    pub(crate) async fn connect_from(
+        outbound: mpsc::Sender<Vec<u8>>,
+        inbound: mpsc::Receiver<Vec<u8>>,
+        ifconfig: Ifconfig,
+        remote: (Ipv4Addr, u16),
+        local_port: u16,
+        patience: Duration,
+        mtu: Mtu,
+    ) -> Result<Self, Error> {
         // Both ends of the question "is the NAS even on our subnet?". The push
         // reply says what we were given; this says what we then dialled, and
         // the pair is what turns "nothing answered" into an answer.
@@ -504,9 +526,7 @@ impl TunnelStream {
             .connect(
                 interface.context(),
                 (IpAddress::Ipv4(remote.0), remote.1),
-                // An ephemeral source port. Anything unused will do; the far
-                // end only cares that it is consistent.
-                49152 + (rand::random::<u16>() % 16000),
+                local_port,
             )
             .map_err(|error| Error::Io(format!("connect: {error}")))?;
 
@@ -550,6 +570,7 @@ impl TunnelStream {
                 written: 0,
                 progress: watching,
                 cause,
+                _keep: None,
                 flushing: None,
                 shutting_down: None,
                 task,
@@ -583,6 +604,12 @@ impl TunnelStream {
     /// wrong end of the problem.
     pub fn explaining(mut self, cause: LinkFailure) -> Self {
         self.cause = cause;
+        self
+    }
+
+    /// Keep `what` alive for as long as this connection is.
+    pub(crate) fn holding(mut self, what: std::sync::Arc<dyn std::any::Any + Send + Sync>) -> Self {
+        self._keep = Some(what);
         self
     }
 

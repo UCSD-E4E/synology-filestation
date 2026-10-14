@@ -394,6 +394,28 @@
                              Minimum="0" Maximum="256" FormatString="0" />
             </Grid>
 
+            <!-- Loss on a home link caps each TCP connection rather than the
+                 link, so reads go over several. Through the VPN they share
+                 the one tunnel, so this costs no VPN logins. -->
+            <Grid Margin="0,0,0,6">
+              <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto" MinWidth="130" SharedSizeGroup="FormLabel" />
+                <ColumnDefinition Width="*" />
+              </Grid.ColumnDefinitions>
+              <TextBlock Grid.Column="0" Text="SMB connections" VerticalAlignment="Center" Margin="0,0,12,0" />
+              <StackPanel Grid.Column="1">
+                <NumericUpDown Value="{Binding SmbConnections}"
+                               Minimum="1" Maximum="16" Increment="1"
+                               FormatString="0" ParsingNumberStyle="Integer"
+                               PlaceholderText="default (4)" />
+                <TextBlock Text="How many connections to read files over. More is faster on a network that loses packets, such as many home connections. Leave empty for the default; 1 uses a single connection."
+                           TextWrapping="Wrap"
+                           FontSize="11"
+                           Opacity="0.7"
+                           Margin="0,2,0,0" />
+              </StackPanel>
+            </Grid>
+
             <!-- Log level -->
             <Grid Margin="0,0,0,6">
               <Grid.ColumnDefinitions>

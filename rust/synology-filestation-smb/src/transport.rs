@@ -6,9 +6,10 @@
 //! future selection layer (in core / the Python bindings) will prefer it and
 //! fall back to the throttled HTTP path when SMB is unavailable.
 //!
-//! All ops on one transport share a single SMB connection and are serialized
-//! behind a mutex — correct and simple. Concurrency across files would use a
-//! connection pool (future work).
+//! Operations share one session, and run concurrently on it: the lock covers
+//! only attaching a share, never a round trip. Block reads can also be spread
+//! over extra sessions — see [`crate::pool`] for why, and
+//! [`SmbTransport::with_read_connections`] to ask for it.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -33,6 +34,7 @@ use tokio::sync::Mutex;
 use crate::error::to_syno_error;
 use crate::handles::{HandleCache, MAX_CACHED_HANDLES};
 use crate::path::SmbPath;
+use crate::pool::{stripes, ConnectionFuture, Lane, Opener, Pool};
 
 /// Process-wide sequence making temp write names unique so concurrent writers
 /// to the same target don't clobber each other's `.part` file.
@@ -320,6 +322,102 @@ where
     )
     .await
     .map_err(|e| crate::error::session_error(&e))
+}
+
+/// Open one extra session to read over: a stream from `opener`, and a login on
+/// it through the refusal gate, as every session here is built.
+///
+/// A refused login is the transport's refusal too. It is the same account, and
+/// asking again on any connection is another strike.
+async fn open_lane(
+    opener: &Opener,
+    cfg: &std::sync::Mutex<SmbConfig>,
+    reconnect: &ReconnectState,
+) -> Result<Lane, SynoFsError> {
+    let (stream, host) = opener().await?;
+    let mut cfg = cfg.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    cfg.host = host;
+    match crate::probe::gated(
+        &cfg,
+        crate::probe::Route::Stream,
+        || reconnect.skipped_by_gate(),
+        || client_over(stream, &cfg),
+    )
+    .await
+    {
+        Ok(client) => Ok(Lane::new(client)),
+        Err(e) => {
+            if crate::error::is_refused_login(&e) {
+                reconnect.refuse(format!("{e} at {}", cfg.host));
+            }
+            Err(e)
+        }
+    }
+}
+
+/// How long closing a file on an extra connection may take before that
+/// connection is given up on. Well under the 30 s response deadline, because
+/// a write is waiting on it.
+const LANE_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long a retired connection is kept to close its handles as its reads
+/// finish, before whatever is left goes with the connection.
+const DRAIN_FOR: Duration = Duration::from_secs(60);
+
+/// Whether an extra connection that failed a piece should be let go of: its
+/// link is gone, or this session served the piece it could not — in which
+/// case the fault was the connection's, not the file's.
+fn should_retire(connection_lost: bool, main_served_it: bool) -> bool {
+    connection_lost || main_served_it
+}
+
+/// An open read handle for `logical` on an extra session, from its cache when
+/// one is there. The session is locked only to attach the share.
+async fn lane_reader(
+    lane: &Lane,
+    loc: &SmbPath,
+    logical: &str,
+) -> Result<Arc<FileReader>, smb2::Error> {
+    close_in(&lane.handles, lane.handles.take_free()).await;
+    if let Some(reader) = lane.handles.get(logical) {
+        return Ok(reader);
+    }
+    let (conn, tree) = {
+        let mut session = lane.session.lock().await;
+        let (client, trees) = &mut *session;
+        if !trees.contains_key(&loc.share) {
+            let tree = client.connect_share(&loc.share).await?;
+            trees.insert(loc.share.clone(), tree);
+        }
+        let tree = trees.get(&loc.share).expect("tree just ensured");
+        let conn = client.connection_for(tree).ok_or_else(|| {
+            smb2::Error::Io(std::io::Error::other(format!(
+                "no connection to the server holding {}",
+                loc.share
+            )))
+        })?;
+        (conn, tree.clone())
+    };
+    let opened = Arc::new(Arc::new(tree).open_file_reader(conn, &loc.path).await?);
+    let (reader, closing) = lane.handles.insert_or_existing(logical, opened);
+    close_in(&lane.handles, closing).await;
+    Ok(reader)
+}
+
+/// Close handles a cache has finished with, parking any that a read is still
+/// using — dropping one instead would leak the open file on the appliance
+/// until the session ends.
+async fn close_in(cache: &HandleCache<FileReader>, handles: Vec<Arc<FileReader>>) {
+    for handle in handles {
+        match Arc::try_unwrap(handle) {
+            Ok(reader) => {
+                if let Err(e) = reader.close().await {
+                    tracing::debug!(error = %e, "smb: closing a read handle");
+                }
+            }
+            Err(still_in_use) => cache.defer(still_in_use),
+        }
+    }
 }
 
 /// Carry a redial failure back as an `smb2::Error` so it flows through the
@@ -616,6 +714,10 @@ pub struct SmbTransport {
     /// the caller supplied. `None` for a transport that dialled its own
     /// address — `SmbClient::reconnect` redials that itself.
     redial: Option<Redialer>,
+    /// Extra sessions that serve block reads alongside this one. See
+    /// [`crate::pool`]; off unless asked for with
+    /// [`with_read_connections`](Self::with_read_connections).
+    pool: Arc<Pool>,
 }
 
 impl SmbTransport {
@@ -705,6 +807,7 @@ impl SmbTransport {
             handles: Arc::new(HandleCache::new(MAX_CACHED_HANDLES)),
             reconnect: Arc::new(reconnect),
             redial,
+            pool: Arc::new(Pool::off()),
         }
     }
 
@@ -718,6 +821,7 @@ impl SmbTransport {
             handles: Arc::clone(&self.handles),
             reconnect: Arc::clone(&self.reconnect),
             redial: self.redial.clone(),
+            pool: Arc::clone(&self.pool),
         }
     }
 
@@ -772,6 +876,83 @@ impl SmbTransport {
     /// transport builds no session again: see [`adopt`](Self::adopt).
     pub fn refused(&self) -> Option<String> {
         self.reconnect.refused()
+    }
+
+    /// Read over `total` connections rather than one: this session and up to
+    /// `total - 1` more, each a session of its own on a stream `open` opens.
+    /// `total` of 0 or 1 reads on this session alone, which is the default.
+    ///
+    /// The extra sessions serve block reads ([`read`](Self::read)) and nothing
+    /// else. They are opened in the background, one at a time, and only while
+    /// this session is live — so only with credentials the server has already
+    /// accepted, and never on behalf of a transport that has no session. Each
+    /// login goes through the same refusal gate as this one, and a refusal
+    /// stops them all. One that dies is let go of, and its reads go to this
+    /// session.
+    ///
+    /// `open` says where to: a stream to the server and the name it goes by on
+    /// it. That is a fresh connection directly, or another connection through
+    /// the tunnel already up.
+    pub fn with_read_connections<F>(self, total: usize, open: F) -> Self
+    where
+        F: Fn() -> ConnectionFuture + Send + Sync + 'static,
+    {
+        let opener: Opener = Arc::new(open);
+        Self {
+            pool: Arc::new(Pool::with(total.saturating_sub(1), Some(opener))),
+            ..self
+        }
+    }
+
+    /// How many connections block reads are spread over now: none without a
+    /// live session, otherwise this one and every extra one that is up.
+    pub fn read_connections(&self) -> usize {
+        if !self.reconnect.is_live() {
+            return 0;
+        }
+        1 + self.pool.live().len()
+    }
+
+    /// The extra connections to read over now, asking for more in the
+    /// background if more are wanted. None unless this session is live.
+    fn lanes_for_reading(&self) -> Vec<Arc<Lane>> {
+        if !self.reconnect.is_live() || self.reconnect.refused().is_some() {
+            return Vec::new();
+        }
+        self.open_more_lanes();
+        self.pool.live()
+    }
+
+    /// Start opening the extra connections still wanted, if it is time to.
+    fn open_more_lanes(&self) {
+        let Some((opener, generation)) = self.pool.should_open() else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            self.pool.opened(false);
+            return;
+        };
+        let pool = Arc::clone(&self.pool);
+        let reconnect = Arc::clone(&self.reconnect);
+        let cfg = Arc::clone(&self.cfg);
+        runtime.spawn(async move {
+            let mut failed = false;
+            while pool.wants(generation) && reconnect.is_live() && reconnect.refused().is_none() {
+                match open_lane(&opener, &cfg, &reconnect).await {
+                    Ok(lane) => {
+                        if !pool.add(lane, generation) {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!("SMB: could not open another connection to read over: {e}");
+                        failed = true;
+                        break;
+                    }
+                }
+            }
+            pool.opened(failed);
+        });
     }
 
     /// Build a session on `stream` and make it the one every later operation
@@ -830,6 +1011,8 @@ impl SmbTransport {
             inner.trees.clear();
             *self.cfg.lock().unwrap_or_else(|e| e.into_inner()) = cfg;
             self.reconnect.settled();
+            // And the extra connections were on the old leg.
+            self.retire_lanes();
             (self.handles.clear(), previous)
         };
         // Outside the lock: closing is a round trip on the old session, and
@@ -1024,6 +1207,7 @@ impl SmbTransport {
                 // so there is nothing left to close them against.
                 trees.clear();
                 drop(self.handles.clear());
+                self.retire_lanes();
             }
             Ok(false) => {}
             // Refused: this operation, and every one after it, goes to HTTP.
@@ -1182,31 +1366,22 @@ impl SmbTransport {
 
         let (conn, tree) = self.attached(&loc.share).await?;
 
-        let reader = Arc::new(
+        let opened = Arc::new(
             std::sync::Arc::new(tree)
                 .open_file_reader(conn, &loc.path)
                 .await
                 .map_err(|e| self.mark_and_map(&e))?,
         );
-        let displaced = self.handles.insert(logical, reader.clone());
-        self.close_handles(displaced).await;
+        // Another read may have opened the file meanwhile; see
+        // `insert_or_existing` for which handle wins.
+        let (reader, closing) = self.handles.insert_or_existing(logical, opened);
+        self.close_handles(closing).await;
         Ok(reader)
     }
 
-    /// Close handles the cache has finished with, parking any that a read is
-    /// still using — dropping one instead would leak the open file on the
-    /// appliance until the session ends.
+    /// Close handles this session's cache has finished with. See [`close_in`].
     async fn close_handles(&self, handles: Vec<Arc<FileReader>>) {
-        for handle in handles {
-            match Arc::try_unwrap(handle) {
-                Ok(reader) => {
-                    if let Err(e) = reader.close().await {
-                        tracing::debug!(error = %e, "smb: closing a read handle");
-                    }
-                }
-                Err(still_in_use) => self.handles.defer(still_in_use),
-            }
-        }
+        close_in(&self.handles, handles).await;
     }
 
     /// Close whatever was parked earlier and has since come free.
@@ -1217,24 +1392,125 @@ impl SmbTransport {
         }
     }
 
-    /// Forget the handle for one path, closing it.
+    /// Forget the handle for one path, closing it — on every connection that
+    /// reads, since each holds its own.
     async fn forget_handle(&self, logical: &str) {
-        let dropped = self.handles.invalidate(logical);
+        // Parked handles too, once their reads are done: one parked because
+        // it was evicted mid-read is still an open file, and a write that
+        // follows would find it.
+        let mut dropped = self.handles.invalidate(logical);
+        dropped.extend(self.handles.take_free());
         self.close_handles(dropped).await;
+        self.forget_on_lanes(|cache| cache.invalidate(logical))
+            .await;
     }
 
-    /// Forget every handle at or under `logical`.
+    /// Forget every handle at or under `logical`, on every connection.
     async fn forget_handles_under(&self, logical: &str) {
-        let dropped = self.handles.invalidate_prefix(logical);
+        let mut dropped = self.handles.invalidate_prefix(logical);
+        dropped.extend(self.handles.take_free());
         self.close_handles(dropped).await;
+        self.forget_on_lanes(|cache| cache.invalidate_prefix(logical))
+            .await;
+    }
+
+    /// Close what `take` takes from each extra connection's handles — the
+    /// draining ones too, whose reads may still hold a file open — all at
+    /// once, and each within [`LANE_CLOSE_TIMEOUT`].
+    ///
+    /// The write or rename waiting on this is on the main session, which is
+    /// fine. One extra connection gone quiet on a lossy link would otherwise
+    /// hold it for the response deadline, 30 s, and they used to be closed
+    /// one after another. A connection that will not close a file in that
+    /// time is let go of.
+    async fn forget_on_lanes<F>(&self, take: F)
+    where
+        F: Fn(&HandleCache<FileReader>) -> Vec<Arc<FileReader>>,
+    {
+        let closes = self.pool.all().into_iter().map(|lane| {
+            let mut dropped = take(&lane.handles);
+            dropped.extend(lane.handles.take_free());
+            async move {
+                let closed =
+                    tokio::time::timeout(LANE_CLOSE_TIMEOUT, close_in(&lane.handles, dropped))
+                        .await
+                        .is_ok();
+                (lane, closed)
+            }
+        });
+        for (lane, closed) in futures_util::future::join_all(closes).await {
+            if !closed {
+                tracing::debug!(
+                    "SMB: a connection to read over would not close a file in time; \
+                     letting it go"
+                );
+                self.retire_lane(&lane);
+            }
+        }
+    }
+
+    /// Stop reading over one extra connection, and close what it has open
+    /// once its reads are done.
+    fn retire_lane(&self, lane: &Arc<Lane>) {
+        if self.pool.retire(lane) {
+            self.drain_lane(Arc::clone(lane));
+        }
+    }
+
+    /// Let go of every extra connection, closing what they have open once
+    /// their reads are done.
+    fn retire_lanes(&self) {
+        for lane in self.pool.retire_all() {
+            self.drain_lane(lane);
+        }
+    }
+
+    /// Close a retired connection's handles in the background as their reads
+    /// finish, then forget it.
+    ///
+    /// Until then it stays where invalidation can find it: a read in flight
+    /// on it still holds a file open, and a rename that met that file would
+    /// fail with a sharing violation from a handle nothing was tracking.
+    /// Dropping the handles instead left them open on the NAS for as long as
+    /// any read kept the connection alive.
+    fn drain_lane(&self, lane: Arc<Lane>) {
+        let pool = Arc::clone(&self.pool);
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            drop(lane.handles.clear());
+            pool.drained(&lane);
+            return;
+        };
+        runtime.spawn(async move {
+            let until = tokio::time::Instant::now() + DRAIN_FOR;
+            let mut closing = lane.handles.clear();
+            loop {
+                let _ = tokio::time::timeout(LANE_CLOSE_TIMEOUT, close_in(&lane.handles, closing))
+                    .await;
+                if lane.handles.is_empty() || tokio::time::Instant::now() >= until {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                closing = lane.handles.take_free();
+            }
+            // Whatever is left goes with the connection, when the last read
+            // on it lets go.
+            drop(lane.handles.clear());
+            pool.drained(&lane);
+        });
     }
 
     /// Read `length` bytes at `offset`.
     ///
-    /// One SMB2 READ on a handle that stays open between calls, with no lock
-    /// held while it is in flight. This used to be a CREATE, a READ and a
-    /// CLOSE, all three serialised behind the transport mutex — three round
-    /// trips per 256 KiB block, one block at a time, for the whole mount.
+    /// One SMB2 READ per piece on handles that stay open between calls, with
+    /// no lock held while they are in flight. This used to be a CREATE, a READ
+    /// and a CLOSE, all three serialised behind the transport mutex — three
+    /// round trips per 256 KiB block, one block at a time, for the whole mount.
+    ///
+    /// With extra connections up (see
+    /// [`with_read_connections`](Self::with_read_connections)) the read is cut
+    /// into stripes dealt across all of them and put back together in order.
+    /// A piece whose connection fails is read again on this session, so a
+    /// dying extra connection costs a retry, not an error.
     pub async fn read(
         &self,
         logical: &str,
@@ -1245,7 +1521,102 @@ impl SmbTransport {
             return self.read_full(logical).await;
         }
         let loc = SmbPath::from_logical(logical)?;
-        let reader = self.reader_for(&loc, logical).await?;
+        let lanes = self.lanes_for_reading();
+        let pieces = stripes(offset, length, lanes.len() + 1);
+        // One piece, the commonest case: a block read. Its bytes are the
+        // answer as they are, with nothing to join.
+        if let [only] = pieces.as_slice() {
+            return match only.connection.checked_sub(1) {
+                None => self.read_on_main(&loc, logical, offset, length).await,
+                Some(n) => {
+                    self.read_on_lane(&lanes[n], &loc, logical, offset, length)
+                        .await
+                }
+            };
+        }
+        let reads = pieces.iter().map(|piece| {
+            let lane = piece.connection.checked_sub(1).map(|n| &lanes[n]);
+            let loc = &loc;
+            async move {
+                match lane {
+                    None => {
+                        self.read_on_main(loc, logical, piece.offset, piece.length)
+                            .await
+                    }
+                    Some(lane) => {
+                        self.read_on_lane(lane, loc, logical, piece.offset, piece.length)
+                            .await
+                    }
+                }
+            }
+        });
+        let parts = futures_util::future::try_join_all(reads).await?;
+
+        let mut out = bytes::BytesMut::with_capacity(parts.iter().map(Bytes::len).sum());
+        for (part, piece) in parts.iter().zip(&pieces) {
+            out.extend_from_slice(part);
+            // Short means the file ends here — this session's word on it, as
+            // `read_on_lane` sees to. Anything after was asked of a file that
+            // is not that long.
+            if (part.len() as u64) < piece.length {
+                break;
+            }
+        }
+        Ok(out.freeze())
+    }
+
+    /// One piece of a read, on an extra connection — or on this session if
+    /// that connection cannot serve it.
+    async fn read_on_lane(
+        &self,
+        lane: &Arc<Lane>,
+        loc: &SmbPath,
+        logical: &str,
+        offset: u64,
+        length: u64,
+    ) -> Result<Bytes, SynoFsError> {
+        let read = async {
+            let reader = lane_reader(lane, loc, logical).await?;
+            reader.read_at(offset, length).await
+        };
+        match read.await {
+            Ok(data) if data.len() as u64 == length => Ok(Bytes::from(data)),
+            // Short: the end of the file as this connection's handle saw it
+            // when it was opened, which may be older than the file — one that
+            // grew by a route that does not invalidate, DSM's own API say.
+            // The pieces are joined up to the first short one, so a stale
+            // end here would cut the whole read off without an error. This
+            // session has the last word on where the file ends, and the
+            // handle is reopened next time.
+            Ok(_) => {
+                let dropped = lane.handles.invalidate(logical);
+                close_in(&lane.handles, dropped).await;
+                self.read_on_main(loc, logical, offset, length).await
+            }
+            Err(e) => {
+                let dropped = lane.handles.invalidate(logical);
+                close_in(&lane.handles, dropped).await;
+                // This session gives the answer that counts: the bytes, or
+                // the error the caller should see.
+                let answer = self.read_on_main(loc, logical, offset, length).await;
+                if should_retire(is_connection_lost(e.kind()), answer.is_ok()) {
+                    tracing::debug!("SMB: letting go of a connection to read over ({e})");
+                    self.retire_lane(lane);
+                }
+                answer
+            }
+        }
+    }
+
+    /// One piece of a read, on this session.
+    async fn read_on_main(
+        &self,
+        loc: &SmbPath,
+        logical: &str,
+        offset: u64,
+        length: u64,
+    ) -> Result<Bytes, SynoFsError> {
+        let reader = self.reader_for(loc, logical).await?;
         match reader.read_at(offset, length).await {
             Ok(data) => Ok(Bytes::from(data)),
             Err(e) => {
@@ -1536,6 +1907,7 @@ impl StreamReadTransport for SmbTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pool::STRIPE;
 
     #[test]
     fn only_a_dfs_referral_sends_an_unlocked_operation_back_through_the_client() {
@@ -1830,6 +2202,117 @@ mod tests {
                 "{what}: {e:?}"
             );
         }
+    }
+
+    // ── Reading over several connections ────────────────────────────────────
+
+    const KIB: u64 = 1024;
+
+    /// The pieces of one read, as (offset, length, connection).
+    fn planned(offset: u64, length: u64, connections: usize) -> Vec<(u64, u64, usize)> {
+        stripes(offset, length, connections)
+            .into_iter()
+            .map(|p| (p.offset, p.length, p.connection))
+            .collect()
+    }
+
+    /// Regression: an extra connection was let go of only when its link was
+    /// lost. One broken any other way — its tree disconnected after a share
+    /// change, say — failed every stripe dealt to it for the life of the
+    /// mount, each failure a wasted round trip and a re-read, so reading was
+    /// slower than on one connection. If this session serves the piece the
+    /// extra one could not, the extra one is what failed.
+    #[test]
+    fn an_extra_connection_is_let_go_of_when_it_is_the_one_at_fault() {
+        assert!(should_retire(true, false), "its link is gone");
+        assert!(should_retire(true, true));
+        assert!(
+            should_retire(false, true),
+            "it failed where this session did not"
+        );
+        assert!(
+            !should_retire(false, false),
+            "both failed: the file's problem, not the connection's"
+        );
+    }
+
+    #[test]
+    fn one_connection_reads_in_one_piece() {
+        assert_eq!(planned(0, 4096 * KIB, 1), vec![(0, 4096 * KIB, 0)]);
+    }
+
+    #[test]
+    fn a_read_within_one_stripe_is_one_piece_on_that_stripes_connection() {
+        // Block reads arrive one stripe at a time, so consecutive blocks have
+        // to land on different connections for a sequential reader to use
+        // them all.
+        assert_eq!(planned(0, STRIPE, 4), vec![(0, STRIPE, 0)]);
+        assert_eq!(planned(STRIPE, STRIPE, 4), vec![(STRIPE, STRIPE, 1)]);
+        assert_eq!(
+            planned(5 * STRIPE + 10, 100, 4),
+            vec![(5 * STRIPE + 10, 100, 1)]
+        );
+    }
+
+    #[test]
+    fn a_long_read_is_cut_at_stripe_boundaries_and_dealt_round_robin() {
+        let s = STRIPE;
+        assert_eq!(
+            planned(s / 2, 3 * s, 2),
+            vec![
+                (s / 2, s / 2, 0),
+                (s, s, 1),
+                (2 * s, s, 0),
+                (3 * s, s / 2, 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_pieces_cover_the_read_exactly_once_in_order() {
+        for (offset, length, connections) in
+            [(0, 1, 4), (7, 10 * STRIPE + 3, 3), (STRIPE - 1, 2, 4)]
+        {
+            let pieces = planned(offset, length, connections);
+            let mut at = offset;
+            for (start, len, connection) in &pieces {
+                assert_eq!(*start, at, "contiguous");
+                assert!(*len > 0 && *len <= STRIPE);
+                assert!(*connection < connections);
+                at += len;
+            }
+            assert_eq!(at, offset + length, "and nothing past the end");
+        }
+    }
+
+    fn a_counting_opener(
+        opened: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> impl Fn() -> ConnectionFuture + Send + Sync + 'static {
+        move || {
+            opened.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Err(SynoFsError::Io("not in this test".into())) })
+        }
+    }
+
+    /// Extra connections follow the session: with none, and so nothing
+    /// proven about the credentials, none are opened. Each one is a login,
+    /// and a login that has not been seen to work is a possible strike.
+    #[tokio::test]
+    async fn a_transport_with_no_session_opens_no_extra_connections() {
+        let opened = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let smb = SmbTransport::unconnected(&a_config(), never_redialled())
+            .with_read_connections(4, a_counting_opener(opened.clone()));
+
+        let e = ReadTransport::read(&smb, "/share/f", 0, 10)
+            .await
+            .expect_err("no session to read on");
+        assert_eq!(
+            e.category(),
+            synology_filestation_core::error::ErrorCategory::NotSupported
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(opened.load(Ordering::SeqCst), 0, "nothing was dialled");
+        assert_eq!(smb.read_connections(), 0);
     }
 
     #[test]
