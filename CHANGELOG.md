@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.12.0](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-fuse-v0.11.0...synology-filestation-fuse-v0.12.0) (2026-10-14)
+
+
+### Features
+
+* **connect:** reuse the tunnel that is already up ([40a2a6c](https://github.com/UCSD-E4E/synology-filestation/commit/40a2a6c8fc38cd1cb225b0f44b43df06d218263b))
+* **fuse:** read ahead per SMB connection ([b8bacd9](https://github.com/UCSD-E4E/synology-filestation/commit/b8bacd927055c485a8d564f2ccd0de03ffa5736a))
+* **fuse:** read over four SMB connections ([f409ff3](https://github.com/UCSD-E4E/synology-filestation/commit/f409ff332b8297bb16c8dcc11982be46fa848eeb))
+* **gui:** set how many SMB connections a mount reads over ([fa469f0](https://github.com/UCSD-E4E/synology-filestation/commit/fa469f09d46188c7d47625787a5a3dcf9c95e1d5))
+* let the VPN tunnel's MTU be set ([971a2c1](https://github.com/UCSD-E4E/synology-filestation/commit/971a2c18f351ce1b3879a803c612884c073d5ab8))
+* move files and folders on the NAS instead of copying them ([995190d](https://github.com/UCSD-E4E/synology-filestation/commit/995190df7467c1151d4f0eb17f1968d708d7af7c))
+* **openvpn:** carry several TCP connections over one tunnel ([5868436](https://github.com/UCSD-E4E/synology-filestation/commit/586843638dc08072e5357a1e78e69a6519c6a7ff))
+* **smb:** spread block reads over several connections ([757a3e8](https://github.com/UCSD-E4E/synology-filestation/commit/757a3e8a4a908b6c4b1ea447d0b9c5a6741308c8))
+
+
+### Bug Fixes
+
+* move only what rename(2) would replace, and settle the review of [#319](https://github.com/UCSD-E4E/synology-filestation/issues/319) ([e5e7e7c](https://github.com/UCSD-E4E/synology-filestation/commit/e5e7e7c3e944e1fbc7c6e9168727801c9886a8ec))
+* settle the review of per-connection read-ahead ([36fc67c](https://github.com/UCSD-E4E/synology-filestation/commit/36fc67ce3b7477df3311bf019db26aa8907fd3be))
+* settle the review of the read pool ([e3a549d](https://github.com/UCSD-E4E/synology-filestation/commit/e3a549d5052ef03c1d07443f3eb0b2eedc879035))
+* **smb:** let a write replace a file that concurrent reads just opened ([757a3e8](https://github.com/UCSD-E4E/synology-filestation/commit/757a3e8a4a908b6c4b1ea447d0b9c5a6741308c8))
+
 ## [0.11.0](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-fuse-v0.10.0...synology-filestation-fuse-v0.11.0) (2026-10-12)
 
 
