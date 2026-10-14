@@ -84,13 +84,18 @@ fn spawn_nas(mut server: FakeServer, socket: tokio::net::UdpSocket) -> Noticed {
             let _ = addresses.push(IpCidr::new(IpAddress::Ipv4(NAS.0), 24));
         });
 
-        let mut listener = tcp::Socket::new(
-            tcp::SocketBuffer::new(vec![0u8; 16 * 1024]),
-            tcp::SocketBuffer::new(vec![0u8; 16 * 1024]),
-        );
-        listener.listen(NAS.1).expect("a free port");
+        // A few listeners, so more than one connection can share the tunnel.
         let mut sockets = SocketSet::new(Vec::new());
-        let handle = sockets.add(listener);
+        let handles: Vec<_> = (0..3)
+            .map(|_| {
+                let mut listener = tcp::Socket::new(
+                    tcp::SocketBuffer::new(vec![0u8; 16 * 1024]),
+                    tcp::SocketBuffer::new(vec![0u8; 16 * 1024]),
+                );
+                listener.listen(NAS.1).expect("a free port");
+                sockets.add(listener)
+            })
+            .collect();
 
         let mut client: Option<SocketAddr> = None;
         let mut datagram = vec![0u8; 4096];
@@ -137,25 +142,27 @@ fn spawn_nas(mut server: FakeServer, socket: tokio::net::UdpSocket) -> Noticed {
             // `send_slice` accepted drops the remainder on the floor, which
             // quietly turns a conversation larger than one buffer into a
             // conversation the size of one buffer.
-            let listening = sockets.get_mut::<tcp::Socket>(handle);
-            let mut buffer = [0u8; 4096];
-            while listening.can_recv() && listening.can_send() {
-                let room = listening
-                    .send_capacity()
-                    .saturating_sub(listening.send_queue())
-                    .min(buffer.len());
-                if room == 0 {
-                    break;
-                }
-                match listening.recv_slice(&mut buffer[..room]) {
-                    Ok(0) | Err(_) => break,
-                    Ok(len) => {
-                        let answer: Vec<u8> = buffer[..len]
-                            .iter()
-                            .map(|byte| byte.to_ascii_uppercase())
-                            .collect();
-                        let sent = listening.send_slice(&answer).unwrap_or(0);
-                        assert_eq!(sent, answer.len(), "there was room, and it was taken");
+            for handle in &handles {
+                let listening = sockets.get_mut::<tcp::Socket>(*handle);
+                let mut buffer = [0u8; 4096];
+                while listening.can_recv() && listening.can_send() {
+                    let room = listening
+                        .send_capacity()
+                        .saturating_sub(listening.send_queue())
+                        .min(buffer.len());
+                    if room == 0 {
+                        break;
+                    }
+                    match listening.recv_slice(&mut buffer[..room]) {
+                        Ok(0) | Err(_) => break,
+                        Ok(len) => {
+                            let answer: Vec<u8> = buffer[..len]
+                                .iter()
+                                .map(|byte| byte.to_ascii_uppercase())
+                                .collect();
+                            let sent = listening.send_slice(&answer).unwrap_or(0);
+                            assert_eq!(sent, answer.len(), "there was room, and it was taken");
+                        }
                     }
                 }
             }
@@ -334,5 +341,49 @@ async fn a_net30_tunnel_can_still_reach_the_nas() {
         .expect("read");
 
     assert_eq!(heard, expected, "the bytes came back, so they arrived");
+    assert_eq!(noticed.undecryptable.load(Relaxed), 0);
+}
+
+#[tokio::test]
+async fn several_connections_share_one_tunnel() {
+    // One VPN login, one session on the NAS, and as many TCP connections over
+    // it as a mount wants: loss caps each connection, not the link.
+    let server = FakeServer::with_peer_id(Answer::KeyMaterialThen(PUSH.to_string()), PEER_ID);
+    let mut config = SessionConfig::new(
+        server.ca_pem.clone(),
+        "localhost",
+        StaticKey::from_hex(TA_KEY_HEX).expect("test vector"),
+    );
+    config.tls_timeout = Duration::from_millis(100);
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("a local socket");
+    let remote: SocketAddr = socket.local_addr().expect("bound");
+    let noticed = spawn_nas(server, socket);
+
+    let tunnel = Tunnel::connect(config, remote).await.expect("a tunnel");
+    let shared = tunnel.share().expect("a tunnel that pushed an address");
+    let mut first = shared
+        .connect(NAS, Duration::from_secs(20))
+        .await
+        .expect("the first connection");
+    let mut second = shared
+        .connect(NAS, Duration::from_secs(20))
+        .await
+        .expect("a second, over the same tunnel");
+
+    for (stream, said) in [(&mut first, &b"first"[..]), (&mut second, b"second")] {
+        stream.write_all(said).await.expect("written");
+        let mut heard = vec![0u8; said.len()];
+        tokio::time::timeout(Duration::from_secs(20), stream.read_exact(&mut heard))
+            .await
+            .expect("in reasonable time")
+            .expect("read");
+        assert_eq!(
+            heard,
+            said.to_ascii_uppercase(),
+            "each heard its own answer"
+        );
+    }
     assert_eq!(noticed.undecryptable.load(Relaxed), 0);
 }
