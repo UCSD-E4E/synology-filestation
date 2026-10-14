@@ -166,6 +166,11 @@ impl ReadAhead {
 /// Eight parallel opens used to mean ~160 simultaneous requests against
 /// `synoscgi`, the shared CGI backend the whole appliance runs on.
 ///
+/// Per connection reads go over: four SMB connections get four times this,
+/// since on a lossy link each needs its share in flight to be worth having —
+/// measured off campus, four connections ran at 2.8 MB/s on one connection's
+/// budget and 4.4 on four. On HTTP it stays this.
+///
 /// Counted in blocks rather than in requests, which is what it used to be.
 /// That was the same thing when a speculative task fetched one block, but
 /// coalescing made a task a run of up to [`MAX_PREFETCH_SPAN`] blocks and
@@ -177,6 +182,75 @@ impl ReadAhead {
 /// satisfied by an empty budget and no run can wait on permits it will never
 /// get.
 pub(super) const MAX_INFLIGHT_PREFETCH_BLOCKS: usize = 32;
+
+/// The speculative blocks on the wire, mount-wide, claimed against a limit the
+/// caller names each time: [`MAX_INFLIGHT_PREFETCH_BLOCKS`] for each
+/// connection reads go over now.
+///
+/// A counter, not a semaphore, because the limit moves with the connections.
+/// It used to be a semaphore sized for 64 connections plus a separate check
+/// of how many permits were out, and a check and a claim in two steps let
+/// every thread that checked before any claimed go past the limit together.
+/// Here the claim *is* the check.
+#[derive(Default)]
+pub(super) struct Budget {
+    in_flight: std::sync::atomic::AtomicUsize,
+}
+
+/// Blocks claimed from a [`Budget`], given back when this is dropped — so an
+/// aborted download returns its share with its claims.
+pub(super) struct Claim {
+    budget: std::sync::Arc<Budget>,
+    blocks: usize,
+}
+
+impl Budget {
+    pub(super) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Claim `blocks`, if that keeps what is in flight within `limit`.
+    pub(super) fn try_claim(
+        self: &std::sync::Arc<Self>,
+        blocks: usize,
+        limit: usize,
+    ) -> Option<Claim> {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.in_flight
+            .fetch_update(SeqCst, SeqCst, |now| {
+                now.checked_add(blocks).filter(|&after| after <= limit)
+            })
+            .ok()?;
+        Some(Claim {
+            budget: self.clone(),
+            blocks,
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn in_flight(&self) -> usize {
+        self.in_flight.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        self.budget
+            .in_flight
+            .fetch_sub(self.blocks, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// How far a streaming reader may read ahead: `depth` blocks for each of the
+/// `connections` reads go over, but never more than half of a read cache of
+/// `cache_blocks` — a window wider than the cache evicts its own blocks before
+/// the reader reaches them. The clamp never cuts below `depth` itself, which
+/// is what the caller asked for.
+pub(super) fn streaming_depth(depth: u64, connections: usize, cache_blocks: u64) -> u64 {
+    depth
+        .saturating_mul(connections as u64)
+        .min(depth.max(cache_blocks / 2))
+}
 
 /// Releases a block's in-flight claim unless the download published it.
 ///
@@ -220,6 +294,88 @@ impl Drop for InflightGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── The in-flight budget ─────────────────────────────────────────────────
+
+    #[test]
+    fn a_claim_within_the_limit_is_granted_and_given_back_when_dropped() {
+        let budget = std::sync::Arc::new(Budget::new());
+        let a = budget.try_claim(20, 32).expect("20 of 32");
+        assert!(budget.try_claim(13, 32).is_none(), "33 would be over");
+        let b = budget.try_claim(12, 32).expect("exactly 32");
+        drop(a);
+        assert!(budget.try_claim(20, 32).is_some(), "20 came back");
+        drop(b);
+        assert_eq!(budget.in_flight(), 0);
+    }
+
+    /// The limit is asked of the claim, not fixed at construction, so it can
+    /// follow the number of connections reads go over.
+    #[test]
+    fn the_limit_is_the_one_asked_for_now() {
+        let budget = std::sync::Arc::new(Budget::new());
+        let _held = budget.try_claim(32, 128).expect("four connections' worth");
+        assert!(
+            budget.try_claim(1, 32).is_none(),
+            "down to one connection: nothing more until it drains"
+        );
+    }
+
+    /// Regression: the check and the claim were two steps, so every thread
+    /// that read the count before any claimed went past the limit together.
+    #[test]
+    fn claims_racing_from_many_threads_never_exceed_the_limit() {
+        let budget = std::sync::Arc::new(Budget::new());
+        let peak = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let threads: Vec<_> = (0..16)
+            .map(|_| {
+                let budget = budget.clone();
+                let peak = peak.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..2000 {
+                        if let Some(claim) = budget.try_claim(16, 32) {
+                            peak.fetch_max(budget.in_flight(), std::sync::atomic::Ordering::SeqCst);
+                            drop(claim);
+                        }
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().expect("ran");
+        }
+        assert!(peak.load(std::sync::atomic::Ordering::SeqCst) <= 32);
+        assert_eq!(budget.in_flight(), 0);
+    }
+
+    // ── How far a streaming reader reads ahead ──────────────────────────────
+
+    #[test]
+    fn the_depth_is_per_connection() {
+        assert_eq!(streaming_depth(16, 1, 1024), 16);
+        assert_eq!(streaming_depth(16, 4, 1024), 64);
+    }
+
+    /// Regression: a window wider than the read cache evicts its own blocks
+    /// before the reader gets to them. Half the cache is the most it takes.
+    #[test]
+    fn the_depth_never_outgrows_half_the_read_cache() {
+        assert_eq!(streaming_depth(256, 8, 1024), 512);
+        assert_eq!(streaming_depth(64, 8, 256), 128);
+    }
+
+    /// What the caller asked for, though, is not cut: a depth set above half
+    /// a small cache on one connection is a choice already made.
+    #[test]
+    fn the_clamp_never_cuts_below_the_depth_asked_for() {
+        assert_eq!(streaming_depth(64, 4, 64), 64);
+    }
+
+    #[test]
+    fn an_absurd_depth_or_count_saturates_rather_than_overflowing() {
+        assert_eq!(streaming_depth(u64::MAX, usize::MAX, 1024), u64::MAX);
+        assert_eq!(streaming_depth(0, 8, 1024), 0, "off stays off");
+    }
 
     // ── container sniffing ────────────────────────────────────────────────
 

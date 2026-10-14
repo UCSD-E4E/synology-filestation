@@ -305,6 +305,8 @@ pub struct ReadCache {
     /// the same block, and to wake whoever is waiting the moment it lands.
     in_flight: std::sync::Mutex<HashMap<(u64, u64), Arc<BlockSlot>>>,
     pub block_size: u64,
+    /// How many blocks it holds at most.
+    max_blocks: u64,
 }
 
 impl ReadCache {
@@ -319,7 +321,13 @@ impl ReadCache {
             ino_blocks: RwLock::new(HashMap::new()),
             in_flight: std::sync::Mutex::new(HashMap::new()),
             block_size,
+            max_blocks,
         }
+    }
+
+    /// How many blocks the cache holds at most.
+    pub fn capacity_blocks(&self) -> u64 {
+        self.max_blocks
     }
 
     pub fn get(&self, ino: u64, block_idx: u64) -> Option<Bytes> {

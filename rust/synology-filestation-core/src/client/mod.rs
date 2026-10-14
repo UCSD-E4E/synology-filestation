@@ -329,6 +329,20 @@ impl SynologyClient {
         self
     }
 
+    /// Whether reads are going to the backends injected with
+    /// [`with_read_transport`](Self::with_read_transport): no breaker on them
+    /// has tripped. Once one has, reads it would have served go to the HTTP
+    /// Download API until it recovers.
+    ///
+    /// For a caller that sizes its load by the backend: a mount reading ahead
+    /// over several SMB connections must not read ahead as far once its reads
+    /// land on `synoscgi`. Cheap, and never touches the network.
+    pub fn read_backends_healthy(&self) -> bool {
+        self.read_transports
+            .iter()
+            .all(|entry| entry.breaker.lock().unwrap().is_closed())
+    }
+
     /// Inject a [`WriteTransport`] backend. `upload` will prefer it over the
     /// HTTP Upload API when healthy, falling back to HTTP on transport failures.
     /// The backend's `write` must be atomic so fallback is safe.

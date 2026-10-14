@@ -206,3 +206,36 @@ async fn upload_passes_over_a_backend_that_declines() {
     }
     assert_eq!(backend.call_count(), 3, "asked every time, never tripped");
 }
+
+/// What a mount reading ahead over several SMB connections needs to know:
+/// whether its reads are still going to that backend. Once the breaker has
+/// tripped they go to HTTP, where read-ahead must not be widened — its budget
+/// is what keeps the mount from flooding `synoscgi`.
+#[tokio::test]
+async fn whether_reads_go_to_their_backend_follows_its_breaker() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/webapi/entry.cgi"))
+        .and(query_param("method", "download"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"from-http".to_vec()))
+        .mount(&server)
+        .await;
+
+    let healthy = offline_client().with_read_transport(FakeBackend::new(Behave::Ok(b"smb")));
+    assert!(healthy.read_backends_healthy());
+    healthy.download("/share/f", 0, 0).await.unwrap();
+    assert!(
+        healthy.read_backends_healthy(),
+        "a read it served keeps it so"
+    );
+
+    let failing = client_for(&server).with_read_transport(FakeBackend::new(Behave::Transient));
+    assert!(failing.read_backends_healthy(), "nothing has failed yet");
+    for _ in 0..2 {
+        failing.download("/share/f", 0, 0).await.unwrap();
+    }
+    assert!(
+        !failing.read_backends_healthy(),
+        "two failures trip the breaker, and reads now go to HTTP"
+    );
+}

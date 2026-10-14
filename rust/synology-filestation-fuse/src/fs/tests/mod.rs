@@ -46,6 +46,17 @@ fn fixture_with_prefetch(depth: u64) -> Fixture {
     fixture_with(depth, 30)
 }
 
+/// A fixture whose reads go over `connections` connections.
+fn fixture_reading_over(connections: usize) -> Fixture {
+    fixture_with_prefetch_over(DEFAULT_PREFETCH_BLOCKS, connections)
+}
+
+fn fixture_with_prefetch_over(depth: u64, connections: usize) -> Fixture {
+    let mut f = fixture_with(depth, 30);
+    f.fs = f.fs.reading_over(Arc::new(move || connections));
+    f
+}
+
 /// `dir_ttl` is `--cache-ttl` for listings; `0` switches their cache off.
 fn fixture_with(depth: u64, dir_ttl: u64) -> Fixture {
     let rt = tokio::runtime::Runtime::new().unwrap();
