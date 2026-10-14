@@ -29,12 +29,14 @@ pub mod error;
 pub mod framing;
 mod handles;
 pub mod path;
+mod pool;
 pub mod probe;
 pub mod transport;
 
 pub use error::to_syno_error;
 pub use framing::StreamTransport;
 pub use path::SmbPath;
+pub use pool::ConnectionFuture;
 pub use probe::{probe_as, Fallback, FallbackKind, Probe};
 pub use transport::{
     attach, auto_attach, auto_attach_as, auto_connect, auto_connect_as, BoxedStream, FileMeta,

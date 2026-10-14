@@ -2619,6 +2619,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "futures-util",
  "smb2",
  "synology-filestation-core",
  "tokio",

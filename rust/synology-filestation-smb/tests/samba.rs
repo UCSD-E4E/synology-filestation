@@ -575,3 +575,210 @@ async fn a_move_replaces_only_what_rename_would() {
         smb.delete(p).await.ok();
     }
 }
+
+// ── Reading over several connections ─────────────────────────────────────────
+
+/// Opens another connection to the auth container, counting how many it has
+/// opened. Each one runs through a proxy whose task is kept, so a test can cut
+/// the extra connections and leave the main one alone.
+#[derive(Clone, Default)]
+struct Extra {
+    opened: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    proxies: std::sync::Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+}
+
+impl Extra {
+    fn opener(
+        &self,
+    ) -> impl Fn() -> synology_filestation_smb::ConnectionFuture + Send + Sync + 'static {
+        let this = self.clone();
+        move || {
+            let this = this.clone();
+            Box::pin(async move {
+                this.opened
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut server = a_stream_to_the_server().await;
+                let (ours, mut theirs) = tokio::io::duplex(1 << 20);
+                this.proxies.lock().unwrap().push(tokio::spawn(async move {
+                    let _ = tokio::io::copy_bidirectional(&mut theirs, &mut server).await;
+                }));
+                Ok((
+                    Box::new(ours) as synology_filestation_smb::BoxedStream,
+                    "127.0.0.1".to_string(),
+                ))
+            })
+        }
+    }
+
+    /// Cut every extra connection opened so far, as a dropped link would.
+    fn cut(&self) {
+        for proxy in self.proxies.lock().unwrap().drain(..) {
+            proxy.abort();
+        }
+    }
+
+    fn opened(&self) -> usize {
+        self.opened.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// A file's worth of bytes no two stripes of which are alike.
+fn pattern(len: usize, salt: u8) -> Vec<u8> {
+    (0..len)
+        .map(|i| ((i / 7) as u8).wrapping_add(salt).wrapping_mul(31))
+        .collect()
+}
+
+/// A transport reading over `total` connections, once they are all up.
+async fn reading_over(total: usize, extra: &Extra, warm: &str) -> SmbTransport {
+    let smb = connect_plain()
+        .await
+        .with_read_connections(total, extra.opener());
+    // The extra connections are opened in the background when reads begin,
+    // so a read goes first.
+    let _ = smb.read(warm, 0, 1).await;
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while smb.read_connections() < total {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("every connection came up");
+    smb
+}
+
+async fn connect_plain() -> SmbTransport {
+    SmbTransport::connect(&config_with("testpass"))
+        .await
+        .expect("the auth container should accept these credentials")
+}
+
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn reads_over_several_connections_return_the_same_bytes() {
+    let _servers = TestServers::start().await.expect("docker compose up");
+    let path = "/private/striped.bin";
+    let original = pattern(3 * 1024 * 1024 + 12345, 1);
+    connect_plain()
+        .await
+        .write_atomic(path, &original)
+        .await
+        .expect("write");
+
+    let extra = Extra::default();
+    let smb = reading_over(4, &extra, path).await;
+    assert_eq!(extra.opened(), 3, "the main session plus three more");
+
+    for (offset, length) in [
+        (0u64, original.len() as u64),
+        (1, 256 * 1024),
+        (256 * 1024 - 3, 700_000),
+        (2 * 1024 * 1024 + 5, 4 * 1024 * 1024), // runs past the end
+        (original.len() as u64 + 10, 4096),     // starts past it
+    ] {
+        let got = smb.read(path, offset, length).await.expect("read");
+        let start = (offset as usize).min(original.len());
+        let end = ((offset + length) as usize).min(original.len());
+        assert!(
+            got.as_ref() == &original[start..end],
+            "bytes {offset}+{length} came back as written"
+        );
+    }
+    smb.delete(path).await.ok();
+}
+
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn every_connection_sees_an_overwrite() {
+    // Each connection holds its own open handle on the file. A write has to
+    // invalidate all of them, or a stripe comes back from before the write.
+    let _servers = TestServers::start().await.expect("docker compose up");
+    let path = "/private/overwritten.bin";
+    let len = 2 * 1024 * 1024;
+    let first = pattern(len, 1);
+    let second = pattern(len, 2);
+
+    let extra = Extra::default();
+    let smb = connect_plain()
+        .await
+        .with_read_connections(4, extra.opener());
+    smb.write_atomic(path, &first).await.expect("first write");
+    let smb = {
+        let _ = smb.read(path, 0, 1).await;
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while smb.read_connections() < 4 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("every connection came up");
+        smb
+    };
+    assert!(smb.read(path, 0, len as u64).await.unwrap().as_ref() == first.as_slice());
+
+    smb.write_atomic(path, &second).await.expect("second write");
+
+    assert!(
+        smb.read(path, 0, len as u64).await.unwrap().as_ref() == second.as_slice(),
+        "no stripe came from a handle opened before the write"
+    );
+    smb.delete(path).await.ok();
+}
+
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn a_read_on_a_connection_that_died_is_served_by_the_main_session() {
+    let _servers = TestServers::start().await.expect("docker compose up");
+    let path = "/private/survivor.bin";
+    let original = pattern(1024 * 1024, 3);
+    connect_plain()
+        .await
+        .write_atomic(path, &original)
+        .await
+        .expect("write");
+
+    let extra = Extra::default();
+    let smb = reading_over(4, &extra, path).await;
+
+    extra.cut();
+
+    let got = smb
+        .read(path, 0, original.len() as u64)
+        .await
+        .expect("the read still succeeds");
+    assert!(
+        got.as_ref() == original.as_slice(),
+        "and returns the right bytes"
+    );
+    smb.delete(path).await.ok();
+}
+
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn a_write_after_reads_that_raced_to_open_the_file_still_replaces_it() {
+    // Two first reads of one file at once both miss the handle cache and both
+    // open a handle; the second displaces the first while it is still being
+    // read, so that one is parked to be closed later. A write then has to
+    // close it too, or the replacing rename meets a file still open and the
+    // server refuses it. The mount reads a file from several threads at once,
+    // so this is the ordinary case, not a contrived one.
+    let _servers = TestServers::start().await.expect("docker compose up");
+    let path = "/private/raced.bin";
+    let smb = connect_plain().await;
+    smb.write_atomic(path, &pattern(600_000, 1))
+        .await
+        .expect("first");
+
+    let (a, b, c) = tokio::join!(
+        smb.read(path, 0, 200_000),
+        smb.read(path, 200_000, 200_000),
+        smb.read(path, 400_000, 200_000)
+    );
+    a.and(b).and(c).expect("the reads");
+
+    smb.write_atomic(path, &pattern(600_000, 2))
+        .await
+        .expect("the second write replaces the file");
+    assert!(smb.read_full(path).await.unwrap().as_ref() == pattern(600_000, 2).as_slice());
+    smb.delete(path).await.ok();
+}
