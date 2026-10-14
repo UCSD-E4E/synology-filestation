@@ -72,6 +72,11 @@ public sealed class PersistedSettings
     /// that default.</summary>
     public decimal? VpnMtu { get; set; }
 
+    /// <summary>How many SMB connections a mount reads over; null for the
+    /// mount's default. Absent from older settings files, which keep that
+    /// default.</summary>
+    public decimal? SmbConnections { get; set; }
+
     /// <summary>The same profile's path on the NAS, to download it from when
     /// there is no copy on this computer yet. Empty to use only what is
     /// already here.</summary>

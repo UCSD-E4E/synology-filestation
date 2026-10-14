@@ -52,6 +52,11 @@ public sealed class MountConfig
     /// datagrams. 0 for the tunnel's own default.</summary>
     public uint VpnMtu { get; init; }
 
+    /// <summary>How many SMB connections a mount reads over: the session and
+    /// up to N-1 more, which share the tunnel on the VPN leg. 0 for the
+    /// mount's default.</summary>
+    public uint SmbConnections { get; init; }
+
     /// <summary>The same profile's path on the NAS, to download it from when
     /// there is no copy on this computer yet. Empty to use only what is
     /// already here.</summary>

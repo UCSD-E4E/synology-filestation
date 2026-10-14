@@ -55,16 +55,19 @@ public sealed class SynoClient : IDisposable
     /// <param name="vpnMtu">The largest IP packet inside that tunnel, in bytes;
     /// 0 for its default. Outside the range the tunnel can use, the connect
     /// fails with <c>InvalidArg</c> before any login.</param>
+    /// <param name="smbConnections">How many SMB connections a mount reads
+    /// over; 0 for the default (four), 1 for the session alone.</param>
     public static SynoClient Connect(
         string host, ushort port, bool https, string username, string password,
         string? otp = null, bool autoRelogin = true, bool verifySsl = true,
         string? domain = null, string? vpnProfile = null, string? vpnHost = null,
-        string? vpnProfileRemote = null, uint vpnMtu = 0)
+        string? vpnProfileRemote = null, uint vpnMtu = 0, uint smbConnections = 0)
     {
         NativeMethods.EnsureResolver();
         var err = default(NativeError);
         int rc = syno_connect(host, port, https, username, password, otp, autoRelogin,
-            verifySsl, domain, vpnProfile, vpnHost, vpnProfileRemote, vpnMtu, out var handle,
+            verifySsl, domain, vpnProfile, vpnHost, vpnProfileRemote, vpnMtu, smbConnections,
+            out var handle,
             ref err);
         Check(rc, ref err);
         return new SynoClient(handle);

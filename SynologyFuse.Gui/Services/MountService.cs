@@ -103,7 +103,8 @@ public sealed class MountService : IDisposable
             vpnProfile: VpnProfileFor(config),
             vpnHost: Blank(config.VpnHost),
             vpnProfileRemote: Blank(config.VpnProfileNas),
-            vpnMtu: config.VpnMtu);
+            vpnMtu: config.VpnMtu,
+            smbConnections: config.SmbConnections);
 
     /// <summary>
     /// Connect and mount in one step. Throws <see cref="OtpRequiredException"/>

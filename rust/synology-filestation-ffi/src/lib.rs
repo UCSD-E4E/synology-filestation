@@ -368,6 +368,17 @@ struct Reachable<'a> {
     vpn_profile_remote: Option<&'a str>,
     /// The largest IP packet inside the tunnel.
     vpn_mtu: VpnMtu,
+    /// How many SMB connections a mount reads over.
+    smb_connections: usize,
+}
+
+/// The number of SMB connections to read over, from what `syno_connect` was
+/// given: 0 is the default, anything else is taken as it is.
+fn read_connections(raw: u32) -> usize {
+    match raw {
+        0 => synology_filestation_fuse::DEFAULT_SMB_CONNECTIONS,
+        n => n as usize,
+    }
 }
 
 /// Put SMB in front of the HTTP client, on the best leg that answers now.
@@ -461,13 +472,7 @@ async fn reach(
     // account with no domain does. So what the badge reports is the session,
     // not the probe; `Legs` says which, and says so in the log when it
     // changes.
-    match Legs::start(
-        chain,
-        &cfg,
-        synology_filestation_fuse::DEFAULT_SMB_CONNECTIONS,
-    )
-    .await
-    {
+    match Legs::start(chain, &cfg, settings.smb_connections).await {
         Some(legs) => (
             synology_filestation_smb::attach(client, legs.session().clone()),
             Some(legs),
@@ -531,6 +536,10 @@ pub unsafe extern "C" fn syno_connect(
     // but only with a profile: without one there is no tunnel to apply it to,
     // and a stale setting must not stop a connection that never uses one.
     vpn_mtu: u32,
+    // How many SMB connections a mount reads over: the session and up to N-1
+    // more, which share the tunnel on the VPN leg. 0 for the default
+    // (`DEFAULT_SMB_CONNECTIONS`), 1 for the session alone.
+    smb_connections: u32,
     out: *mut *mut SynoClient,
     err: *mut SynoError,
 ) -> i32 {
@@ -644,6 +653,7 @@ pub unsafe extern "C" fn syno_connect(
                         vpn_host,
                         vpn_profile_remote,
                         vpn_mtu,
+                        smb_connections: read_connections(smb_connections),
                     },
                 ));
                 let watching = legs
@@ -1492,6 +1502,7 @@ mod tests {
                 ptr::null(),
                 ptr::null(),
                 0,
+                0,
                 &mut client,
                 &mut err,
             );
@@ -1550,6 +1561,7 @@ mod tests {
                 ptr::null(),
                 ptr::null(),
                 0,
+                0,
                 &mut client,
                 &mut err,
             );
@@ -1604,6 +1616,7 @@ mod tests {
                 ptr::null(),
                 ptr::null(),
                 0,
+                0,
                 &mut client,
                 &mut err,
             );
@@ -1646,6 +1659,7 @@ mod tests {
                 ptr::null(),
                 ptr::null(),
                 ptr::null(),
+                0,
                 0,
                 &mut client,
                 &mut err,
@@ -1696,6 +1710,7 @@ mod tests {
                 ptr::null(),
                 ptr::null(),
                 0,
+                0,
                 &mut client,
                 &mut err,
             );
@@ -1743,6 +1758,7 @@ mod tests {
             ptr::null(),
             ptr::null(),
             0,
+            0,
             &mut client,
             &mut err,
         );
@@ -1773,9 +1789,23 @@ mod tests {
             ptr::null(),
             ptr::null(),
             vpn_mtu,
+            0,
             client,
             err,
         )
+    }
+
+    /// The GUI passes 0 when the field is left empty, which is the mount's
+    /// default rather than a request for no connections at all — there is
+    /// always at least the session.
+    #[test]
+    fn a_connection_count_of_zero_is_the_default() {
+        assert_eq!(
+            read_connections(0),
+            synology_filestation_fuse::DEFAULT_SMB_CONNECTIONS
+        );
+        assert_eq!(read_connections(1), 1, "the session alone");
+        assert_eq!(read_connections(8), 8);
     }
 
     /// Refused before the login, as the CLI refuses it before connecting: a
@@ -2004,6 +2034,7 @@ mod tests {
                 vpn_host: None,
                 vpn_profile_remote: None,
                 vpn_mtu: VpnMtu::default(),
+                smb_connections: synology_filestation_fuse::DEFAULT_SMB_CONNECTIONS,
             },
         )
         .await;

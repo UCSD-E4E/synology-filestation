@@ -140,6 +140,28 @@ public class SettingsServiceTests : IDisposable
         Assert.Equal(1150m, SettingsService.Load(_path).VpnMtu);
     }
 
+    /// <summary>Written before reads went over several connections: empty,
+    /// which is the mount's default.</summary>
+    [Fact]
+    public void Load_SettingsWithoutSmbConnections_KeepsTheDefault()
+    {
+        File.WriteAllText(_path, """
+            {
+                "Host": "nas.example.com",
+                "Mountpoint": "/mnt/nas"
+            }
+            """);
+
+        Assert.Null(SettingsService.Load(_path).SmbConnections);
+    }
+
+    [Fact]
+    public void SaveThenLoad_RoundTripsSmbConnections()
+    {
+        SettingsService.Save(new PersistedSettings { SmbConnections = 2m }, _path);
+        Assert.Equal(2m, SettingsService.Load(_path).SmbConnections);
+    }
+
     [Fact]
     public void Load_CorruptJson_ReturnsDefaults()
     {
