@@ -47,7 +47,9 @@ pub use push::{PushReply, PUSH_REQUEST, SUPPORTED_CIPHER};
 pub use reliable::{Delivery, Outgoing, RecvWindow, SendWindow};
 pub use replay::ReplayWindow;
 pub use session::{ClientAuth, Credentials, Session, SessionConfig, MAX_TLS_FRAGMENT};
-pub use stack::{LinkFailure, TunnelDevice, TunnelStream, LINK, MTU, OUTER};
+pub use stack::{
+    LinkFailure, Mtu, TunnelDevice, TunnelStream, LINK, MIN_MTU, MSS_OVERHEAD, MTU, OUTER,
+};
 pub use static_key::{KeyDirection, StaticKey, STATIC_KEY_LEN};
 pub use tls_auth::{TlsAuth, TlsAuthHeader};
 

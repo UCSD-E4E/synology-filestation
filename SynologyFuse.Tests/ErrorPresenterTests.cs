@@ -219,4 +219,30 @@ public class ErrorPresenterTests
         Assert.False(string.IsNullOrWhiteSpace(r.Title));
         Assert.False(string.IsNullOrWhiteSpace(r.Remedy));
     }
+
+    // ── A VPN MTU out of range ────────────────────────────────────────────────
+
+    /// <summary>Refused by the native side before any login, so "the NAS
+    /// rejected the request" would send the user to the wrong place. The
+    /// native message carries the range, and stays in the detail.</summary>
+    [Fact]
+    public void AnMtuOutOfRange_PointsAtTheVpnMtuField()
+    {
+        const string native = "a tunnel MTU of 500 is outside 576..=1298: smaller than 576 is "
+            + "not carried by every path";
+        var r = Describe(SynoStatus.InvalidArg, 0, native);
+
+        Assert.Contains("VPN MTU", r.Title);
+        Assert.Contains("VPN MTU", r.Remedy);
+        Assert.DoesNotContain("NAS rejected", r.Title);
+        Assert.Contains("576..=1298", r.Detail);
+    }
+
+    [Fact]
+    public void AnyOtherInvalidArg_KeepsTheGeneralAdvice()
+    {
+        var r = Describe(SynoStatus.InvalidArg, 0, "path must be absolute");
+
+        Assert.DoesNotContain("MTU", r.Title);
+    }
 }

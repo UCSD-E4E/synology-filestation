@@ -17,7 +17,7 @@ use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::socket::tcp;
 use smoltcp::time::Instant;
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr};
-use synology_filestation_openvpn::{Ifconfig, LinkFailure, Mux, TunnelDevice};
+use synology_filestation_openvpn::{Ifconfig, LinkFailure, Mtu, Mux, TunnelDevice};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
@@ -98,7 +98,13 @@ fn linked(listeners: usize) -> (Mux, tokio::task::JoinHandle<()>) {
     let (to_peer, peer_inbound) = mpsc::channel(64);
     let (to_us, our_inbound) = mpsc::channel(64);
     let peer = echo_peer(to_us, peer_inbound, listeners);
-    let mux = Mux::new(to_peer, our_inbound, OURS, LinkFailure::new());
+    let mux = Mux::new(
+        to_peer,
+        our_inbound,
+        OURS,
+        Mtu::default(),
+        LinkFailure::new(),
+    );
     (mux, peer)
 }
 
@@ -209,7 +215,13 @@ async fn connections_get_different_local_ports() {
     // The only thing that tells their packets apart.
     let (to_peer, mut peer_inbound) = mpsc::channel(64);
     let (_to_us, our_inbound) = mpsc::channel(64);
-    let mux = Mux::new(to_peer, our_inbound, OURS, LinkFailure::new());
+    let mux = Mux::new(
+        to_peer,
+        our_inbound,
+        OURS,
+        Mtu::default(),
+        LinkFailure::new(),
+    );
 
     let short = Duration::from_millis(300);
     let first = tokio::spawn({

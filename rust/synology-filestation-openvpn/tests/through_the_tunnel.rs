@@ -27,7 +27,9 @@ use smoltcp::iface::{Config, Interface, SocketSet};
 use smoltcp::socket::tcp;
 use smoltcp::time::Instant;
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr};
-use synology_filestation_openvpn::{Session, SessionConfig, StaticKey, Tunnel, TunnelDevice, PING};
+use synology_filestation_openvpn::{
+    Mtu, Session, SessionConfig, StaticKey, Tunnel, TunnelDevice, PING,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
@@ -200,7 +202,11 @@ async fn a_conversation_completes_through_the_tunnel() {
 
     let tunnel = Tunnel::connect(config, remote).await.expect("a tunnel");
     let mut stream = tunnel
-        .open_stream(NAS, Duration::from_secs(20))
+        .open_stream(
+            NAS,
+            Duration::from_secs(20),
+            synology_filestation_openvpn::Mtu::default(),
+        )
         .await
         .expect("a connection to the NAS inside the tunnel");
 
@@ -265,7 +271,11 @@ async fn keepalives_and_payload_share_the_channel() {
 
     let tunnel = Tunnel::connect(config, remote).await.expect("a tunnel");
     let mut stream = tunnel
-        .open_stream(NAS, Duration::from_secs(20))
+        .open_stream(
+            NAS,
+            Duration::from_secs(20),
+            synology_filestation_openvpn::Mtu::default(),
+        )
         .await
         .expect("a connection");
 
@@ -326,7 +336,11 @@ async fn a_net30_tunnel_can_still_reach_the_nas() {
 
     let tunnel = Tunnel::connect(config, remote).await.expect("a tunnel");
     let mut stream = tunnel
-        .open_stream(NAS, Duration::from_secs(10))
+        .open_stream(
+            NAS,
+            Duration::from_secs(10),
+            synology_filestation_openvpn::Mtu::default(),
+        )
         .await
         .expect("the NAS is off-link under net30, and reached through the peer");
 
@@ -362,7 +376,9 @@ async fn several_connections_share_one_tunnel() {
     let noticed = spawn_nas(server, socket);
 
     let tunnel = Tunnel::connect(config, remote).await.expect("a tunnel");
-    let shared = tunnel.share().expect("a tunnel that pushed an address");
+    let shared = tunnel
+        .share(Mtu::default())
+        .expect("a tunnel that pushed an address");
     let mut first = shared
         .connect(NAS, Duration::from_secs(20))
         .await

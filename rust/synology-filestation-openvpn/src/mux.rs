@@ -27,7 +27,7 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::task::JoinHandle;
 
 use crate::ip::Ifconfig;
-use crate::stack::{LinkFailure, TunnelStream};
+use crate::stack::{LinkFailure, Mtu, TunnelStream};
 use crate::Error;
 
 /// How many packets may wait for one connection's stack to take them.
@@ -60,6 +60,8 @@ struct Shared {
     outbound: mpsc::Sender<Vec<u8>>,
     routes: Routes,
     ifconfig: Ifconfig,
+    /// The largest IP packet any connection puts in the tunnel.
+    mtu: Mtu,
     /// Why the tunnel stopped, once it has.
     failure: LinkFailure,
     /// Which local port the next connection gets.
@@ -77,12 +79,14 @@ impl Mux {
     /// Share a link: packets for it go to `outbound`, and packets arriving on
     /// `inbound` are handed to whichever connection they are addressed to.
     ///
+    /// `mtu` is the largest IP packet a connection puts in the tunnel, and
     /// `failure` is where the layer below records why it stopped, so that a
     /// connection that breaks can say why rather than only that it did.
     pub fn new(
         outbound: mpsc::Sender<Vec<u8>>,
         inbound: mpsc::Receiver<Vec<u8>>,
         ifconfig: Ifconfig,
+        mtu: Mtu,
         failure: LinkFailure,
     ) -> Self {
         let routes: Routes = Arc::default();
@@ -92,6 +96,7 @@ impl Mux {
                 outbound,
                 routes,
                 ifconfig,
+                mtu,
                 failure,
                 ports: PortCursor::new(),
                 demux,
@@ -122,6 +127,7 @@ impl Mux {
             remote,
             port,
             patience,
+            shared.mtu,
         )
         .await
         {

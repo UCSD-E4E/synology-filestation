@@ -21,7 +21,7 @@ use tokio::task::JoinHandle;
 use crate::ip::Ifconfig;
 use crate::mux::Mux;
 use crate::session::{Session, SessionConfig};
-use crate::stack::{LinkFailure, TunnelStream};
+use crate::stack::{LinkFailure, Mtu, TunnelStream};
 use crate::Error;
 
 /// How long to wait for the tunnel to come up before giving up on it.
@@ -195,8 +195,9 @@ impl Tunnel {
         self,
         remote: (Ipv4Addr, u16),
         patience: Duration,
+        mtu: Mtu,
     ) -> Result<TunnelStream, Error> {
-        self.share()?.connect(remote, patience).await
+        self.share(mtu)?.connect(remote, patience).await
     }
 
     /// Hand the tunnel over to carry as many TCP connections as are opened on
@@ -204,8 +205,9 @@ impl Tunnel {
     ///
     /// It stays up while any of them, or the [`Mux`] itself, is held, and goes
     /// when the last is let go of. See [`crate::mux`] for why one tunnel
-    /// carries several connections rather than one each.
-    pub fn share(self) -> Result<Mux, Error> {
+    /// carries several connections rather than one each. `mtu` is the largest
+    /// IP packet any of them puts in the tunnel.
+    pub fn share(self, mtu: Mtu) -> Result<Mux, Error> {
         let ifconfig = self
             .ifconfig
             .ok_or_else(|| Error::Io("the server pushed no address for us".into()))?;
@@ -253,7 +255,7 @@ impl Tunnel {
             }
         });
 
-        Ok(Mux::new(to_tunnel, from_tunnel, ifconfig, failure))
+        Ok(Mux::new(to_tunnel, from_tunnel, ifconfig, mtu, failure))
     }
 
     /// Why the tunnel stopped, if it has.

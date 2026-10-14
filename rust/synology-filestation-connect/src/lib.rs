@@ -29,6 +29,7 @@ pub mod openvpn;
 pub mod profile;
 
 pub use openvpn::OpenVpnTunnel;
+pub use synology_filestation_openvpn::Mtu as VpnMtu;
 
 use std::sync::Mutex;
 use std::time::Duration;

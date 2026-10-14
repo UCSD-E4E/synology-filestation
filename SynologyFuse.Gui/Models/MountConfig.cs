@@ -47,6 +47,11 @@ public sealed class MountConfig
     /// does not resolve to: the tunnel pushes no DNS.</summary>
     public string VpnHost { get; init; } = "";
 
+    /// <summary>The largest IP packet inside the tunnel, in bytes -- the
+    /// client-side <c>--mssfix</c>, for a path that splits the default-sized
+    /// datagrams. 0 for the tunnel's own default.</summary>
+    public uint VpnMtu { get; init; }
+
     /// <summary>The same profile's path on the NAS, to download it from when
     /// there is no copy on this computer yet. Empty to use only what is
     /// already here.</summary>

@@ -33,7 +33,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use synology_filestation_openvpn::{
-    credentials, Error as VpnError, Mux, Profile, Tunnel as OpenVpn, WeakMux,
+    credentials, Error as VpnError, Mtu as VpnMtu, Mux, Profile, Tunnel as OpenVpn, WeakMux,
 };
 use tracing::{debug, info};
 use zeroize::Zeroizing;
@@ -53,6 +53,9 @@ pub struct OpenVpnTunnel {
     password: Zeroizing<String>,
     /// How long the whole thing may take, handshake included.
     patience: Duration,
+    /// The largest IP packet either end puts in the tunnel. See
+    /// [`OpenVpnTunnel::with_mtu`].
+    mtu: VpnMtu,
     /// The tunnel already up, if one is.
     shared: SharedTunnel,
 }
@@ -65,6 +68,7 @@ impl std::fmt::Debug for OpenVpnTunnel {
             .field("login", &self.login)
             .field("password", &"<redacted>")
             .field("patience", &self.patience)
+            .field("mtu", &self.mtu)
             .finish()
     }
 }
@@ -86,8 +90,21 @@ impl OpenVpnTunnel {
             login: qualified(domain, &username.into()),
             password: Zeroizing::new(password.into()),
             patience,
+            mtu: VpnMtu::default(),
             shared: SharedTunnel::default(),
         }
+    }
+
+    /// Use packets of at most `mtu` bytes inside the tunnel, rather than the
+    /// largest that fits what the server pushes.
+    ///
+    /// The client-side `--mssfix`: the NAS sizes what it sends by the MSS our
+    /// SYN offers, so a smaller MTU here keeps its wrapped packets under a path
+    /// that would otherwise split each one in two. Every connection through
+    /// the shared tunnel uses it.
+    pub fn with_mtu(mut self, mtu: VpnMtu) -> Self {
+        self.mtu = mtu;
+        self
     }
 
     /// A connection to `host:port` through the tunnel already up, or through
@@ -160,11 +177,13 @@ impl OpenVpnTunnel {
             }
         })?;
 
-        tunnel.share().map_err(|e| {
+        let shared = tunnel.share(self.mtu).map_err(|e| {
             TunnelUnavailable::Transient(format!(
                 "the vpn tunnel to {server} came up but cannot carry a connection: {e}"
             ))
-        })
+        })?;
+        debug!("tunnel: up (MTU {}, MSS {})", self.mtu, self.mtu.mss());
+        Ok(shared)
     }
 }
 
@@ -341,7 +360,13 @@ mod tests {
             address: Ipv4Addr::new(10, 90, 24, 6),
             prefix: 24,
         };
-        let mux = Mux::new(to_far_end, inbound, ifconfig, LinkFailure::new());
+        let mux = Mux::new(
+            to_far_end,
+            inbound,
+            ifconfig,
+            synology_filestation_openvpn::Mtu::default(),
+            LinkFailure::new(),
+        );
         (mux, (far_end, from_far_end))
     }
 

@@ -14,7 +14,7 @@
 
 use std::time::Duration;
 
-use synology_filestation_connect::{OpenVpnTunnel, Tunnel};
+use synology_filestation_connect::{OpenVpnTunnel, Tunnel, VpnMtu};
 
 /// A profile shaped like the one `synology_vpn` publishes, pointed wherever
 /// the test needs.
@@ -146,5 +146,36 @@ async fn a_server_that_never_answers_gives_up_when_it_said_it_would() {
         "it gave up in about the time it was given, not the handshake's own: \
          {:?} after {refused}",
         started.elapsed()
+    );
+}
+
+// An MTU out of range cannot reach `with_mtu` at all: `VpnMtu::new` is the only
+// way to make one, and it is tested where it lives, in the openvpn crate.
+
+#[test]
+fn a_smaller_mtu_is_kept() {
+    let mtu = VpnMtu::new(1150).expect("in range");
+    let tunnel = tunnel_for(
+        std::path::Path::new("/nowhere.ovpn"),
+        Duration::from_secs(5),
+    )
+    .with_mtu(mtu);
+
+    assert!(
+        format!("{tunnel:?}").contains("mtu: Mtu(1150)"),
+        "{tunnel:?}"
+    );
+}
+
+#[test]
+fn without_one_the_default_is_used() {
+    let tunnel = tunnel_for(
+        std::path::Path::new("/nowhere.ovpn"),
+        Duration::from_secs(5),
+    );
+
+    assert!(
+        format!("{tunnel:?}").contains(&format!("mtu: {:?}", VpnMtu::default())),
+        "{tunnel:?}"
     );
 }

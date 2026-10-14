@@ -18,7 +18,7 @@ use smoltcp::iface::{Config, Interface, SocketSet};
 use smoltcp::socket::tcp;
 use smoltcp::time::Instant;
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr};
-use synology_filestation_openvpn::{Error, Ifconfig, LinkFailure, TunnelDevice, TunnelStream};
+use synology_filestation_openvpn::{Error, Ifconfig, LinkFailure, Mtu, TunnelDevice, TunnelStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
@@ -185,7 +185,7 @@ async fn connected() -> (TunnelStream, mpsc::Sender<Ask>, mpsc::Receiver<Vec<u8>
     let (to_us, our_inbound) = mpsc::channel(64);
 
     let (ask, heard) = Peer::listening(to_us, peer_inbound).spawn();
-    let stream = TunnelStream::connect(to_peer, our_inbound, OURS, NAS, PATIENCE)
+    let stream = TunnelStream::connect(to_peer, our_inbound, OURS, NAS, PATIENCE, Mtu::default())
         .await
         .expect("the connection comes up");
 
@@ -324,6 +324,7 @@ async fn the_first_thing_out_is_a_syn_to_where_we_were_told() {
         },
         NAS,
         Duration::from_millis(200),
+        Mtu::default(),
     ));
 
     let packet = tokio::time::timeout(PATIENCE, peer_inbound.recv())
@@ -350,6 +351,61 @@ async fn the_first_thing_out_is_a_syn_to_where_we_were_told() {
 
     // And nobody answered it, which is a failure rather than a wait forever.
     assert!(attempt.await.expect("the task finished").is_err());
+}
+
+/// The MSS a SYN offers, read from its TCP options.
+fn offered_mss(packet: &[u8]) -> Option<u16> {
+    let header_len = ((packet[0] & 0x0f) as usize) * 4;
+    let tcp = &packet[header_len..];
+    let options = &tcp[20..((tcp[12] >> 4) as usize) * 4];
+    let mut at = 0;
+    while at < options.len() {
+        match options[at] {
+            0 => return None,
+            1 => at += 1,
+            2 => return Some(u16::from_be_bytes([options[at + 2], options[at + 3]])),
+            _ => at += options[at + 1].max(2) as usize,
+        }
+    }
+    None
+}
+
+#[tokio::test]
+async fn a_smaller_mtu_is_what_the_syn_offers() {
+    // The far end sizes every segment it sends us by the MSS in our SYN, and
+    // there is no kernel here for `--mssfix` to rewrite it in: an MTU this
+    // stack is given is the only way to keep the NAS's packets, once wrapped,
+    // under a path that would otherwise split every one of them.
+    let mtu = Mtu::new(1150).expect("in range");
+    let (to_peer, mut peer_inbound) = mpsc::channel(64);
+    let (_to_us, our_inbound) = mpsc::channel(64);
+
+    let attempt = tokio::spawn(TunnelStream::connect(
+        to_peer,
+        our_inbound,
+        OURS,
+        NAS,
+        Duration::from_millis(200),
+        mtu,
+    ));
+
+    let syn = tokio::time::timeout(PATIENCE, peer_inbound.recv())
+        .await
+        .expect("something went out")
+        .expect("a packet");
+
+    assert_eq!(
+        offered_mss(&syn),
+        Some(1150 - 40),
+        "MTU less IPv4 and TCP headers"
+    );
+    // And what the log reports as the MSS is the one actually offered.
+    assert_eq!(
+        offered_mss(&syn),
+        Some(mtu.mss() as u16),
+        "Mtu::mss agrees with the stack"
+    );
+    attempt.abort();
 }
 
 #[tokio::test]
@@ -579,6 +635,7 @@ async fn giving_up_on_a_connection_takes_the_stack_with_it() {
         NAS,
         // Long enough that the caller below is certainly the one giving up.
         Duration::from_secs(600),
+        Mtu::default(),
     ));
 
     // It got as far as putting a SYN on the link, so the stack is running.
