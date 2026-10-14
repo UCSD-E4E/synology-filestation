@@ -89,7 +89,11 @@ async fn a_tunnel_that_already_died_is_not_blamed_on_the_far_end() {
     assert!(matches!(tunnel.failure(), Some(Error::PeerGone(_))));
 
     let refused = tunnel
-        .open_stream((Ipv4Addr::new(10, 90, 24, 1), 445), Duration::from_secs(5))
+        .open_stream(
+            (Ipv4Addr::new(10, 90, 24, 1), 445),
+            Duration::from_secs(5),
+            synology_filestation_openvpn::Mtu::default(),
+        )
         .await;
 
     assert!(
@@ -109,7 +113,11 @@ async fn a_tunnel_that_dies_while_connecting_says_what_died() {
     quiet.store(true, std::sync::atomic::Ordering::SeqCst);
 
     let outcome = tunnel
-        .open_stream((Ipv4Addr::new(10, 90, 24, 1), 445), Duration::from_secs(3))
+        .open_stream(
+            (Ipv4Addr::new(10, 90, 24, 1), 445),
+            Duration::from_secs(3),
+            synology_filestation_openvpn::Mtu::default(),
+        )
         .await;
 
     assert!(
@@ -244,6 +252,7 @@ async fn a_connection_through_the_tunnel_reaches_the_far_side_encrypted() {
         tunnel.open_stream(
             (Ipv4Addr::new(10, 90, 24, 1), 445),
             Duration::from_millis(500),
+            synology_filestation_openvpn::Mtu::default(),
         ),
     )
     .await;

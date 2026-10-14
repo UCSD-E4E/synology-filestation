@@ -116,6 +116,30 @@ public class SettingsServiceTests : IDisposable
         Assert.Equal(16m, s.PrefetchBlocks);
     }
 
+    /// <summary>Written before the VPN MTU setting existed: empty, which is the
+    /// tunnel's own default, so nothing changes.</summary>
+    [Fact]
+    public void Load_SettingsWithoutVpnMtu_KeepsTheTunnelDefault()
+    {
+        File.WriteAllText(_path, """
+            {
+                "Host": "nas.example.com",
+                "Mountpoint": "/mnt/nas"
+            }
+            """);
+
+        var s = SettingsService.Load(_path);
+
+        Assert.Null(s.VpnMtu);
+    }
+
+    [Fact]
+    public void SaveThenLoad_RoundTripsVpnMtu()
+    {
+        SettingsService.Save(new PersistedSettings { VpnMtu = 1150m }, _path);
+        Assert.Equal(1150m, SettingsService.Load(_path).VpnMtu);
+    }
+
     [Fact]
     public void Load_CorruptJson_ReturnsDefaults()
     {

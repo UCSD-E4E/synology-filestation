@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use synology_filestation_connect::{
     profile::ProfileSource, Chain, Endpoints, NoTunnel, OpenVpnTunnel, TcpProber, Transport,
-    TransportPolicy, Tunnel, DEFAULT_RECHECK,
+    TransportPolicy, Tunnel, VpnMtu, DEFAULT_RECHECK,
 };
 use synology_filestation_core::client::SynologyClient;
 use synology_filestation_core::error::SynoFsError;
@@ -366,6 +366,8 @@ struct Reachable<'a> {
     /// set it up made, and guessing one would be this client asserting a
     /// layout it has no business knowing.
     vpn_profile_remote: Option<&'a str>,
+    /// The largest IP packet inside the tunnel.
+    vpn_mtu: VpnMtu,
 }
 
 /// Put SMB in front of the HTTP client, on the best leg that answers now.
@@ -415,13 +417,16 @@ async fn reach(
         }
     };
     let tunnel: Box<dyn Tunnel> = match settings.vpn_profile {
-        Some(profile) => Box::new(OpenVpnTunnel::new(
-            profile,
-            settings.username,
-            settings.password,
-            settings.domain,
-            VPN_PATIENCE,
-        )),
+        Some(profile) => Box::new(
+            OpenVpnTunnel::new(
+                profile,
+                settings.username,
+                settings.password,
+                settings.domain,
+                VPN_PATIENCE,
+            )
+            .with_mtu(settings.vpn_mtu),
+        ),
         None => Box::new(NoTunnel),
     };
     // The one leg this consumer lets be switched off, and only from the
@@ -514,6 +519,12 @@ pub unsafe extern "C" fn syno_connect(
     // Where that profile lives on the NAS, if it should be fetched from there
     // when it is not on disk yet. Null to use only what is already on disk.
     vpn_profile_remote: *const c_char,
+    // The largest IP packet inside the tunnel, in bytes: the client-side
+    // `--mssfix`, for a path that splits the default-sized datagrams. 0 for
+    // the default. Outside the range the tunnel can use it is `InvalidArg`,
+    // but only with a profile: without one there is no tunnel to apply it to,
+    // and a stale setting must not stop a connection that never uses one.
+    vpn_mtu: u32,
     out: *mut *mut SynoClient,
     err: *mut SynoError,
 ) -> i32 {
@@ -535,6 +546,13 @@ pub unsafe extern "C" fn syno_connect(
         let vpn_profile = opt_str(vpn_profile);
         let vpn_host = opt_str(vpn_host);
         let vpn_profile_remote = opt_str(vpn_profile_remote);
+        let vpn_mtu = match (vpn_mtu, vpn_profile) {
+            (0, _) | (_, None) => VpnMtu::default(),
+            (bytes, Some(_)) => match VpnMtu::new(bytes as usize) {
+                Ok(mtu) => mtu,
+                Err(why) => return set_err(err, SynoStatus::InvalidArg, 0, &why),
+            },
+        };
         if out.is_null() {
             return set_err(err, SynoStatus::NullArg, 0, "out pointer must not be null");
         }
@@ -619,6 +637,7 @@ pub unsafe extern "C" fn syno_connect(
                         vpn_profile,
                         vpn_host,
                         vpn_profile_remote,
+                        vpn_mtu,
                     },
                 ));
                 let watching = legs
@@ -1466,6 +1485,7 @@ mod tests {
                 ptr::null(),
                 ptr::null(),
                 ptr::null(),
+                0,
                 &mut client,
                 &mut err,
             );
@@ -1523,6 +1543,7 @@ mod tests {
                 ptr::null(),
                 ptr::null(),
                 ptr::null(),
+                0,
                 &mut client,
                 &mut err,
             );
@@ -1576,6 +1597,7 @@ mod tests {
                 ptr::null(),
                 ptr::null(),
                 ptr::null(),
+                0,
                 &mut client,
                 &mut err,
             );
@@ -1618,6 +1640,7 @@ mod tests {
                 ptr::null(),
                 ptr::null(),
                 ptr::null(),
+                0,
                 &mut client,
                 &mut err,
             );
@@ -1666,6 +1689,7 @@ mod tests {
                 ptr::null(),
                 ptr::null(),
                 ptr::null(),
+                0,
                 &mut client,
                 &mut err,
             );
@@ -1712,11 +1736,92 @@ mod tests {
             ptr::null(),
             ptr::null(),
             ptr::null(),
+            0,
             &mut client,
             &mut err,
         );
         assert_eq!(rc, SynoStatus::Ok as i32, "connect: {}", err_message(&err));
         client
+    }
+
+    /// `syno_connect` with every optional argument null but the VPN MTU.
+    unsafe fn connect_with_mtu(
+        host: &CString,
+        port: u16,
+        vpn_profile: *const c_char,
+        vpn_mtu: u32,
+        client: &mut *mut SynoClient,
+        err: &mut SynoError,
+    ) -> i32 {
+        syno_connect(
+            host.as_ptr(),
+            port,
+            false,
+            cstr("alice").as_ptr(),
+            cstr("secret").as_ptr(),
+            ptr::null(),
+            false,
+            true,
+            ptr::null(),
+            vpn_profile,
+            ptr::null(),
+            ptr::null(),
+            vpn_mtu,
+            client,
+            err,
+        )
+    }
+
+    /// Refused before the login, as the CLI refuses it before connecting: a
+    /// tunnel that could not use it would otherwise only show as one that
+    /// never came up, and a quiet fall back to HTTP. The message says "MTU",
+    /// which is how the GUI tells this refusal from the others.
+    #[test]
+    fn a_vpn_mtu_the_tunnel_cannot_carry_is_refused_before_logging_in() {
+        unsafe {
+            let mut client: *mut SynoClient = ptr::null_mut();
+            let mut err = empty_err();
+            let profile = cstr("/nowhere/e4e-nas-vpn.ovpn");
+            // Nowhere: a login attempt would fail as `Io`, not `InvalidArg`.
+            let rc = connect_with_mtu(
+                &cstr("127.0.0.1"),
+                1,
+                profile.as_ptr(),
+                2000,
+                &mut client,
+                &mut err,
+            );
+            assert_eq!(rc, SynoStatus::InvalidArg as i32, "{}", err_message(&err));
+            assert!(err_message(&err).contains("MTU"), "{}", err_message(&err));
+            assert!(err_message(&err).contains("2000"), "{}", err_message(&err));
+            assert!(client.is_null());
+            syno_string_free(err.message);
+        }
+    }
+
+    /// With no tunnel there is nothing for it to apply to, so a stale value
+    /// left in the GUI's settings does not stop a connection that never uses
+    /// one — as the CLI ignores `--vpn-mtu` without `--vpn-profile`.
+    #[test]
+    fn a_vpn_mtu_with_no_tunnel_to_apply_to_is_ignored() {
+        let (_rt, server) = server_with(async {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/webapi/auth.cgi"))
+                .respond_with(login_ok())
+                .mount(&server)
+                .await;
+            server
+        });
+
+        unsafe {
+            let (host, port) = host_port(&server);
+            let mut client: *mut SynoClient = ptr::null_mut();
+            let mut err = empty_err();
+            let rc = connect_with_mtu(&host, port, ptr::null(), 2000, &mut client, &mut err);
+            assert_eq!(rc, SynoStatus::Ok as i32, "{}", err_message(&err));
+            syno_client_free(client);
+        }
     }
 
     /// A mock that answers only `SYNO.FileStation.MD5` calls with `method`.
@@ -1892,6 +1997,7 @@ mod tests {
                 vpn_profile: None,
                 vpn_host: None,
                 vpn_profile_remote: None,
+                vpn_mtu: VpnMtu::default(),
             },
         )
         .await;
