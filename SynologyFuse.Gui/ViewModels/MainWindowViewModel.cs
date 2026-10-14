@@ -51,6 +51,7 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
         _domain = s.Domain;
         _vpnProfile = s.VpnProfile;
         _vpnHost = s.VpnHost;
+        _vpnMtu = VpnMtuSetting.FromPersisted(s.VpnMtu);
         _vpnProfileNas = s.VpnProfileNas;
 
         _mountService.OutputReceived += OnOutput;
@@ -150,6 +151,12 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
     /// does not resolve to.</summary>
     [ObservableProperty]
     private string _vpnHost = "";
+
+    /// <summary>The largest IP packet inside the tunnel; empty for its default.
+    /// Lower it when a hop on the way splits every full-size datagram, which
+    /// shows as a VPN far slower than the link it runs over.</summary>
+    [ObservableProperty]
+    private decimal? _vpnMtu;
 
     public IReadOnlyList<string> LogLevels { get; } =
         ["error", "warn", "info", "debug", "trace"];
@@ -463,6 +470,7 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
         Domain = Domain,
         VpnProfile = VpnProfile,
         VpnHost = VpnHost,
+        VpnMtu = VpnMtuSetting.ToNative(VpnMtu),
         VpnProfileNas = VpnProfileNas,
     };
 
@@ -483,6 +491,7 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
         Domain = Domain,
         VpnProfile = VpnProfile,
         VpnHost = VpnHost,
+        VpnMtu = VpnMtu,
         VpnProfileNas = VpnProfileNas,
     });
 

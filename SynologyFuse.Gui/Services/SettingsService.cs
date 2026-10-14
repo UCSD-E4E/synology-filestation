@@ -67,6 +67,11 @@ public sealed class PersistedSettings
     /// <summary>The NAS's address inside that tunnel.</summary>
     public string VpnHost { get; set; } = "";
 
+    /// <summary>The largest IP packet inside the tunnel, in bytes; null for the
+    /// tunnel's own default. Absent from older settings files, which keep
+    /// that default.</summary>
+    public decimal? VpnMtu { get; set; }
+
     /// <summary>The same profile's path on the NAS, to download it from when
     /// there is no copy on this computer yet. Empty to use only what is
     /// already here.</summary>

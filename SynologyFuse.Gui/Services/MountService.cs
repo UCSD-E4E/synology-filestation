@@ -91,6 +91,20 @@ public sealed class MountService : IDisposable
         return resolved is null ? null : ExpandPath(resolved);
     }
 
+    /// <summary>Log in with everything <paramref name="config"/> says about
+    /// reaching the NAS. The mount, the connection test and the file browser
+    /// all connect through here, so a setting added to the config reaches all
+    /// three or none.</summary>
+    internal static SynoClient Connect(MountConfig config, string? otp) =>
+        SynoClient.Connect(
+            config.Host, config.Port, config.UseHttps, config.Username, config.Password, otp,
+            autoRelogin: true, verifySsl: config.VerifySsl,
+            domain: Blank(config.Domain),
+            vpnProfile: VpnProfileFor(config),
+            vpnHost: Blank(config.VpnHost),
+            vpnProfileRemote: Blank(config.VpnProfileNas),
+            vpnMtu: config.VpnMtu);
+
     /// <summary>
     /// Connect and mount in one step. Throws <see cref="OtpRequiredException"/>
     /// when the account needs a 2FA code (prompt and retry with
@@ -107,13 +121,7 @@ public sealed class MountService : IDisposable
 
         var client = await Task.Run(() =>
         {
-            var c = SynoClient.Connect(
-                config.Host, config.Port, config.UseHttps, config.Username, config.Password, otp,
-                autoRelogin: true, verifySsl: config.VerifySsl,
-                domain: Blank(config.Domain),
-                vpnProfile: VpnProfileFor(config),
-                vpnHost: Blank(config.VpnHost),
-                vpnProfileRemote: Blank(config.VpnProfileNas));
+            var c = Connect(config, otp);
             try
             {
                 c.Mount(mountpoint, config.CacheTtl, config.ReadCacheMb, config.PrefetchBlocks);
@@ -155,13 +163,7 @@ public sealed class MountService : IDisposable
         ApplyLogFile(config);
         return Task.Run(() =>
         {
-            using var client = SynoClient.Connect(
-                config.Host, config.Port, config.UseHttps, config.Username, config.Password, otp,
-                autoRelogin: true, verifySsl: config.VerifySsl,
-                domain: Blank(config.Domain),
-                vpnProfile: VpnProfileFor(config),
-                vpnHost: Blank(config.VpnHost),
-                vpnProfileRemote: Blank(config.VpnProfileNas));
+            using var client = Connect(config, otp);
             _tested = client.Transport;
             // Dispose logs out immediately; reaching here means success.
         });

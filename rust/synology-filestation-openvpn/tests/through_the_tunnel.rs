@@ -193,7 +193,11 @@ async fn a_conversation_completes_through_the_tunnel() {
 
     let tunnel = Tunnel::connect(config, remote).await.expect("a tunnel");
     let mut stream = tunnel
-        .open_stream(NAS, Duration::from_secs(20))
+        .open_stream(
+            NAS,
+            Duration::from_secs(20),
+            synology_filestation_openvpn::Mtu::default(),
+        )
         .await
         .expect("a connection to the NAS inside the tunnel");
 
@@ -258,7 +262,11 @@ async fn keepalives_and_payload_share_the_channel() {
 
     let tunnel = Tunnel::connect(config, remote).await.expect("a tunnel");
     let mut stream = tunnel
-        .open_stream(NAS, Duration::from_secs(20))
+        .open_stream(
+            NAS,
+            Duration::from_secs(20),
+            synology_filestation_openvpn::Mtu::default(),
+        )
         .await
         .expect("a connection");
 
@@ -319,7 +327,11 @@ async fn a_net30_tunnel_can_still_reach_the_nas() {
 
     let tunnel = Tunnel::connect(config, remote).await.expect("a tunnel");
     let mut stream = tunnel
-        .open_stream(NAS, Duration::from_secs(10))
+        .open_stream(
+            NAS,
+            Duration::from_secs(10),
+            synology_filestation_openvpn::Mtu::default(),
+        )
         .await
         .expect("the NAS is off-link under net30, and reached through the peer");
 

@@ -25,7 +25,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use synology_filestation_openvpn::{credentials, Error as VpnError, Profile, Tunnel as OpenVpn};
+use synology_filestation_openvpn::{
+    credentials, Error as VpnError, Mtu as VpnMtu, Profile, Tunnel as OpenVpn,
+};
 use tracing::{debug, info};
 use zeroize::Zeroizing;
 
@@ -44,6 +46,9 @@ pub struct OpenVpnTunnel {
     password: Zeroizing<String>,
     /// How long the whole thing may take, handshake included.
     patience: Duration,
+    /// The largest IP packet either end puts in the tunnel. See
+    /// [`OpenVpnTunnel::with_mtu`].
+    mtu: VpnMtu,
 }
 
 /// Hand-written so the password never reaches a log.
@@ -54,6 +59,7 @@ impl std::fmt::Debug for OpenVpnTunnel {
             .field("login", &self.login)
             .field("password", &"<redacted>")
             .field("patience", &self.patience)
+            .field("mtu", &self.mtu)
             .finish()
     }
 }
@@ -75,7 +81,19 @@ impl OpenVpnTunnel {
             login: qualified(domain, &username.into()),
             password: Zeroizing::new(password.into()),
             patience,
+            mtu: VpnMtu::default(),
         }
+    }
+
+    /// Use packets of at most `mtu` bytes inside the tunnel, rather than the
+    /// largest that fits what the server pushes.
+    ///
+    /// The client-side `--mssfix`: the NAS sizes what it sends by the MSS our
+    /// SYN offers, so a smaller MTU here keeps its wrapped packets under a path
+    /// that would otherwise split each one in two.
+    pub fn with_mtu(mut self, mtu: VpnMtu) -> Self {
+        self.mtu = mtu;
+        self
     }
 
     /// Raise a tunnel and open a connection through it, by `deadline`.
@@ -138,13 +156,20 @@ impl OpenVpnTunnel {
         // listening behind one, which is the difference this layer exists to
         // draw.
         let left = deadline.saturating_duration_since(tokio::time::Instant::now());
-        let stream = tunnel.open_stream((host, port), left).await.map_err(|e| {
-            TunnelUnavailable::Transient(format!(
-                "the tunnel is up, but nothing answered at {host}:{port} inside it: {e}"
-            ))
-        })?;
+        let stream = tunnel
+            .open_stream((host, port), left, self.mtu)
+            .await
+            .map_err(|e| {
+                TunnelUnavailable::Transient(format!(
+                    "the tunnel is up, but nothing answered at {host}:{port} inside it: {e}"
+                ))
+            })?;
 
-        info!("tunnel: up, and {host}:{port} answered through it");
+        info!(
+            "tunnel: up, and {host}:{port} answered through it (MTU {}, MSS {})",
+            self.mtu,
+            self.mtu.mss()
+        );
         Ok(Box::new(stream))
     }
 }

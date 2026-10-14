@@ -52,16 +52,20 @@ public sealed class SynoClient : IDisposable
     /// from the NAS if the file is not there.</param>
     /// <param name="vpnHost">The NAS's address inside that tunnel, which its
     /// public name does not resolve to.</param>
+    /// <param name="vpnMtu">The largest IP packet inside that tunnel, in bytes;
+    /// 0 for its default. Outside the range the tunnel can use, the connect
+    /// fails with <c>InvalidArg</c> before any login.</param>
     public static SynoClient Connect(
         string host, ushort port, bool https, string username, string password,
         string? otp = null, bool autoRelogin = true, bool verifySsl = true,
         string? domain = null, string? vpnProfile = null, string? vpnHost = null,
-        string? vpnProfileRemote = null)
+        string? vpnProfileRemote = null, uint vpnMtu = 0)
     {
         NativeMethods.EnsureResolver();
         var err = default(NativeError);
         int rc = syno_connect(host, port, https, username, password, otp, autoRelogin,
-            verifySsl, domain, vpnProfile, vpnHost, vpnProfileRemote, out var handle, ref err);
+            verifySsl, domain, vpnProfile, vpnHost, vpnProfileRemote, vpnMtu, out var handle,
+            ref err);
         Check(rc, ref err);
         return new SynoClient(handle);
     }

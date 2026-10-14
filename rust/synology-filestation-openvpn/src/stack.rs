@@ -71,6 +71,81 @@ const WRAP: usize = 4 + 64 + 16 + 4 + 16;
 /// connecting and browsing looked fine and copying a file did not.
 pub const MTU: usize = LINK - OUTER - WRAP;
 
+/// The smallest MTU [`Mtu::new`] accepts: what IPv4 obliges every host to
+/// take in one piece.
+pub const MIN_MTU: usize = 576;
+
+/// What the MSS `smoltcp` offers leaves out of the MTU: an IPv4 header and a
+/// TCP header, neither with options.
+pub const MSS_OVERHEAD: usize = 20 + 20;
+
+/// The largest IP packet either end puts in the tunnel: ours directly, the far
+/// end's because our SYN offers it an MSS of [`Mtu::mss`].
+///
+/// Smaller than [`MTU`] is the point of setting one. A path that can carry
+/// less than [`LINK`] — a carrier hop that splits every full-size datagram,
+/// leaving reassembly to equipment that is slow at it — is fixed by sending
+/// less, and the far end only sends less if our SYN asks it to. There is no
+/// kernel here for `--mssfix` to rewrite that SYN in; this is the same knob.
+///
+/// Larger is refused: a full packet would no longer fit what the server
+/// pushes, and the kernel answering `EMSGSIZE` kills the tunnel on the first
+/// bulk write (see [`MTU`]).
+///
+/// A type rather than a `usize` so that the range is checked once, where the
+/// number was typed, and nothing further down can be handed one out of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Mtu(usize);
+
+impl Mtu {
+    /// `bytes`, if the tunnel can use it, or why not.
+    pub fn new(bytes: usize) -> Result<Self, String> {
+        if (MIN_MTU..=MTU).contains(&bytes) {
+            Ok(Self(bytes))
+        } else {
+            Err(format!(
+                "a tunnel MTU of {bytes} is outside {MIN_MTU}..={MTU}: smaller than \
+                 {MIN_MTU} is not carried by every path, and larger than {MTU} does not fit \
+                 the {LINK} bytes the server allows a datagram"
+            ))
+        }
+    }
+
+    pub fn get(self) -> usize {
+        self.0
+    }
+
+    /// The MSS our SYN offers with this MTU.
+    pub fn mss(self) -> usize {
+        self.0 - MSS_OVERHEAD
+    }
+}
+
+/// [`MTU`]: the largest that, wrapped, fits what the server pushes.
+impl Default for Mtu {
+    fn default() -> Self {
+        Self(MTU)
+    }
+}
+
+impl std::fmt::Display for Mtu {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::str::FromStr for Mtu {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, String> {
+        let bytes = raw
+            .trim()
+            .parse()
+            .map_err(|_| format!("`{raw}` is not a number of bytes"))?;
+        Self::new(bytes)
+    }
+}
+
 /// How much each direction may buffer inside the stack.
 ///
 /// This is the window, and the window is the speed limit: a sender may have
@@ -134,15 +209,24 @@ pub struct TunnelDevice {
     /// back. `Cell` because a transmit token borrows the device immutably.
     sent: std::cell::Cell<usize>,
     received: usize,
+    /// The largest IP packet handed to the tunnel, which is also what
+    /// `smoltcp` derives the MSS it offers from.
+    mtu: Mtu,
 }
 
 impl TunnelDevice {
     pub fn new(outbound: mpsc::Sender<Vec<u8>>) -> Self {
+        Self::with_mtu(outbound, Mtu::default())
+    }
+
+    /// A device whose packets are at most `mtu` bytes.
+    pub fn with_mtu(outbound: mpsc::Sender<Vec<u8>>, mtu: Mtu) -> Self {
         Self {
             outbound,
             inbox: std::collections::VecDeque::new(),
             sent: std::cell::Cell::new(0),
             received: 0,
+            mtu,
         }
     }
 
@@ -177,7 +261,7 @@ impl Device for TunnelDevice {
         let mut capabilities = DeviceCapabilities::default();
         // Layer three: no ethernet header, because `dev tun` has none.
         capabilities.medium = Medium::Ip;
-        capabilities.max_transmission_unit = MTU;
+        capabilities.max_transmission_unit = self.mtu.get();
         capabilities
     }
 
@@ -371,25 +455,29 @@ impl TunnelStream {
     /// — for this driver's purpose, the NAS at its address inside the tunnel.
     /// `patience` bounds the wait: a peer that never answers is a failure, not
     /// a caller blocked forever.
+    ///
+    /// `mtu` is the largest IP packet either end will put in the tunnel.
     pub async fn connect(
         outbound: mpsc::Sender<Vec<u8>>,
         inbound: mpsc::Receiver<Vec<u8>>,
         ifconfig: Ifconfig,
         remote: (Ipv4Addr, u16),
         patience: Duration,
+        mtu: Mtu,
     ) -> Result<Self, Error> {
         // Both ends of the question "is the NAS even on our subnet?". The push
         // reply says what we were given; this says what we then dialled, and
         // the pair is what turns "nothing answered" into an answer.
         tracing::debug!(
-            "stack: connecting {}/{} → {}:{} inside the tunnel",
+            "stack: connecting {}/{} → {}:{} inside the tunnel, MTU {mtu} (MSS {})",
             ifconfig.address,
             ifconfig.prefix,
             remote.0,
-            remote.1
+            remote.1,
+            mtu.mss()
         );
 
-        let mut device = TunnelDevice::new(outbound);
+        let mut device = TunnelDevice::with_mtu(outbound, mtu);
         let started = StdInstant::now();
 
         let mut interface = Interface::new(
@@ -1035,5 +1123,45 @@ mod tests {
 
         assert!(said.contains("refused or reset"), "got {said}");
         assert!(said.contains('1'), "got {said}");
+    }
+
+    /// Smaller is the experiment: a path that splits every full-size datagram
+    /// is fixed by sending smaller ones.
+    #[test]
+    fn an_mtu_up_to_the_default_is_accepted() {
+        assert_eq!(Mtu::new(MTU).map(Mtu::get), Ok(MTU));
+        assert_eq!(Mtu::new(1150).map(Mtu::get), Ok(1150));
+        assert_eq!(Mtu::new(MIN_MTU).map(Mtu::get), Ok(MIN_MTU));
+        assert_eq!(Mtu::default().get(), MTU);
+    }
+
+    /// Larger is not: past the default a full packet no longer fits the 1450
+    /// the server pushes, and the kernel answering `EMSGSIZE` kills the tunnel
+    /// on the first bulk write. Below IPv4's minimum nothing is obliged to
+    /// carry it.
+    ///
+    /// The message names the range, since the GUI shows it rather than keep a
+    /// copy of these numbers, and says "MTU", which is how it tells this
+    /// refusal from the others.
+    #[test]
+    fn an_mtu_outside_the_range_is_refused_and_says_the_range() {
+        for wrong in [MTU + 1, MIN_MTU - 1, 0] {
+            let said = Mtu::new(wrong).expect_err("refused");
+            assert!(said.contains("MTU"), "got {said}");
+            assert!(said.contains(&wrong.to_string()), "got {said}");
+            assert!(said.contains(&MTU.to_string()), "got {said}");
+            assert!(said.contains(&MIN_MTU.to_string()), "got {said}");
+        }
+    }
+
+    /// What a command line hands over.
+    #[test]
+    fn an_mtu_parses_from_text_and_says_why_it_did_not() {
+        assert_eq!("1150".parse::<Mtu>().map(Mtu::get), Ok(1150));
+        assert!("2000".parse::<Mtu>().expect_err("too big").contains("2000"));
+        assert!("big"
+            .parse::<Mtu>()
+            .expect_err("not a number")
+            .contains("big"));
     }
 }

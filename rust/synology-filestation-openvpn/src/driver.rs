@@ -20,7 +20,7 @@ use tokio::task::JoinHandle;
 
 use crate::ip::Ifconfig;
 use crate::session::{Session, SessionConfig};
-use crate::stack::{LinkFailure, TunnelStream};
+use crate::stack::{LinkFailure, Mtu, TunnelStream};
 use crate::Error;
 
 /// How long to wait for the tunnel to come up before giving up on it.
@@ -194,6 +194,7 @@ impl Tunnel {
         self,
         remote: (Ipv4Addr, u16),
         patience: Duration,
+        mtu: Mtu,
     ) -> Result<TunnelStream, Error> {
         let ifconfig = self
             .ifconfig
@@ -242,7 +243,7 @@ impl Tunnel {
             }
         });
 
-        match TunnelStream::connect(to_tunnel, from_tunnel, ifconfig, remote, patience).await {
+        match TunnelStream::connect(to_tunnel, from_tunnel, ifconfig, remote, patience, mtu).await {
             // And the same question again on the way out: the tunnel may have
             // stopped while the connection was being made, in which case what
             // happened is not that nobody answered.

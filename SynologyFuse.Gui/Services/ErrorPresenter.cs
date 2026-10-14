@@ -56,6 +56,14 @@ public static class ErrorPresenter
 
     private static (string Title, string Remedy) Advise(SynoException ex) => ex.Status switch
     {
+        // Refused before any login, so "the NAS rejected the request" would send
+        // the user to the wrong place. The native message carries the range,
+        // and stays in the detail beneath this.
+        SynoStatus.InvalidArg when ex.Message.Contains("tunnel MTU", StringComparison.Ordinal) => (
+            "The VPN MTU is out of range",
+            "Set VPN MTU to a value in the range given below, or clear it to use the "
+            + "default."),
+
         // A rejected login is the common case and the one worth being specific
         // about: DSM says exactly why, and each cause has a different fix.
         SynoStatus.LoginFailed => LoginAdvice(ex.DsmCode),

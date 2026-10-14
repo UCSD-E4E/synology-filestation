@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use synology_filestation_connect::{
     profile::ProfileSource, Chain, Endpoints, NoTransport, NoTunnel, OpenVpnTunnel, TcpProber,
-    Transport, TransportPolicy, Tunnel, DEFAULT_RECHECK,
+    Transport, TransportPolicy, Tunnel, VpnMtu, DEFAULT_RECHECK,
 };
 use synology_filestation_smb::SmbConfig;
 
@@ -185,6 +185,17 @@ struct Args {
     /// set it up made, and this client has no business assuming a layout.
     #[arg(long)]
     vpn_profile_nas: Option<String>,
+
+    /// The largest IP packet inside the VPN tunnel, in bytes.
+    ///
+    /// The client-side `--mssfix`: the NAS sizes what it sends by the MSS this
+    /// offers (MTU less 40), so lowering it keeps the tunnel's datagrams under
+    /// a path that would otherwise split every full-size one in two — which a
+    /// carrier NAT then has to put back together, slowly. Takes effect on the
+    /// next tunnel. Default: the largest that fits what the server pushes.
+    /// A value the tunnel cannot use is refused, and the error gives the range.
+    #[arg(long, value_name = "BYTES")]
+    vpn_mtu: Option<VpnMtu>,
 }
 
 /// How long the whole tunnel attempt may take, handshake included.
@@ -202,13 +213,16 @@ const VPN_PATIENCE: Duration = Duration::from_secs(30);
 /// to HTTP with nothing to wait for.
 fn tunnel_from(args: &Args, username: &str, password: &str) -> Box<dyn Tunnel> {
     match &args.vpn_profile {
-        Some(profile) => Box::new(OpenVpnTunnel::new(
-            profile,
-            username,
-            password,
-            args.domain.as_deref(),
-            VPN_PATIENCE,
-        )),
+        Some(profile) => Box::new(
+            OpenVpnTunnel::new(
+                profile,
+                username,
+                password,
+                args.domain.as_deref(),
+                VPN_PATIENCE,
+            )
+            .with_mtu(args.vpn_mtu.unwrap_or_default()),
+        ),
         None => Box::new(NoTunnel),
     }
 }
@@ -516,7 +530,7 @@ fn run(args: Args) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_umask, probe_timeout, smb_disabled, tunnel_from, Args};
+    use super::{parse_umask, probe_timeout, smb_disabled, tunnel_from, Args, VpnMtu};
     use clap::Parser;
     use std::time::Duration;
 
@@ -583,6 +597,43 @@ mod tests {
         assert_eq!(parse_umask("077"), Ok(0o077));
         assert_eq!(parse_umask("0o027"), Ok(0o027));
         assert_eq!(parse_umask("0"), Ok(0));
+    }
+
+    fn args_plus(extra: &[&str]) -> Result<Args, clap::Error> {
+        let mut argv = vec![
+            "synology-fuse",
+            "--host",
+            "nas.example",
+            "--username",
+            "someone",
+        ];
+        argv.extend(extra);
+        argv.push("/mnt/nas");
+        Args::try_parse_from(argv)
+    }
+
+    #[test]
+    fn a_vpn_mtu_is_taken_from_the_command_line() {
+        let args = args_plus(&["--vpn-mtu", "1150"]).expect("parses");
+        assert_eq!(args.vpn_mtu.map(VpnMtu::get), Some(1150));
+    }
+
+    #[test]
+    fn without_one_the_tunnel_keeps_its_default() {
+        assert_eq!(args_plus(&[]).expect("parses").vpn_mtu, None);
+    }
+
+    /// Refused before anything connects, rather than surfacing as a tunnel
+    /// that never came up and a quiet fall back to HTTP.
+    #[test]
+    fn a_vpn_mtu_the_tunnel_cannot_carry_is_refused_up_front() {
+        for wrong in ["2000", "100", "big"] {
+            let said = args_plus(&["--vpn-mtu", wrong])
+                .err()
+                .unwrap_or_else(|| panic!("{wrong} is refused"))
+                .to_string();
+            assert!(said.contains(wrong), "names the value: {said}");
+        }
     }
 
     #[test]
