@@ -64,6 +64,7 @@ pub use upload::DEFAULT_SLICE_SIZE;
 
 mod download;
 mod metadata;
+mod moves;
 mod session;
 mod throttle;
 mod upload;

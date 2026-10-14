@@ -377,7 +377,7 @@ impl SynologyClient {
 /// A task id as DSM reads it: JSON. `start` hands back `FileStation_…`, and
 /// `status`/`stop` look up the decoded parameter, so a bare id names no task
 /// and is answered with 599. File Station's own UI sends it quoted.
-fn task_param(taskid: &str) -> String {
+pub(super) fn task_param(taskid: &str) -> String {
     serde_json::to_string(taskid).expect("a string always encodes")
 }
 

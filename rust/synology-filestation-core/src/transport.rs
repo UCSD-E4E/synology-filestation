@@ -171,6 +171,18 @@ pub trait MetadataTransport: Send + Sync {
         let _ = (path, size);
         Err(SynoFsError::NotSupported)
     }
+
+    /// Move `from` to the full path `to` — another directory, another name, or
+    /// both — without the bytes leaving the server. A file already at `to` is
+    /// replaced, as `rename(2)` replaces it.
+    ///
+    /// Declining is the default and the right answer for anything that would
+    /// have to copy: [`SynologyClient::move_to`](crate::SynologyClient::move_to)
+    /// then asks FileStation, which moves on the appliance too.
+    async fn move_to(&self, from: &str, to: &str) -> Result<(), SynoFsError> {
+        let _ = (from, to);
+        Err(SynoFsError::NotSupported)
+    }
 }
 
 /// What opening a file for writing may create, and what it promises about a
@@ -402,5 +414,47 @@ mod tests {
             b.allows(probe + Duration::from_secs(30)),
             "half-opens again after another full cooldown"
         );
+    }
+}
+
+/// What is at a move's destination, as far as the move needs to know.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Destination {
+    Absent,
+    File,
+    Dir { empty: bool },
+}
+
+/// What a move may replace at its destination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MovePlan {
+    /// Nothing is there; a name that turns up meanwhile must make the move
+    /// fail rather than be overwritten.
+    Fresh,
+    /// A file replaces a file.
+    ReplaceFile,
+    /// A folder replaces an empty folder, which goes first.
+    ReplaceEmptyDir,
+}
+
+/// `rename(2)`'s rule for what a move may replace, shared by every way of
+/// moving so none of them can disagree.
+///
+/// FileStation's CopyMove with `overwrite` would merge a folder into one
+/// already there and overwrite what both held; SMB's replacing rename would
+/// refuse a folder outright. Neither is what a mount promises. A folder only
+/// replaces an empty folder, a non-empty one is [`SynoFsError::NotEmpty`],
+/// and a file and a folder never replace each other.
+pub fn plan_move(source_is_dir: bool, dest: Destination) -> Result<MovePlan, SynoFsError> {
+    match (source_is_dir, dest) {
+        (_, Destination::Absent) => Ok(MovePlan::Fresh),
+        (false, Destination::File) => Ok(MovePlan::ReplaceFile),
+        (true, Destination::Dir { empty: true }) => Ok(MovePlan::ReplaceEmptyDir),
+        (true, Destination::Dir { empty: false }) => Err(SynoFsError::NotEmpty),
+        // EISDIR and ENOTDIR, which the kernel answers itself before a FUSE
+        // mount is asked; anyone else calling is told the name is taken.
+        (false, Destination::Dir { .. }) | (true, Destination::File) => {
+            Err(SynoFsError::AlreadyExists)
+        }
     }
 }
