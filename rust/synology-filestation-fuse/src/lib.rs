@@ -260,7 +260,9 @@ pub struct MountOptions {
     /// Masked out of the synthetic mode (Linux only), as a process umask would
     /// be: the default 0o022 yields 0o755 directories and 0o644 files.
     pub umask: u16,
-    /// Depth of the speculative read-ahead window, in blocks (Linux/FUSE only).
+    /// Depth of the speculative read-ahead window, in blocks per connection
+    /// reads go over (Linux/FUSE only): a streaming reader ramps to this times
+    /// the live connection count, and the window fetched at open stays this.
     /// `0` switches speculation off entirely, which is what a bulk consumer
     /// walking a corpus wants: it reads each file once, in order, and every
     /// speculative block is waste that competes with the next file.
@@ -638,12 +640,47 @@ fn session_config(allow_other: bool, opts: &MountOptions) -> fuser::Config {
     config
 }
 
+/// How many connections a mount's reads go over now: the SMB transport's
+/// live count, or 1 on HTTP. Asked on every read-ahead decision, so it must be
+/// cheap — [`SmbTransport::read_connections`](synology_filestation_smb::SmbTransport::read_connections)
+/// is.
+pub type ReadConnections = Arc<dyn Fn() -> usize + Send + Sync>;
+
+/// How many connections a mount on `legs` reads over, asked live: the SMB
+/// transport's count while its session is up, and 1 otherwise — including
+/// with no SMB at all, where reads take the one HTTP path.
+pub fn live_read_connections(legs: Option<&Arc<legs::Legs>>) -> ReadConnections {
+    match legs {
+        Some(legs) => {
+            let smb = legs.session().clone();
+            Arc::new(move || smb.read_connections().max(1))
+        }
+        None => Arc::new(|| 1),
+    }
+}
+
+/// [`spawn_mount`] for a mount whose reads go over one connection.
 #[cfg(target_os = "linux")]
 pub fn spawn_mount(
     client: Arc<SynologyClient>,
     rt: tokio::runtime::Handle,
     mountpoint: PathBuf,
     opts: MountOptions,
+) -> Result<MountHandle, SynoFsError> {
+    spawn_mount_reading_over(client, rt, mountpoint, opts, Arc::new(|| 1))
+}
+
+/// Mount, with read-ahead and its in-flight budget scaled by `connections`:
+/// per connection, so each one a lossy link caps has its share in flight.
+/// Off campus, four connections ran at 2.8 MB/s on one connection's
+/// read-ahead and 4.4 on four.
+#[cfg(target_os = "linux")]
+pub fn spawn_mount_reading_over(
+    client: Arc<SynologyClient>,
+    rt: tokio::runtime::Handle,
+    mountpoint: PathBuf,
+    opts: MountOptions,
+    connections: ReadConnections,
 ) -> Result<MountHandle, SynoFsError> {
     use cache::{DirCache, InodeCache, ReadCache, READ_BLOCK_SIZE};
     use fs::SynologyFS;
@@ -679,7 +716,8 @@ pub fn spawn_mount(
         rt,
         owner,
         opts.prefetch_blocks,
-    );
+    )
+    .reading_over(move || connections());
 
     // As a non-root user, allow_other requires `user_allow_other` in
     // /etc/fuse.conf; running as root always permits it.
@@ -791,6 +829,19 @@ fn validate_macos_mountpoint(mountpoint: &std::path::Path) -> Result<(), SynoFsE
         )));
     }
     Ok(())
+}
+
+/// [`spawn_mount`]: the macOS and Windows backends do not read ahead this way,
+/// so the number of connections changes nothing there.
+#[cfg(not(target_os = "linux"))]
+pub fn spawn_mount_reading_over(
+    client: Arc<SynologyClient>,
+    rt: tokio::runtime::Handle,
+    mountpoint: PathBuf,
+    opts: MountOptions,
+    _connections: ReadConnections,
+) -> Result<MountHandle, SynoFsError> {
+    spawn_mount(client, rt, mountpoint, opts)
 }
 
 #[cfg(target_os = "macos")]
@@ -1792,6 +1843,32 @@ mod another_connection_tests {
         let text = logs.text();
         assert!(!text.contains("lasted"), "got: {text}");
         assert!(!text.contains("WARN"), "got: {text}");
+    }
+
+    /// A mount with no SMB at all, and one whose SMB has no session yet, both
+    /// read over the one HTTP path: their read-ahead must not widen, since
+    /// on HTTP its budget is what protects the NAS's CGI backend.
+    #[test]
+    fn with_no_smb_session_reads_go_over_one_connection() {
+        assert_eq!(live_read_connections(None)(), 1, "no SMB at all");
+
+        let cfg = synology_filestation_smb::SmbConfig::new("127.0.0.1", "u", "p");
+        let smb = Arc::new(
+            synology_filestation_smb::SmbTransport::unconnected(&cfg, || {
+                Box::pin(async { Err(SynoFsError::NotSupported) })
+            })
+            .with_read_connections(4, || Box::pin(async { Err(SynoFsError::NotSupported) })),
+        );
+        let legs = Arc::new(crate::legs::Legs::new(
+            chain_to("127.0.0.1:9", false),
+            smb,
+            DIAL,
+        ));
+        assert_eq!(
+            live_read_connections(Some(&legs))(),
+            1,
+            "four asked for, none up yet"
+        );
     }
 
     /// No SMB leg, no connection — and no dial to find that out.

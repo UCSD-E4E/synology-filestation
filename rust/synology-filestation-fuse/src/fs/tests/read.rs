@@ -599,3 +599,78 @@ fn a_run_that_reaches_eof_stores_the_partial_block_it_got() {
     );
     assert_eq!(tail.as_ref(), &body[3 * BLOCK as usize..]);
 }
+
+// ── Reading over several connections ─────────────────────────────────────────
+
+/// Measured off campus: four SMB connections with the default read-ahead ran
+/// at 2.8 MB/s, and with four times the read-ahead at 4.4 — each connection
+/// had only one to four reads in flight, so the window, not the link, was the
+/// limit. The budget is per connection, so it widens with them.
+#[test]
+fn with_four_connections_the_prefetch_budget_is_four_times_as_wide() {
+    let f = fixture_reading_over(4);
+    eight_slow_opens(&f);
+
+    let on_the_wire: u64 = downloaded_spans(&f).iter().map(|(_, blocks)| blocks).sum();
+    let budget = 4 * MAX_INFLIGHT_PREFETCH_BLOCKS as u64;
+    assert!(
+        on_the_wire > MAX_INFLIGHT_PREFETCH_BLOCKS as u64,
+        "four connections, and still only {on_the_wire} blocks in flight"
+    );
+    assert!(
+        on_the_wire <= budget,
+        "{on_the_wire} blocks in flight; four connections allow {budget}"
+    );
+}
+
+/// The reads a sequential reader ramps up to, as runs of blocks.
+fn ramp_spans(f: &Fixture) -> Vec<u64> {
+    mount_download(
+        f,
+        body_with_magic(JPEG_MAGIC, 400 * BLOCK as usize),
+        Map::new(),
+    );
+    let ino = seed_size(f, "/share/scan.jpg", 400 * BLOCK);
+    f.fs.prime_open(1, ino, "/share/scan.jpg");
+    for b in 0..200 {
+        f.fs.read_ahead(1, ino, "/share/scan.jpg", b * BLOCK, BLOCK);
+        f.fs.await_prefetch(ino);
+    }
+    downloaded_spans(f)
+        .into_iter()
+        .map(|(_, blocks)| blocks)
+        .collect()
+}
+
+#[test]
+fn a_sequential_reader_ramps_further_over_more_connections() {
+    let alone = ramp_spans(&fixture_with_prefetch_over(4, 1));
+    let spread = ramp_spans(&fixture_with_prefetch_over(4, 4));
+
+    assert!(
+        alone.iter().all(|&blocks| blocks <= 4),
+        "one connection keeps to its depth of 4: {alone:?}"
+    );
+    assert!(
+        spread.iter().any(|&blocks| blocks > 4),
+        "four connections read further ahead than one: {spread:?}"
+    );
+}
+
+/// The window an open fetches is not scaled: it is fetched for every file
+/// opened, which for a file browser making thumbnails is every video in a
+/// folder, and the reads it saves are the first few.
+#[test]
+fn the_window_fetched_at_open_does_not_grow_with_connections() {
+    let f = fixture_reading_over(4);
+    eight_slow_opens(&f);
+
+    let head_blocks = DEFAULT_PREFETCH_BLOCKS - 1;
+    assert!(
+        downloaded_spans(&f)
+            .iter()
+            .all(|&(_, blocks)| blocks <= head_blocks),
+        "{:?}",
+        downloaded_spans(&f)
+    );
+}

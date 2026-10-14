@@ -391,7 +391,8 @@
               <TextBlock Grid.Column="0" Text="Read-ahead (blocks)" VerticalAlignment="Center" Margin="0,0,12,0" />
               <NumericUpDown Grid.Column="1"
                              Value="{Binding PrefetchBlocks}"
-                             Minimum="0" Maximum="256" FormatString="0" />
+                             Minimum="0" Maximum="256" FormatString="0"
+                             ToolTip.Tip="Blocks of 256 KiB to read ahead, for each SMB connection: four connections read four times as far ahead. 0 turns read-ahead off." />
             </Grid>
 
             <!-- Loss on a home link caps each TCP connection rather than the
