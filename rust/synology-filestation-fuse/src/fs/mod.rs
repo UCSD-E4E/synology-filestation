@@ -33,7 +33,7 @@ use dirs::Snapshot;
 use dirs::{DirHandles, Flights};
 use prefetch::{
     is_indexed_media, open_window, InflightGuard, ReadAhead, MAX_INFLIGHT_PREFETCH_BLOCKS,
-    MAX_PREFETCH_SPAN,
+    MAX_PREFETCH_SPAN, PREFETCH_PERMITS,
 };
 use transfer::{
     Buffers, OpenHandle, Rewrites, Transfers, WriteBuffer, WriteSink, MAX_CONCURRENT_TRANSFERS,
@@ -67,8 +67,14 @@ pub struct SynologyFS {
     /// Bounds speculative block downloads. One permit is one block on the
     /// wire. See [`MAX_INFLIGHT_PREFETCH_BLOCKS`].
     prefetch_limit: Arc<tokio::sync::Semaphore>,
-    /// Depth of the speculative window, in blocks. `0` switches it off.
+    /// Depth of the speculative window, in blocks, per connection reads go
+    /// over. `0` switches it off.
     prefetch_blocks: u64,
+    /// How many connections reads go over now: the SMB transport's live
+    /// count, and 1 on HTTP or with no session. The streaming read-ahead and
+    /// the in-flight budget are per connection, so they widen with it — and
+    /// stay as they were on HTTP, where the budget protects `synoscgi`.
+    parallel: Arc<dyn Fn() -> usize + Send + Sync>,
     /// Per-handle sequential-read state, paired with the inode the handle is
     /// on so that closing one handle only cancels prefetch when it is the last
     /// handle on that file.
@@ -122,13 +128,26 @@ impl SynologyFS {
             hashes: Arc::new(Mutex::new(HashMap::new())),
             next_fh: AtomicU64::new(1),
             owner,
-            prefetch_limit: Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_PREFETCH_BLOCKS)),
+            prefetch_limit: Arc::new(tokio::sync::Semaphore::new(PREFETCH_PERMITS)),
             prefetch_blocks,
+            parallel: Arc::new(|| 1),
             read_ahead: Arc::new(Mutex::new(HashMap::new())),
             prefetch_tasks: Arc::new(Mutex::new(HashMap::new())),
             dir_handles: Arc::new(Mutex::new(HashMap::new())),
             flights: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Read over however many connections `connections` says, from now on.
+    /// See the `parallel` field.
+    pub fn reading_over(mut self, connections: impl Fn() -> usize + Send + Sync + 'static) -> Self {
+        self.parallel = Arc::new(connections);
+        self
+    }
+
+    /// How many connections reads go over now; never less than one.
+    fn connections(&self) -> usize {
+        (self.parallel)().max(1)
     }
 
     /// A transfer bundle owning clones of everything a background task needs.
@@ -449,7 +468,9 @@ impl SynologyFS {
         let blocks = {
             let mut handles = self.read_ahead.lock().unwrap();
             let (_, state) = handles.entry(fh).or_insert((ino, ReadAhead::default()));
-            state.advance(offset, size, block_size, total_blocks, self.prefetch_blocks)
+            // Per connection: each keeps its share of the window in flight.
+            let depth = self.prefetch_blocks * self.connections() as u64;
+            state.advance(offset, size, block_size, total_blocks, depth)
         };
         self.spawn_prefetch(ino, path, blocks);
     }
@@ -536,10 +557,18 @@ impl SynologyFS {
             .iter()
             .map(|&idx| InflightGuard::new(self.read_cache.clone(), ino, idx))
             .collect();
-        let permit = self
-            .prefetch_limit
-            .clone()
-            .try_acquire_many_owned(blocks.len() as u32);
+        // The budget is per connection. The semaphore is sized for the most
+        // connections there could be, and this is what holds it to the ones
+        // there are; two runs passing it together overshoot by a run at most.
+        let budget = MAX_INFLIGHT_PREFETCH_BLOCKS * self.connections();
+        let in_flight = PREFETCH_PERMITS.saturating_sub(self.prefetch_limit.available_permits());
+        let permit = if in_flight + blocks.len() > budget {
+            Err(tokio::sync::TryAcquireError::NoPermits)
+        } else {
+            self.prefetch_limit
+                .clone()
+                .try_acquire_many_owned(blocks.len() as u32)
+        };
         let Ok(permit) = permit else {
             debug!(
                 "prefetch: budget full, dropping {} block(s) from {} at block {}",

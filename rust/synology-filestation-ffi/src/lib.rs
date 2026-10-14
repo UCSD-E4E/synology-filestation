@@ -30,7 +30,9 @@ use synology_filestation_core::error::SynoFsError;
 use synology_filestation_core::types::SynoFileInfo;
 use synology_filestation_core::ThrottleConfig;
 use synology_filestation_fuse::legs::{Legs, DEFAULT_WATCH_INTERVAL};
-use synology_filestation_fuse::{is_otp_required, spawn_mount, MountOptions};
+use synology_filestation_fuse::{
+    is_otp_required, live_read_connections, spawn_mount_reading_over, MountOptions,
+};
 use synology_filestation_smb::SmbConfig;
 use tokio::runtime::Runtime;
 use tracing::{info, warn};
@@ -1231,11 +1233,12 @@ pub unsafe extern "C" fn syno_mount(
             prefetch_blocks,
             ..MountOptions::default()
         };
-        match spawn_mount(
+        match spawn_mount_reading_over(
             c.inner.clone(),
             c.runtime.handle().clone(),
             mountpoint,
             opts,
+            live_read_connections(c.legs.as_ref()),
         ) {
             Ok(handle) => {
                 let mount = Box::new(SynoMount {

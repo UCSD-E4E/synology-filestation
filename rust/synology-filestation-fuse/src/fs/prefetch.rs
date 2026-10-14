@@ -166,6 +166,11 @@ impl ReadAhead {
 /// Eight parallel opens used to mean ~160 simultaneous requests against
 /// `synoscgi`, the shared CGI backend the whole appliance runs on.
 ///
+/// Per connection reads go over: four SMB connections get four times this,
+/// since on a lossy link each needs its share in flight to be worth having —
+/// measured off campus, four connections ran at 2.8 MB/s on one connection's
+/// budget and 4.4 on four. On HTTP it stays this.
+///
 /// Counted in blocks rather than in requests, which is what it used to be.
 /// That was the same thing when a speculative task fetched one block, but
 /// coalescing made a task a run of up to [`MAX_PREFETCH_SPAN`] blocks and
@@ -177,6 +182,12 @@ impl ReadAhead {
 /// satisfied by an empty budget and no run can wait on permits it will never
 /// get.
 pub(super) const MAX_INFLIGHT_PREFETCH_BLOCKS: usize = 32;
+
+/// The permits the budget's semaphore holds: enough for 64 connections'
+/// worth. What a mount may use is [`MAX_INFLIGHT_PREFETCH_BLOCKS`] for each
+/// connection its reads go over now, checked before the permits are taken —
+/// so one connection, and HTTP, keep exactly the budget they always had.
+pub(super) const PREFETCH_PERMITS: usize = MAX_INFLIGHT_PREFETCH_BLOCKS * 64;
 
 /// Releases a block's in-flight claim unless the download published it.
 ///

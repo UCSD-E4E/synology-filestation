@@ -15,7 +15,9 @@ use tracing::{info, warn};
 use synology_filestation_core::client::SynologyClient;
 use synology_filestation_fuse::legs::{Legs, DEFAULT_WATCH_INTERVAL};
 use synology_filestation_fuse::logfile::{self, LogFile};
-use synology_filestation_fuse::{is_otp_required, spawn_mount, MountOptions};
+use synology_filestation_fuse::{
+    is_otp_required, live_read_connections, spawn_mount_reading_over, MountOptions,
+};
 
 /// Aborts a background task when it goes out of scope.
 struct AbortOnDrop(tokio::task::JoinHandle<()>);
@@ -86,10 +88,12 @@ struct Args {
     #[arg(long, default_value_t = 256)]
     read_cache_mb: u64,
 
-    /// Speculative read-ahead depth in 256 KiB blocks; 0 disables it.
-    /// Read-ahead only fires for a reader that is streaming, and the window
-    /// at open only for a container that keeps its index at the end. Bulk
-    /// consumers walking a corpus want 0 (Linux/FUSE only)
+    /// Speculative read-ahead depth in 256 KiB blocks, per SMB connection
+    /// reads go over (so 64 at the default 16 and four connections, 16 on
+    /// HTTP); 0 disables it. Read-ahead only fires for a reader that is
+    /// streaming, and the window at open only for a container that keeps its
+    /// index at the end. Bulk consumers walking a corpus want 0 (Linux/FUSE
+    /// only)
     #[arg(long, default_value_t = synology_filestation_fuse::DEFAULT_PREFETCH_BLOCKS)]
     prefetch_blocks: u64,
 
@@ -526,7 +530,13 @@ fn run(args: Args) -> anyhow::Result<()> {
         gid: args.gid,
         umask: args.umask,
     };
-    let handle = spawn_mount(client.clone(), rt.handle().clone(), args.mountpoint, opts)?;
+    let handle = spawn_mount_reading_over(
+        client.clone(),
+        rt.handle().clone(),
+        args.mountpoint,
+        opts,
+        live_read_connections(legs.as_ref()),
+    )?;
 
     // Block until Ctrl-C, then unmount and log out — preserving the previous
     // foreground CLI behaviour now that the mount itself runs in the background.
