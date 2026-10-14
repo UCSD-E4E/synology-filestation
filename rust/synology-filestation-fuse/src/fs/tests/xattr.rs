@@ -299,6 +299,9 @@ fn a_file_being_truncated_is_not_hashed() {
 #[test]
 fn both_ends_of_a_move_in_flight_are_not_hashed() {
     let f = fixture();
+    mount_existing(&f, "/a/f.bin", false);
+    // The copy path is the slow one, and the one this needs in flight.
+    mount_copymove_refused(&f);
     mount_md5(&f, Duration::ZERO);
     mount_download_slow(&f, ramp(4096), Duration::from_millis(800));
     mount_delete_ok(&f);
