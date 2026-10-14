@@ -24,7 +24,8 @@
 //! when to tear it down is still not a question anything here has to answer
 //! — [`Chain`](crate::Chain) answers it in its own terms. A tunnel that has
 //! stopped is not reused: the caller asking again is usually asking because
-//! of that.
+//! of that. One that is running is never replaced because a connection
+//! through it failed: that is a second login for an account already logged in.
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -97,31 +98,18 @@ impl OpenVpnTunnel {
         port: u16,
         deadline: tokio::time::Instant,
     ) -> Result<Connection, TunnelUnavailable> {
-        let (tunnel, fresh) = self.shared.get_or_raise(|| self.raise(host, port)).await?;
-        match connect_through(&tunnel, host, port, deadline).await {
-            Ok(stream) => {
-                if fresh {
-                    info!("tunnel: up, and {host}:{port} answered through it");
-                } else {
-                    debug!(
-                        "tunnel: another connection to {host}:{port} through the one already up"
-                    );
-                }
-                Ok(stream)
-            }
-            // A tunnel that was up a moment ago and now carries nothing may
-            // have died without saying so yet. One fresh attempt, rather than
-            // a failure the next call would only repeat on the same tunnel.
-            Err(e) if !fresh => {
-                debug!("tunnel: the one already up would not carry a connection ({e}); raising another");
-                self.shared.forget();
-                let (tunnel, _) = self.shared.get_or_raise(|| self.raise(host, port)).await?;
-                let stream = connect_through(&tunnel, host, port, deadline).await?;
-                info!("tunnel: up, and {host}:{port} answered through it");
-                Ok(stream)
-            }
-            Err(e) => Err(e),
+        let (stream, fresh) = through(
+            &self.shared,
+            || self.raise(host, port),
+            |tunnel: Mux| async move { connect_through(&tunnel, host, port, deadline).await },
+        )
+        .await?;
+        if fresh {
+            info!("tunnel: up, and {host}:{port} answered through it");
+        } else {
+            debug!("tunnel: another connection to {host}:{port} through the one already up");
         }
+        Ok(stream)
     }
 
     /// Raise a tunnel, ready to carry connections.
@@ -227,13 +215,30 @@ impl SharedTunnel {
         *held = tunnel.downgrade();
         Ok((tunnel, true))
     }
+}
 
-    /// Stop offering the tunnel held now. Connections on it keep it.
-    fn forget(&self) {
-        if let Ok(mut held) = self.held.try_lock() {
-            *held = WeakMux::default();
-        }
-    }
+/// A connection through the shared tunnel: the one running, or one `raise`
+/// brings up when none is. The flag is `true` when this call raised it.
+///
+/// A connection that fails is that connection's failure, and the tunnel is
+/// kept. Replacing a running tunnel because one connection through it would
+/// not open is a second VPN login for an account already logged in, on
+/// exactly the lossy links that make connections time out. A tunnel that has
+/// really died says so (`Mux::is_running`), and the next call raises another.
+async fn through<R, RF, C, CF>(
+    shared: &SharedTunnel,
+    raise: R,
+    connect: C,
+) -> Result<(Connection, bool), TunnelUnavailable>
+where
+    R: FnOnce() -> RF,
+    RF: std::future::Future<Output = Result<Mux, TunnelUnavailable>>,
+    C: FnOnce(Mux) -> CF,
+    CF: std::future::Future<Output = Result<Connection, TunnelUnavailable>>,
+{
+    let (tunnel, fresh) = shared.get_or_raise(raise).await?;
+    let connection = connect(tunnel).await?;
+    Ok((connection, fresh))
 }
 
 #[async_trait]
@@ -460,6 +465,41 @@ mod tests {
             held.push(ask.await.expect("finished").expect("a tunnel").0);
         }
         assert_eq!(raiser.count(), 1);
+    }
+
+    /// Regression: a connection that would not open through a tunnel already
+    /// up made `reach` let go of that tunnel and raise another — a second VPN
+    /// login for the same account, while the first tunnel went on carrying
+    /// the mount's session. On a lossy link, where extra connections time out
+    /// now and then, that is a login per timeout, and a server that allows
+    /// one session per account drops the one in use. A tunnel that is still
+    /// running is not replaced because one connection through it failed.
+    #[tokio::test]
+    async fn a_connection_that_fails_through_a_running_tunnel_raises_no_other() {
+        let shared = SharedTunnel::default();
+        let raiser = Raiser::new();
+        let (in_use, _) = shared
+            .get_or_raise(|| raiser.raise())
+            .await
+            .expect("the session's tunnel");
+
+        for _ in 0..3 {
+            let failed = through(
+                &shared,
+                || raiser.raise(),
+                |_tunnel| async { Err(TunnelUnavailable::Transient("timed out".into())) },
+            )
+            .await;
+            assert!(failed.is_err(), "the connection's failure is reported");
+        }
+
+        assert_eq!(raiser.count(), 1, "one tunnel, one login");
+        let (_still, fresh) = shared
+            .get_or_raise(|| raiser.raise())
+            .await
+            .expect("offered");
+        assert!(!fresh, "and the running tunnel is still the one offered");
+        drop(in_use);
     }
 
     fn addr(text: &str) -> SocketAddr {

@@ -62,6 +62,8 @@ struct Shared {
     ifconfig: Ifconfig,
     /// Why the tunnel stopped, once it has.
     failure: LinkFailure,
+    /// Which local port the next connection gets.
+    ports: PortCursor,
     demux: JoinHandle<()>,
 }
 
@@ -91,6 +93,7 @@ impl Mux {
                 routes,
                 ifconfig,
                 failure,
+                ports: PortCursor::new(),
                 demux,
             }),
         }
@@ -111,7 +114,7 @@ impl Mux {
         let (to_connection, inbound) = mpsc::channel(QUEUE_DEPTH);
         // Claimed before the SYN goes out, or the answer to it has nowhere to
         // go.
-        let port = claim_port(&shared.routes, to_connection);
+        let port = claim_port(&shared.routes, &shared.ports, to_connection);
         match TunnelStream::connect_from(
             shared.outbound.clone(),
             inbound,
@@ -163,14 +166,56 @@ fn lock(routes: &Routes) -> std::sync::MutexGuard<'_, HashMap<u16, mpsc::Sender<
     routes.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// The first local port connections use, and how many there are: the
+/// ephemeral range.
+const FIRST_PORT: u16 = 49152;
+const PORTS: u16 = 16000;
+
+/// Hands out local ports in turn, wrapping at the end of the range.
+///
+/// In turn rather than at random, so a port a connection has just given up
+/// comes round again only after every other one has. The NAS may hold the old
+/// connection in TIME_WAIT for minutes, and a new SYN from the same address
+/// and port meets an acknowledgement for the old one, or a reset.
+struct PortCursor(std::sync::atomic::AtomicU16);
+
+impl PortCursor {
+    /// Starting somewhere random, so two tunnels in one process — each with
+    /// its own address, but still — do not walk the same ports in step.
+    fn new() -> Self {
+        Self::starting_at(FIRST_PORT + rand::random::<u16>() % PORTS)
+    }
+
+    fn starting_at(port: u16) -> Self {
+        Self(std::sync::atomic::AtomicU16::new(port))
+    }
+
+    fn take(&self) -> u16 {
+        let next = |port: u16| {
+            Some(if port >= FIRST_PORT + PORTS - 1 {
+                FIRST_PORT
+            } else {
+                port + 1
+            })
+        };
+        match self.0.fetch_update(
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+            next,
+        ) {
+            Ok(port) | Err(port) => port,
+        }
+    }
+}
+
 /// A local port no live connection on this link is using, now routed to `to`.
-fn claim_port(routes: &Routes, to: mpsc::Sender<Vec<u8>>) -> u16 {
+fn claim_port(routes: &Routes, cursor: &PortCursor, to: mpsc::Sender<Vec<u8>>) -> u16 {
     let mut routes = lock(routes);
     // Connections that have gone leave their route behind until something
     // notices; this is a good moment to.
     routes.retain(|_, sender| !sender.is_closed());
     loop {
-        let port = 49152 + (rand::random::<u16>() % 16000);
+        let port = cursor.take();
         if let std::collections::hash_map::Entry::Vacant(free) = routes.entry(port) {
             free.insert(to);
             return port;
@@ -241,6 +286,36 @@ mod tests {
         p[header_len..header_len + 2].copy_from_slice(&445u16.to_be_bytes());
         p[header_len + 2..header_len + 4].copy_from_slice(&to.to_be_bytes());
         p
+    }
+
+    /// Regression: ports were picked at random, so one a connection had just
+    /// given up could be handed straight to the next. The NAS may still hold
+    /// the old connection in TIME_WAIT, and a SYN from the same address and
+    /// port then meets an acknowledgement for the old one, or a reset. With
+    /// several connections from one address that is no longer rare. Ports are
+    /// handed out in turn, so one comes round again only after every other.
+    #[test]
+    fn a_port_given_up_is_not_handed_out_again_soon() {
+        let routes: Routes = Arc::default();
+        let cursor = PortCursor::new();
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..1000 {
+            let (to, gone) = mpsc::channel(1);
+            let port = claim_port(&routes, &cursor, to);
+            assert!(seen.insert(port), "port {port} came round again");
+            drop(gone);
+        }
+    }
+
+    #[test]
+    fn ports_in_use_are_skipped_and_the_range_wraps() {
+        let routes: Routes = Arc::default();
+        let cursor = PortCursor::starting_at(FIRST_PORT + PORTS - 1);
+        let (to, _held) = mpsc::channel(1);
+        let last = claim_port(&routes, &cursor, to.clone());
+        assert_eq!(last, FIRST_PORT + PORTS - 1);
+        let wrapped = claim_port(&routes, &cursor, to);
+        assert_eq!(wrapped, FIRST_PORT, "after the last port, the first");
     }
 
     #[test]

@@ -242,10 +242,8 @@ fn probe_timeout(env: Option<String>) -> Duration {
         .unwrap_or(Duration::from_secs(2))
 }
 
-/// Parse a umask the way `umask(1)` and every mount helper do: octal, with no
-/// `0o` prefix required. Base 10 would silently turn the near-universal `022`
-/// into 0o026.
-/// At least one: the session itself is a connection.
+/// The number of SMB connections to read over: at least one, since the
+/// session itself is a connection.
 fn parse_connections(raw: &str) -> Result<usize, String> {
     match raw.parse::<usize>() {
         Ok(0) => Err("at least 1: the session itself is one".into()),
@@ -254,6 +252,9 @@ fn parse_connections(raw: &str) -> Result<usize, String> {
     }
 }
 
+/// Parse a umask the way `umask(1)` and every mount helper do: octal, with no
+/// `0o` prefix required. Base 10 would silently turn the near-universal `022`
+/// into 0o026.
 fn parse_umask(raw: &str) -> Result<u16, String> {
     let value = u16::from_str_radix(raw.trim_start_matches("0o"), 8)
         .map_err(|_| format!("`{raw}` is not an octal umask"))?;

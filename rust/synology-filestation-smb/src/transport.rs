@@ -355,6 +355,22 @@ async fn open_lane(
     }
 }
 
+/// How long closing a file on an extra connection may take before that
+/// connection is given up on. Well under the 30 s response deadline, because
+/// a write is waiting on it.
+const LANE_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long a retired connection is kept to close its handles as its reads
+/// finish, before whatever is left goes with the connection.
+const DRAIN_FOR: Duration = Duration::from_secs(60);
+
+/// Whether an extra connection that failed a piece should be let go of: its
+/// link is gone, or this session served the piece it could not — in which
+/// case the fault was the connection's, not the file's.
+fn should_retire(connection_lost: bool, main_served_it: bool) -> bool {
+    connection_lost || main_served_it
+}
+
 /// An open read handle for `logical` on an extra session, from its cache when
 /// one is there. The session is locked only to attach the share.
 async fn lane_reader(
@@ -1385,11 +1401,8 @@ impl SmbTransport {
         let mut dropped = self.handles.invalidate(logical);
         dropped.extend(self.handles.take_free());
         self.close_handles(dropped).await;
-        for lane in self.pool.live() {
-            let mut dropped = lane.handles.invalidate(logical);
-            dropped.extend(lane.handles.take_free());
-            close_in(&lane.handles, dropped).await;
-        }
+        self.forget_on_lanes(|cache| cache.invalidate(logical))
+            .await;
     }
 
     /// Forget every handle at or under `logical`, on every connection.
@@ -1397,19 +1410,93 @@ impl SmbTransport {
         let mut dropped = self.handles.invalidate_prefix(logical);
         dropped.extend(self.handles.take_free());
         self.close_handles(dropped).await;
-        for lane in self.pool.live() {
-            let mut dropped = lane.handles.invalidate_prefix(logical);
+        self.forget_on_lanes(|cache| cache.invalidate_prefix(logical))
+            .await;
+    }
+
+    /// Close what `take` takes from each extra connection's handles — the
+    /// draining ones too, whose reads may still hold a file open — all at
+    /// once, and each within [`LANE_CLOSE_TIMEOUT`].
+    ///
+    /// The write or rename waiting on this is on the main session, which is
+    /// fine. One extra connection gone quiet on a lossy link would otherwise
+    /// hold it for the response deadline, 30 s, and they used to be closed
+    /// one after another. A connection that will not close a file in that
+    /// time is let go of.
+    async fn forget_on_lanes<F>(&self, take: F)
+    where
+        F: Fn(&HandleCache<FileReader>) -> Vec<Arc<FileReader>>,
+    {
+        let closes = self.pool.all().into_iter().map(|lane| {
+            let mut dropped = take(&lane.handles);
             dropped.extend(lane.handles.take_free());
-            close_in(&lane.handles, dropped).await;
+            async move {
+                let closed =
+                    tokio::time::timeout(LANE_CLOSE_TIMEOUT, close_in(&lane.handles, dropped))
+                        .await
+                        .is_ok();
+                (lane, closed)
+            }
+        });
+        for (lane, closed) in futures_util::future::join_all(closes).await {
+            if !closed {
+                tracing::debug!(
+                    "SMB: a connection to read over would not close a file in time; \
+                     letting it go"
+                );
+                self.retire_lane(&lane);
+            }
         }
     }
 
-    /// Let go of every extra connection. Their handles go with them: a
-    /// session's open files are closed by the server when its connection is.
+    /// Stop reading over one extra connection, and close what it has open
+    /// once its reads are done.
+    fn retire_lane(&self, lane: &Arc<Lane>) {
+        if self.pool.retire(lane) {
+            self.drain_lane(Arc::clone(lane));
+        }
+    }
+
+    /// Let go of every extra connection, closing what they have open once
+    /// their reads are done.
     fn retire_lanes(&self) {
         for lane in self.pool.retire_all() {
-            drop(lane.handles.clear());
+            self.drain_lane(lane);
         }
+    }
+
+    /// Close a retired connection's handles in the background as their reads
+    /// finish, then forget it.
+    ///
+    /// Until then it stays where invalidation can find it: a read in flight
+    /// on it still holds a file open, and a rename that met that file would
+    /// fail with a sharing violation from a handle nothing was tracking.
+    /// Dropping the handles instead left them open on the NAS for as long as
+    /// any read kept the connection alive.
+    fn drain_lane(&self, lane: Arc<Lane>) {
+        let pool = Arc::clone(&self.pool);
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            drop(lane.handles.clear());
+            pool.drained(&lane);
+            return;
+        };
+        runtime.spawn(async move {
+            let until = tokio::time::Instant::now() + DRAIN_FOR;
+            let mut closing = lane.handles.clear();
+            loop {
+                let _ = tokio::time::timeout(LANE_CLOSE_TIMEOUT, close_in(&lane.handles, closing))
+                    .await;
+                if lane.handles.is_empty() || tokio::time::Instant::now() >= until {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                closing = lane.handles.take_free();
+            }
+            // Whatever is left goes with the connection, when the last read
+            // on it lets go.
+            drop(lane.handles.clear());
+            pool.drained(&lane);
+        });
     }
 
     /// Read `length` bytes at `offset`.
@@ -1436,10 +1523,16 @@ impl SmbTransport {
         let loc = SmbPath::from_logical(logical)?;
         let lanes = self.lanes_for_reading();
         let pieces = stripes(offset, length, lanes.len() + 1);
+        // One piece, the commonest case: a block read. Its bytes are the
+        // answer as they are, with nothing to join.
         if let [only] = pieces.as_slice() {
-            if only.connection == 0 {
-                return self.read_on_main(&loc, logical, offset, length).await;
-            }
+            return match only.connection.checked_sub(1) {
+                None => self.read_on_main(&loc, logical, offset, length).await,
+                Some(n) => {
+                    self.read_on_lane(&lanes[n], &loc, logical, offset, length)
+                        .await
+                }
+            };
         }
         let reads = pieces.iter().map(|piece| {
             let lane = piece.connection.checked_sub(1).map(|n| &lanes[n]);
@@ -1459,16 +1552,17 @@ impl SmbTransport {
         });
         let parts = futures_util::future::try_join_all(reads).await?;
 
-        let mut out = Vec::with_capacity(parts.iter().map(Bytes::len).sum());
+        let mut out = bytes::BytesMut::with_capacity(parts.iter().map(Bytes::len).sum());
         for (part, piece) in parts.iter().zip(&pieces) {
             out.extend_from_slice(part);
-            // Short means the file ends here. Anything after it was asked of
-            // a file that is not that long.
+            // Short means the file ends here — this session's word on it, as
+            // `read_on_lane` sees to. Anything after was asked of a file that
+            // is not that long.
             if (part.len() as u64) < piece.length {
                 break;
             }
         }
-        Ok(Bytes::from(out))
+        Ok(out.freeze())
     }
 
     /// One piece of a read, on an extra connection — or on this session if
@@ -1486,18 +1580,30 @@ impl SmbTransport {
             reader.read_at(offset, length).await
         };
         match read.await {
-            Ok(data) => Ok(Bytes::from(data)),
+            Ok(data) if data.len() as u64 == length => Ok(Bytes::from(data)),
+            // Short: the end of the file as this connection's handle saw it
+            // when it was opened, which may be older than the file — one that
+            // grew by a route that does not invalidate, DSM's own API say.
+            // The pieces are joined up to the first short one, so a stale
+            // end here would cut the whole read off without an error. This
+            // session has the last word on where the file ends, and the
+            // handle is reopened next time.
+            Ok(_) => {
+                let dropped = lane.handles.invalidate(logical);
+                close_in(&lane.handles, dropped).await;
+                self.read_on_main(loc, logical, offset, length).await
+            }
             Err(e) => {
                 let dropped = lane.handles.invalidate(logical);
                 close_in(&lane.handles, dropped).await;
-                if is_connection_lost(e.kind()) {
-                    tracing::debug!("SMB: a connection to read over was lost ({e})");
-                    self.pool.retire(lane);
-                    drop(lane.handles.clear());
-                }
                 // This session gives the answer that counts: the bytes, or
                 // the error the caller should see.
-                self.read_on_main(loc, logical, offset, length).await
+                let answer = self.read_on_main(loc, logical, offset, length).await;
+                if should_retire(is_connection_lost(e.kind()), answer.is_ok()) {
+                    tracing::debug!("SMB: letting go of a connection to read over ({e})");
+                    self.retire_lane(lane);
+                }
+                answer
             }
         }
     }
@@ -2108,6 +2214,26 @@ mod tests {
             .into_iter()
             .map(|p| (p.offset, p.length, p.connection))
             .collect()
+    }
+
+    /// Regression: an extra connection was let go of only when its link was
+    /// lost. One broken any other way — its tree disconnected after a share
+    /// change, say — failed every stripe dealt to it for the life of the
+    /// mount, each failure a wasted round trip and a re-read, so reading was
+    /// slower than on one connection. If this session serves the piece the
+    /// extra one could not, the extra one is what failed.
+    #[test]
+    fn an_extra_connection_is_let_go_of_when_it_is_the_one_at_fault() {
+        assert!(should_retire(true, false), "its link is gone");
+        assert!(should_retire(true, true));
+        assert!(
+            should_retire(false, true),
+            "it failed where this session did not"
+        );
+        assert!(
+            !should_retire(false, false),
+            "both failed: the file's problem, not the connection's"
+        );
     }
 
     #[test]

@@ -39,10 +39,29 @@ use crate::transport::BoxedStream;
 /// is what the kernel does without read-ahead — still spreads across them.
 pub(crate) const STRIPE: u64 = 256 * 1024;
 
-/// How long to wait before trying again after an extra connection could not
-/// be opened. A network that will not carry one more connection now will
-/// rarely carry it a moment later, and every attempt is a dial and a login.
-const RETRY_AFTER: Duration = Duration::from_secs(30);
+/// How long to wait after the first failure to open an extra connection.
+/// A network that will not carry one more connection now will rarely carry it
+/// a moment later, and every attempt is a dial and a login.
+const FIRST_BACKOFF: Duration = Duration::from_secs(30);
+
+/// The longest wait between attempts.
+const MAX_BACKOFF: Duration = Duration::from_secs(30 * 60);
+
+/// Failures in a row after which no more attempts are made until the session
+/// changes. A NAS that caps sessions per account, or a path that times every
+/// extra connection out, would otherwise cost a login every few minutes for
+/// the life of the mount, for nothing.
+const MAX_FAILURES: u32 = 6;
+
+/// How long to wait after `failures` failed attempts in a row, or `None` once
+/// it is time to stop asking.
+fn backoff(failures: u32) -> Option<Duration> {
+    match failures {
+        0 => Some(Duration::ZERO),
+        n if n >= MAX_FAILURES => None,
+        n => Some(FIRST_BACKOFF.saturating_mul(1 << (n - 1)).min(MAX_BACKOFF)),
+    }
+}
 
 /// What an opener returns: a stream to the server, and the name the server
 /// goes by on it — the public name directly, an address inside a tunnel.
@@ -123,8 +142,12 @@ pub(crate) struct Pool {
     /// to another leg, or was rebuilt — so one opened for the old session is
     /// not kept for the new.
     generation: AtomicU64,
-    /// Not before this, after an attempt that failed.
-    retry_at: Mutex<Option<Instant>>,
+    /// Failed attempts in a row, and when the last one was.
+    failures: Mutex<(u32, Option<Instant>)>,
+    /// Connections let go of whose handles are still being closed. Kept
+    /// where invalidation can find them: a read in flight on one still holds
+    /// a file open, and a rename meeting it fails.
+    draining: Mutex<Vec<Arc<Lane>>>,
     /// The count last logged, so a change is said once.
     reported: AtomicUsize,
 }
@@ -141,7 +164,8 @@ impl Pool {
             live: Mutex::new(Vec::new()),
             opening: AtomicBool::new(false),
             generation: AtomicU64::new(0),
-            retry_at: Mutex::new(None),
+            failures: Mutex::new((0, None)),
+            draining: Mutex::new(Vec::new()),
             reported: AtomicUsize::new(0),
         }
     }
@@ -161,14 +185,19 @@ impl Pool {
     ///
     /// [`opened`]: Self::opened
     pub fn should_open(&self) -> Option<(Opener, u64)> {
+        self.should_open_at(Instant::now())
+    }
+
+    /// [`should_open`](Self::should_open), as if it were `now`.
+    pub fn should_open_at(&self, now: Instant) -> Option<(Opener, u64)> {
         let opener = self.opener.clone()?;
         if self.lock().len() >= self.wanted {
             return None;
         }
-        if let Some(at) = *self.retry_at.lock().unwrap_or_else(|e| e.into_inner()) {
-            if Instant::now() < at {
-                return None;
-            }
+        let (failures, last) = *self.failures.lock().unwrap_or_else(|e| e.into_inner());
+        let wait = backoff(failures)?;
+        if last.is_some_and(|at| now < at + wait) {
+            return None;
         }
         if self.opening.swap(true, Ordering::SeqCst) {
             return None;
@@ -195,33 +224,68 @@ impl Pool {
         true
     }
 
-    /// The attempt to open connections is over; `failed` puts off the next.
+    /// The attempt to open connections is over. A failure puts off the next,
+    /// for longer each time, and enough in a row stop them; a success
+    /// forgets the failures before it.
     pub fn opened(&self, failed: bool) {
-        if failed {
-            *self.retry_at.lock().unwrap_or_else(|e| e.into_inner()) =
-                Some(Instant::now() + RETRY_AFTER);
+        {
+            let mut failures = self.failures.lock().unwrap_or_else(|e| e.into_inner());
+            *failures = if failed {
+                (failures.0.saturating_add(1), Some(Instant::now()))
+            } else {
+                (0, None)
+            };
         }
         self.opening.store(false, Ordering::SeqCst);
     }
 
-    /// Stop reading over `lane`: its connection has died.
-    pub fn retire(&self, lane: &Arc<Lane>) {
+    /// Stop reading over `lane`. Returns whether it was live, in which case
+    /// it is now draining and the caller closes its handles.
+    pub fn retire(&self, lane: &Arc<Lane>) -> bool {
         let mut live = self.lock();
         let before = live.len();
         live.retain(|l| !Arc::ptr_eq(l, lane));
         let now = live.len();
         drop(live);
-        if now != before {
-            self.report(now);
+        if now == before {
+            return false;
         }
+        self.drain(lane.clone());
+        self.report(now);
+        true
     }
 
-    /// Let go of every extra connection, returning them so their handles can
-    /// be dealt with, and disown any being opened now.
+    fn draining(&self) -> std::sync::MutexGuard<'_, Vec<Arc<Lane>>> {
+        self.draining.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn drain(&self, lane: Arc<Lane>) {
+        self.draining().push(lane);
+    }
+
+    /// Every connection whose handles invalidation has to reach: the live
+    /// ones and the ones still draining.
+    pub fn all(&self) -> Vec<Arc<Lane>> {
+        let mut all = self.live();
+        all.extend(self.draining().iter().cloned());
+        all
+    }
+
+    /// A draining connection has closed everything it had open.
+    pub fn drained(&self, lane: &Arc<Lane>) {
+        self.draining().retain(|l| !Arc::ptr_eq(l, lane));
+    }
+
+    /// Let go of every extra connection, returning them — now draining — so
+    /// their handles can be closed, and disown any being opened now. A new
+    /// session is a new chance, so past failures are forgotten.
     pub fn retire_all(&self) -> Vec<Arc<Lane>> {
         self.generation.fetch_add(1, Ordering::SeqCst);
-        *self.retry_at.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *self.failures.lock().unwrap_or_else(|e| e.into_inner()) = (0, None);
         let gone = std::mem::take(&mut *self.lock());
+        for lane in &gone {
+            self.drain(lane.clone());
+        }
         if !gone.is_empty() {
             self.report(0);
         }
@@ -232,6 +296,69 @@ impl Pool {
         let was = self.reported.swap(extra, Ordering::SeqCst);
         if was != extra {
             tracing::info!("SMB: reading over {} connections", extra + 1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn opener() -> Opener {
+        Arc::new(|| Box::pin(async { Err(SynoFsError::Io("not in this test".into())) }))
+    }
+
+    /// Each failure doubles the wait, up to a ceiling, and after enough of
+    /// them there is no next attempt: a NAS that caps sessions per account,
+    /// or a path that times every extra connection out, would otherwise cost
+    /// a dial and a login every half minute for the life of the mount.
+    #[test]
+    fn failing_to_open_backs_off_and_then_stops() {
+        assert_eq!(backoff(0), Some(Duration::ZERO));
+        assert_eq!(backoff(1), Some(Duration::from_secs(30)));
+        assert_eq!(backoff(2), Some(Duration::from_secs(60)));
+        assert_eq!(backoff(3), Some(Duration::from_secs(120)));
+        assert!(backoff(MAX_FAILURES - 1).is_some());
+        assert_eq!(backoff(MAX_FAILURES), None, "given up");
+        for n in 1..MAX_FAILURES {
+            assert!(backoff(n).unwrap() <= MAX_BACKOFF);
+        }
+    }
+
+    #[test]
+    fn a_pool_that_has_given_up_asks_again_once_its_session_changes() {
+        let pool = Pool::with(3, Some(opener()));
+        for _ in 0..MAX_FAILURES {
+            let claimed = pool.should_open_at(Instant::now() + Duration::from_secs(86_400));
+            assert!(claimed.is_some(), "still trying");
+            pool.opened(true);
+        }
+        assert!(
+            pool.should_open_at(Instant::now() + Duration::from_secs(86_400))
+                .is_none(),
+            "given up, however long it waits"
+        );
+
+        drop(pool.retire_all());
+        assert!(
+            pool.should_open().is_some(),
+            "a new session is a new chance"
+        );
+    }
+
+    #[test]
+    fn an_attempt_that_works_forgets_the_failures_before_it() {
+        let pool = Pool::with(3, Some(opener()));
+        let far = Instant::now() + Duration::from_secs(86_400);
+        for _ in 0..MAX_FAILURES - 1 {
+            pool.should_open_at(far).expect("trying");
+            pool.opened(true);
+        }
+        pool.should_open_at(far).expect("trying");
+        pool.opened(false);
+        for _ in 0..MAX_FAILURES - 1 {
+            pool.should_open_at(far).expect("the count started again");
+            pool.opened(true);
         }
     }
 }

@@ -605,6 +605,35 @@ impl Chain {
         Ok(chosen)
     }
 
+    /// Another connection on the leg the chain has settled on, for a caller
+    /// that already has a session there and wants one more beside it.
+    ///
+    /// Unlike [`reach_smb`](Self::reach_smb) this decides nothing and
+    /// remembers nothing: no probe, no re-deciding when the decision has
+    /// expired, and a failure is only the caller's. A connection that timed
+    /// out on a lossy link says nothing about the tunnel, and treating it as
+    /// the tunnel failing put the session that *was* working on HTTP for the
+    /// tunnel's recheck interval. Finding a better leg is the watch's job.
+    ///
+    /// [`SmbRoute::Unavailable`] when no SMB leg is settled.
+    pub async fn another_smb_connection(&self) -> Result<SmbRoute, TunnelUnavailable> {
+        let Some(Route {
+            transport,
+            smb_host: Some(host),
+        }) = self.current()
+        else {
+            return Ok(SmbRoute::Unavailable);
+        };
+        match transport {
+            Transport::SmbDirect => Ok(SmbRoute::Direct { host }),
+            Transport::SmbOverVpn => {
+                let connection = self.tunnel.open(&host, self.smb_port).await?;
+                Ok(SmbRoute::Tunnelled { host, connection })
+            }
+            Transport::Https => Ok(SmbRoute::Unavailable),
+        }
+    }
+
     /// Reach SMB by the best route there is.
     ///
     /// This is what a mount calls. [`route`](Self::route) answers *which*
@@ -1478,6 +1507,85 @@ mod tests {
 
         assert!(chain.better_than(Transport::Https).await.is_none());
         assert_eq!(tunnel.opens(), 1);
+    }
+
+    // ── Another connection on the leg already settled ────────────────────────
+
+    /// A mount reads over extra connections on the leg its session is on.
+    /// They go through the tunnel already up, to the address inside it.
+    #[tokio::test]
+    async fn another_connection_on_the_tunnel_leg_goes_through_the_tunnel() {
+        let prober = FakeProber::nothing_answers();
+        let tunnel = FakeTunnel::reaching();
+        let chain = chain(TransportPolicy::default(), prober.clone(), tunnel.clone());
+        chain.reach_smb().await.unwrap();
+        let probes = prober.probes();
+
+        match chain.another_smb_connection().await {
+            Ok(SmbRoute::Tunnelled { host, .. }) => assert_eq!(host, INSIDE),
+            _ => panic!("another connection through the tunnel"),
+        }
+        assert_eq!(tunnel.opens(), 2);
+        assert_eq!(prober.probes(), probes, "and nothing was probed to get it");
+    }
+
+    /// Regression: the extra connections asked `reach_smb`, whose failure
+    /// path marks the tunnel failed and re-decides without it. One extra
+    /// connection timing out on a lossy link then put the main session's
+    /// redial on HTTP for ten minutes. A failed extra connection is that
+    /// connection's problem, and says nothing about the tunnel.
+    #[tokio::test]
+    async fn a_failed_extra_connection_leaves_the_chain_as_it_was() {
+        let prober = FakeProber::nothing_answers();
+        let tunnel = FakeTunnel::reaching();
+        let chain = chain(TransportPolicy::default(), prober.clone(), tunnel.clone());
+        chain.reach_smb().await.unwrap();
+
+        tunnel.stops_working();
+        assert!(chain.another_smb_connection().await.is_err());
+        tunnel.works.store(true, Ordering::SeqCst);
+
+        assert_eq!(
+            chain.current().map(|r| r.transport),
+            Some(Transport::SmbOverVpn),
+            "still settled on the tunnel"
+        );
+        assert!(
+            matches!(chain.reach_smb().await, Ok(SmbRoute::Tunnelled { .. })),
+            "and the redial still goes through it"
+        );
+    }
+
+    #[tokio::test]
+    async fn another_connection_on_the_direct_leg_names_the_host_to_dial() {
+        let prober = FakeProber::answering(&[PUBLIC]);
+        let tunnel = FakeTunnel::reaching();
+        let chain = chain(TransportPolicy::default(), prober.clone(), tunnel.clone());
+        chain.reach_smb().await.unwrap();
+        let probes = prober.probes();
+
+        match chain.another_smb_connection().await {
+            Ok(SmbRoute::Direct { host }) => assert_eq!(host, PUBLIC),
+            _ => panic!("the direct host"),
+        }
+        assert_eq!(prober.probes(), probes, "no probe");
+        assert_eq!(tunnel.opens(), 0, "and no tunnel");
+    }
+
+    /// Nothing settled, or HTTP: there is no SMB leg for another connection
+    /// to go on, and finding one is the watch's job, not a read's.
+    #[tokio::test]
+    async fn with_no_smb_leg_settled_there_is_no_other_connection() {
+        let prober = FakeProber::nothing_answers();
+        let tunnel = FakeTunnel::reaching();
+        let chain = chain(TransportPolicy::default(), prober.clone(), tunnel.clone());
+
+        assert!(matches!(
+            chain.another_smb_connection().await,
+            Ok(SmbRoute::Unavailable)
+        ));
+        assert_eq!(prober.probes(), 0);
+        assert_eq!(tunnel.opens(), 0);
     }
 
     #[tokio::test]

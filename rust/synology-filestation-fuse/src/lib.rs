@@ -127,12 +127,15 @@ pub const DEFAULT_SMB_CONNECTIONS: usize = 4;
 /// How to open one more stream to the NAS on the leg the mount is on, for
 /// [`SmbTransport::with_read_connections`](synology_filestation_smb::SmbTransport::with_read_connections).
 ///
-/// The same question the redial asks — [`Chain::reach_smb`] — and the same
-/// answer: a dial on the direct leg, another connection through the tunnel
-/// already up on the other. What differs is that nothing died. So it says
-/// nothing above debug, where the redial warns: its "the stream lasted Ns"
-/// is the record of a session that keeps falling over, and a mount opening
-/// its read connections would bury it.
+/// A dial on the direct leg, another connection through the tunnel already up
+/// on the other: [`Chain::another_smb_connection`], which reads the leg the
+/// chain settled on and changes nothing about it. Not [`Chain::reach_smb`],
+/// the redial's question: its failure path marks the tunnel failed and
+/// re-decides, so one extra connection timing out on a lossy link would put
+/// the main session's next redial on HTTP. And it says nothing above debug,
+/// where the redial warns: its "the stream lasted Ns" is the record of a
+/// session that keeps falling over, and a mount opening its read connections
+/// would bury it.
 pub fn another_connection(
     chain: Arc<Chain>,
     dial: Dial,
@@ -140,7 +143,7 @@ pub fn another_connection(
     move || {
         let chain = chain.clone();
         Box::pin(async move {
-            match chain.reach_smb().await {
+            match chain.another_smb_connection().await {
                 Ok(SmbRoute::Tunnelled { host, connection }) => {
                     Ok((Box::new(connection) as BoxedStream, host))
                 }
@@ -1729,7 +1732,9 @@ mod another_connection_tests {
         let host = listener.local_addr().expect("its address").to_string();
         let accepted = tokio::spawn(async move { listener.accept().await.map(|_| ()) });
 
-        let (_stream, named) = another_connection(chain_to(&host, true), DIAL)()
+        let chain = chain_to(&host, true);
+        chain.reach_smb().await.expect("settled on the direct leg");
+        let (_stream, named) = another_connection(chain, DIAL)()
             .await
             .unwrap_or_else(|e| panic!("a stream: {e}"));
 
@@ -1750,7 +1755,9 @@ mod another_connection_tests {
         let host = listener.local_addr().expect("its address").to_string();
         let accepting = tokio::spawn(async move { listener.accept().await.map(|_| ()) });
 
-        another_connection(chain_to(&host, true), DIAL)()
+        let chain = chain_to(&host, true);
+        chain.reach_smb().await.expect("settled on the direct leg");
+        another_connection(chain, DIAL)()
             .await
             .unwrap_or_else(|e| panic!("a stream: {e}"));
         let _ = accepting.await;

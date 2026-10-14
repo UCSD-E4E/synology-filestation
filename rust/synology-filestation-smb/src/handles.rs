@@ -136,6 +136,13 @@ impl<H> HandleCache<H> {
         self.state.lock().unwrap().deferred.push(handle);
     }
 
+    /// Whether nothing is cached and nothing is parked: every handle this
+    /// cache ever held has been handed back.
+    pub(crate) fn is_empty(&self) -> bool {
+        let state = self.state.lock().unwrap();
+        state.handles.is_empty() && state.deferred.is_empty()
+    }
+
     /// Parked handles nothing is reading through any more.
     pub(crate) fn take_free(&self) -> Vec<Arc<H>> {
         let mut state = self.state.lock().unwrap();
