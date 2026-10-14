@@ -53,6 +53,39 @@ pub(crate) fn session_error(err: &smb2::Error) -> SynoFsError {
     }
 }
 
+/// Map a move the server would not make.
+///
+/// A dead link stays a transport failure, which falls back. Anything else is
+/// the server's answer, and final: mapped to `Io` it read as "SMB is down",
+/// tripping the breaker and sending the move on to FileStation's CopyMove —
+/// which, with `overwrite`, merged a folder into the one SMB had refused to
+/// replace. `smb2` has no kind for a folder that is not empty, so that one is
+/// read off the status.
+pub(crate) fn move_error(err: &smb2::Error) -> SynoFsError {
+    use smb2::types::status::NtStatus;
+    if let smb2::Error::Protocol {
+        status: NtStatus::DIRECTORY_NOT_EMPTY,
+        ..
+    } = err
+    {
+        return SynoFsError::NotEmpty;
+    }
+    match err.kind() {
+        ErrorKind::ConnectionLost | ErrorKind::TimedOut | ErrorKind::SessionExpired => {
+            to_syno_error(err)
+        }
+        // Open elsewhere: the server's refusal, as an access denial would be.
+        ErrorKind::SharingViolation => SynoFsError::PermissionDenied,
+        _ => match to_syno_error(err) {
+            SynoFsError::Io(why) => {
+                tracing::warn!("SMB refused a move: {why}");
+                SynoFsError::InvalidArg
+            }
+            definitive => definitive,
+        },
+    }
+}
+
 /// Map `smb2`'s high-level [`ErrorKind`] to a [`SynoFsError`]. `context` is the
 /// human-readable detail carried into the `Io` variants.
 pub(crate) fn kind_to_syno(kind: ErrorKind, context: &str) -> SynoFsError {
@@ -91,6 +124,36 @@ pub(crate) fn kind_to_syno(kind: ErrorKind, context: &str) -> SynoFsError {
 mod tests {
     use super::*;
     use synology_filestation_core::error::ErrorCategory;
+
+    fn refused(status: smb2::types::status::NtStatus) -> smb2::Error {
+        smb2::Error::Protocol {
+            status,
+            command: smb2::types::Command::SetInfo,
+        }
+    }
+
+    /// Regression (review of #319): a move the server refused for a reason
+    /// of its own mapped to `Io`, which reads as "this backend is down". The
+    /// breaker tripped, and the move went on to FileStation's CopyMove,
+    /// which with `overwrite` merged a folder into the one SMB had refused to
+    /// replace.
+    #[test]
+    fn a_refused_move_is_final_and_a_dead_link_is_not() {
+        use smb2::types::status::NtStatus;
+        assert!(matches!(
+            move_error(&refused(NtStatus::DIRECTORY_NOT_EMPTY)),
+            SynoFsError::NotEmpty
+        ));
+        for status in [NtStatus::SHARING_VIOLATION, NtStatus(0xC000_0999)] {
+            let e = move_error(&refused(status));
+            assert_ne!(e.category(), ErrorCategory::Transport, "{status:?}: {e:?}");
+        }
+        assert_eq!(
+            move_error(&smb2::Error::Disconnected).category(),
+            ErrorCategory::Transport,
+            "a dead link still falls back"
+        );
+    }
 
     /// Regression (Copilot, #315): any `LoginFailed` counted, and core wraps
     /// HTTP re-login failures in it too — a TLS error or a DSM 400 handed

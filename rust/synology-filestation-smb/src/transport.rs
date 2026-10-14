@@ -21,6 +21,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use smb2::{ClientConfig, FileReader, RenameOptions, SmbClient, Tree};
+use synology_filestation_core::transport::{plan_move, Destination, MovePlan};
 use synology_filestation_core::{
     MetadataTransport, OpenWriteTransport, ReadTransport, StreamReadTransport,
     StreamWriteTransport, SynoAdditional, SynoFileInfo, SynoFsError, SynoTime, SynologyClient,
@@ -2083,9 +2084,10 @@ impl MetadataTransport for SmbTransport {
         ))
     }
 
-    /// One `SET_INFO` rename, replacing whatever is at `to`: the server swaps
-    /// the names, so `to` never stops resolving and no byte moves. Within a
-    /// share only — two shares are two trees, and a move between them is a
+    /// One `SET_INFO` rename. It replaces what is at `to` only as `rename(2)`
+    /// would ([`plan_move`]): a file swaps in for a file in that one call, so
+    /// `to` never stops resolving, and a folder takes the place of an empty
+    /// folder only. No byte moves. Within a share only — two shares are two trees, and a move between them is a
     /// copy, which FileStation's CopyMove does on the appliance instead.
     async fn move_to(&self, from: &str, to: &str) -> Result<(), SynoFsError> {
         let src = SmbPath::from_logical(from)?;
@@ -2097,19 +2099,53 @@ impl MetadataTransport for SmbTransport {
         self.forget_handles_under(from).await;
         self.forget_handles_under(to).await;
 
+        // A dead link is flagged for the reconnect, and falls back; any other
+        // answer is the server's and final (see `move_error`).
+        let refused = |e: smb2::Error| {
+            if is_connection_lost(e.kind()) {
+                self.mark_and_map(&e)
+            } else {
+                crate::error::move_error(&e)
+            }
+        };
+
         let mut guard = self.inner.lock().await;
         let (client, tree) = self.ready(&mut guard, &src.share).await?;
+        let source_is_dir = client
+            .stat(tree, &src.path)
+            .await
+            .map_err(refused)?
+            .is_directory;
+        let dest = match client.stat(tree, &dst.path).await {
+            Err(e) if e.kind() == smb2::ErrorKind::NotFound => Destination::Absent,
+            Err(e) => return Err(refused(e)),
+            Ok(info) if !info.is_directory => Destination::File,
+            // A folder in the way of a file: refused below, whatever it holds.
+            Ok(_) if !source_is_dir => Destination::Dir { empty: false },
+            // A folder in the way of a folder may go only if it is empty, and
+            // an SMB delete never takes a folder that is not: trying it is the
+            // check, with no listing of what may be a million entries.
+            Ok(_) => match client.delete_directory(tree, &dst.path).await {
+                Ok(()) => Destination::Absent,
+                Err(e) => match refused(e) {
+                    SynoFsError::NotEmpty => Destination::Dir { empty: false },
+                    other => return Err(other),
+                },
+            },
+        };
+        let plan = plan_move(source_is_dir, dest)?;
+
         client
             .rename_with_options(
                 tree,
                 &src.path,
                 &dst.path,
                 RenameOptions {
-                    replace_if_exists: true,
+                    replace_if_exists: plan == MovePlan::ReplaceFile,
                 },
             )
             .await
-            .map_err(|e| self.mark_and_map(&e))
+            .map_err(refused)
     }
 
     async fn delete(&self, path: &str) -> Result<(), SynoFsError> {

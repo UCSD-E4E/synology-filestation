@@ -185,6 +185,35 @@ impl SynologyClient {
         Err(last_err)
     }
 
+    /// [`get_text_retried`](Self::get_text_retried), for a request that must
+    /// not happen twice: it is sent again only when no connection was ever
+    /// made, so the server cannot have seen it.
+    ///
+    /// Any later failure — the request went out, and the answer was lost —
+    /// is returned rather than retried. For a call that starts something on
+    /// the appliance, resending then starts a second one.
+    pub(super) async fn get_text_once(
+        &self,
+        url: &str,
+        params: &[(&str, &str)],
+    ) -> Result<String, SynoFsError> {
+        let mut attempt = 0u8;
+        loop {
+            match self
+                .attach_session(self.http.get(url).query(params))
+                .send()
+                .await
+            {
+                Ok(resp) => return resp.text().await.map_err(Into::into),
+                Err(e) if e.is_connect() && attempt < 2 => {
+                    attempt += 1;
+                    tokio::time::sleep(Duration::from_millis(200 * attempt as u64)).await;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
     /// Login and store the session ID.
     ///
     /// `otp_code` is the 6-digit TOTP code required when the account has 2-factor

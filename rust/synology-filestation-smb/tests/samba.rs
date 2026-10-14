@@ -514,3 +514,64 @@ async fn a_move_across_directories_is_one_rename_that_replaces() {
     smb.delete("/private/mv-b/mv-a").await.ok();
     smb.delete("/private/mv-b").await.ok();
 }
+
+/// Regression (review of #319): `rename(2)`'s rule, not a merge. A folder
+/// replaces only an empty folder, a non-empty one is ENOTEMPTY and nothing
+/// moves, and a file never replaces a folder.
+#[tokio::test]
+#[ignore = "needs Docker"]
+async fn a_move_replaces_only_what_rename_would() {
+    use synology_filestation_core::SynoFsError;
+
+    let servers = TestServers::start().await.expect("docker compose up");
+    let smb = connect(&servers).await;
+    for dir in ["mv2-src", "mv2-full", "mv2-empty"] {
+        let _ = smb.create_folder("/private", dir).await;
+    }
+    smb.write_atomic("/private/mv2-src/x.ORF", b"source")
+        .await
+        .unwrap();
+    smb.write_atomic("/private/mv2-full/x.ORF", b"keep me")
+        .await
+        .unwrap();
+
+    let err = smb
+        .move_to("/private/mv2-src", "/private/mv2-full")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SynoFsError::NotEmpty), "got {err:?}");
+    assert_eq!(
+        &smb.read_full("/private/mv2-full/x.ORF").await.unwrap()[..],
+        b"keep me"
+    );
+    assert_eq!(
+        &smb.read_full("/private/mv2-src/x.ORF").await.unwrap()[..],
+        b"source"
+    );
+
+    let err = smb
+        .move_to("/private/mv2-src/x.ORF", "/private/mv2-full")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, SynoFsError::AlreadyExists),
+        "a file onto a folder: {err:?}"
+    );
+
+    smb.move_to("/private/mv2-src", "/private/mv2-empty")
+        .await
+        .expect("an empty folder is replaced");
+    assert_eq!(
+        &smb.read_full("/private/mv2-empty/x.ORF").await.unwrap()[..],
+        b"source"
+    );
+
+    for p in [
+        "/private/mv2-empty/x.ORF",
+        "/private/mv2-empty",
+        "/private/mv2-full/x.ORF",
+        "/private/mv2-full",
+    ] {
+        smb.delete(p).await.ok();
+    }
+}

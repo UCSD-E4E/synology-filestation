@@ -681,7 +681,7 @@ which is why this is an attribute you ask for by name.
 
 ## Known Limitations
 
-- **Moves between directories (Linux).** These happen on the NAS: over SMB as one rename, otherwise with FileStation's CopyMove. Only if the NAS refuses the move is a file copied (download → upload → delete), and that copy is not atomic. A folder is never copied: if the NAS can't move it, the move fails with `ENOSYS`. Over HTTP, a move that also renames is a rename followed by a move, not one atomic step.
+- **Moves between directories (Linux).** These happen on the NAS: over SMB as one rename, otherwise with FileStation's CopyMove. A move replaces what `rename(2)` would and nothing else: a file replaces a file, a folder replaces only an empty folder, and a folder onto a non-empty folder fails with `ENOTEMPTY` rather than merging the two. Only if the NAS refuses the move is a file copied (download → upload → delete), and that copy is not atomic. A folder is never copied: if the NAS can't move it, the move fails with `ENOSYS`. Over HTTP, a move that also renames is a rename followed by a move, not one atomic step.
 - **Moves between directories (macOS, Windows).** These are still download → upload → delete, so files only, not atomic, and folders return `ENOSYS` / `STATUS_UNSUCCESSFUL`.
 - **Large files require large in-memory write buffers.** Writing to a file buffers the entire file content in process memory until the file is closed or flushed.
 - **Overwriting a file is not atomic.** The existing file is deleted before the new content is uploaded; a crash between those two steps would result in data loss.

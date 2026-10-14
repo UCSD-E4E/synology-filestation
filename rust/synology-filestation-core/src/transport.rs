@@ -416,3 +416,45 @@ mod tests {
         );
     }
 }
+
+/// What is at a move's destination, as far as the move needs to know.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Destination {
+    Absent,
+    File,
+    Dir { empty: bool },
+}
+
+/// What a move may replace at its destination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MovePlan {
+    /// Nothing is there; a name that turns up meanwhile must make the move
+    /// fail rather than be overwritten.
+    Fresh,
+    /// A file replaces a file.
+    ReplaceFile,
+    /// A folder replaces an empty folder, which goes first.
+    ReplaceEmptyDir,
+}
+
+/// `rename(2)`'s rule for what a move may replace, shared by every way of
+/// moving so none of them can disagree.
+///
+/// FileStation's CopyMove with `overwrite` would merge a folder into one
+/// already there and overwrite what both held; SMB's replacing rename would
+/// refuse a folder outright. Neither is what a mount promises. A folder only
+/// replaces an empty folder, a non-empty one is [`SynoFsError::NotEmpty`],
+/// and a file and a folder never replace each other.
+pub fn plan_move(source_is_dir: bool, dest: Destination) -> Result<MovePlan, SynoFsError> {
+    match (source_is_dir, dest) {
+        (_, Destination::Absent) => Ok(MovePlan::Fresh),
+        (false, Destination::File) => Ok(MovePlan::ReplaceFile),
+        (true, Destination::Dir { empty: true }) => Ok(MovePlan::ReplaceEmptyDir),
+        (true, Destination::Dir { empty: false }) => Err(SynoFsError::NotEmpty),
+        // EISDIR and ENOTDIR, which the kernel answers itself before a FUSE
+        // mount is asked; anyone else calling is told the name is taken.
+        (false, Destination::Dir { .. }) | (true, Destination::File) => {
+            Err(SynoFsError::AlreadyExists)
+        }
+    }
+}

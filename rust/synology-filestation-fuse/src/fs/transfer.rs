@@ -312,9 +312,12 @@ impl Transfers {
         self.client.get_info(path).await
     }
 
-    /// Move a file between directories: download, upload to the new location,
-    /// then delete the source. FileStation's Rename API cannot move across
-    /// directories, so this is the only route.
+    /// Move a file or folder between directories, on the NAS where it can be
+    /// ([`SynologyClient::move_to`]: an SMB rename, or FileStation's CopyMove),
+    /// so no byte comes through here. Only when the NAS will not is a *file*
+    /// copied — downloaded, uploaded to the new place, the original deleted —
+    /// and a folder is then not supported. The caches forget both ends
+    /// whatever happened: a move that failed may have moved part of a folder.
     pub(super) async fn move_across_dirs(
         &self,
         old_path: &str,
@@ -328,8 +331,28 @@ impl Transfers {
         // On the NAS if it can: SMB renames across directories in one call,
         // and FileStation's CopyMove moves on the appliance. Neither sends a
         // byte through here.
-        match self.client.move_to(old_path, &new_path).await {
-            Ok(()) => {}
+        let outcome = self
+            .move_or_copy(old_path, new_parent, new_name, &new_path)
+            .await;
+        self.forget_moved(old_path, &new_path);
+        outcome
+    }
+
+    async fn move_or_copy(
+        &self,
+        old_path: &str,
+        new_parent: &str,
+        new_name: &str,
+        new_path: &str,
+    ) -> Result<(), SynoFsError> {
+        // A slot, as a transfer takes: across volumes a move is a whole copy
+        // on the appliance, and a burst of them is the fan-out the cap is for.
+        let moved = {
+            let _slot = self.permit().await;
+            self.client.move_to(old_path, new_path).await
+        };
+        match moved {
+            Ok(()) => Ok(()),
             Err(SynoFsError::NotSupported) => {
                 // A folder was never copied through here, and is not now. The
                 // cache usually knows which this is; ask the NAS only if not.
@@ -351,13 +374,10 @@ impl Transfers {
                 if is_dir {
                     return Err(SynoFsError::NotSupported);
                 }
-                self.copy_across_dirs(old_path, new_parent, new_name)
-                    .await?;
+                self.copy_across_dirs(old_path, new_parent, new_name).await
             }
-            Err(e) => return Err(e),
+            Err(e) => Err(e),
         }
-        self.forget_moved(old_path, &new_path);
-        Ok(())
     }
 
     /// What a cross-directory move falls back to when the NAS will not move

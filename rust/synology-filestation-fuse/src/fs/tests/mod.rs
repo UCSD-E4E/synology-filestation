@@ -253,3 +253,19 @@ fn mount_copymove_refused(f: &Fixture) {
             .mount(&f.server),
     );
 }
+
+/// DSM's answer for `path`: it is there, a file or a folder. Ahead of any
+/// catch-all, such as [`mount_getinfo_gone`] for everything else.
+fn mount_existing(f: &Fixture, path: &str, isdir: bool) {
+    f.rt.block_on(
+        Mock::given(http_method("GET"))
+            .and(query_param("method", "getinfo"))
+            .and(query_param("path", serde_json::to_string(&[path]).unwrap().as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "data": {"files": [{"name": path.rsplit('/').next().unwrap(), "path": path, "isdir": isdir}]}
+            })))
+            .with_priority(1)
+            .mount(&f.server),
+    );
+}

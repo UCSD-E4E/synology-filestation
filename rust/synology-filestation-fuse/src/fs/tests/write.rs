@@ -89,6 +89,7 @@ fn truncate_uploads_the_resized_content() {
 #[test]
 fn cross_directory_move_copies_the_whole_file_not_the_cached_size() {
     let f = fixture();
+    mount_existing(&f, "/a/f.bin", false);
     let body = ramp(4096);
     // The copy is the fallback now: only when the NAS will not move it.
     mount_copymove_refused(&f);
@@ -469,6 +470,7 @@ fn starting_a_truncate_does_not_block_the_calling_thread() {
 #[test]
 fn starting_a_cross_directory_move_does_not_block_the_calling_thread() {
     let f = fixture();
+    mount_existing(&f, "/a/f.bin", false);
     mount_copymove_refused(&f);
     mount_download(&f, ramp(4096), Map::new());
     mount_delete_ok(&f);
@@ -1041,6 +1043,8 @@ fn seed_entry(f: &Fixture, path: &str, isdir: bool) -> u64 {
 fn a_move_across_directories_happens_on_the_nas() {
     let f = fixture();
     mount_copymove_finished(&f);
+    mount_existing(&f, "/a/img.ORF", false);
+    mount_getinfo_gone(&f);
     seed_entry(&f, "/a/img.ORF", false);
 
     f.fs.move_across_dirs("/a/img.ORF", "/b", "img.ORF")
@@ -1060,6 +1064,8 @@ fn a_move_across_directories_happens_on_the_nas() {
 fn a_folder_moves_across_directories_on_the_nas() {
     let f = fixture();
     mount_copymove_finished(&f);
+    mount_existing(&f, "/a/photos", true);
+    mount_getinfo_gone(&f);
     seed_entry(&f, "/a/photos", true);
     seed_entry(&f, "/a/photos/x.ORF", false);
     seed_entry(&f, "/a/photos2", true);
@@ -1085,19 +1091,92 @@ fn a_folder_moves_across_directories_on_the_nas() {
 fn a_folder_the_nas_will_not_move_is_not_copied() {
     let f = fixture();
     mount_copymove_refused(&f);
-    f.rt.block_on(
-        Mock::given(http_method("GET"))
-            .and(query_param("method", "getinfo"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "success": true,
-                "data": {"files": [{"name": "photos", "path": "/a/photos", "isdir": true}]}
-            })))
-            .mount(&f.server),
-    );
+    mount_existing(&f, "/a/photos", true);
+    mount_getinfo_gone(&f);
 
     let err =
         f.fs.move_across_dirs("/a/photos", "/b", "photos")
             .unwrap_err();
     assert!(matches!(err, SynoFsError::NotSupported), "got {err:?}");
     assert!(!bytes_moved_through_us(&f));
+}
+
+/// Regression (review of #319): a move that failed skipped forgetting what it
+/// may have changed — and a failed task can have moved part of a folder.
+#[test]
+fn a_move_that_fails_still_forgets_the_old_layout() {
+    let f = fixture();
+    mount_existing(&f, "/a/photos", true);
+    mount_getinfo_gone(&f);
+    f.rt.block_on(async {
+        Mock::given(http_method("GET"))
+            .and(query_param("api", "SYNO.FileStation.CopyMove"))
+            .and(query_param("method", "start"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true, "data": {"taskid": "FileStation_1"}
+            })))
+            .mount(&f.server)
+            .await;
+        Mock::given(http_method("GET"))
+            .and(query_param("api", "SYNO.FileStation.CopyMove"))
+            .and(query_param("method", "status"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": false, "error": {"code": 1001}
+            })))
+            .mount(&f.server)
+            .await;
+    });
+    seed_entry(&f, "/a/photos", true);
+    seed_entry(&f, "/a/photos/x.ORF", false);
+
+    assert!(f.fs.move_across_dirs("/a/photos", "/b", "photos").is_err());
+    assert_eq!(f.fs.cache.get_ino_for_path("/a/photos"), None);
+    assert_eq!(f.fs.cache.get_ino_for_path("/a/photos/x.ORF"), None);
+}
+
+/// Regression (review of #319): a move on the NAS took no transfer slot, so a
+/// burst of them was unbounded — and across volumes each is a whole copy on
+/// the appliance's shared backend.
+#[test]
+fn a_move_on_the_nas_holds_a_transfer_slot() {
+    let f = fixture();
+    mount_existing(&f, "/a/img.ORF", false);
+    mount_getinfo_gone(&f);
+    f.rt.block_on(async {
+        Mock::given(http_method("GET"))
+            .and(query_param("api", "SYNO.FileStation.CopyMove"))
+            .and(query_param("method", "start"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true, "data": {"taskid": "FileStation_1"}
+            })))
+            .mount(&f.server)
+            .await;
+        Mock::given(http_method("GET"))
+            .and(query_param("api", "SYNO.FileStation.CopyMove"))
+            .and(query_param("method", "status"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"success": true, "data": {"finished": true}}))
+                    .set_delay(Duration::from_millis(600)),
+            )
+            .mount(&f.server)
+            .await;
+    });
+
+    let (done, outcome) = outcome_channel();
+    f.fs.start_move_across_dirs("/a/img.ORF".into(), "/b".into(), "img.ORF".into(), done);
+    std::thread::sleep(Duration::from_millis(250));
+    assert_eq!(
+        f.fs.transfer_limit.available_permits(),
+        MAX_CONCURRENT_TRANSFERS - 1,
+        "the move holds one slot while the NAS works"
+    );
+    outcome
+        .recv_timeout(Duration::from_secs(10))
+        .unwrap()
+        .expect("moved");
+    assert_eq!(
+        f.fs.transfer_limit.available_permits(),
+        MAX_CONCURRENT_TRANSFERS
+    );
 }
