@@ -20,7 +20,7 @@ use std::time::Duration;
 use synology_filestation_connect::{Chain, SmbRoute};
 use synology_filestation_core::client::SynologyClient;
 use synology_filestation_core::error::SynoFsError;
-use synology_filestation_smb::{BoxedStream, RedialFuture};
+use synology_filestation_smb::{BoxedStream, ConnectionFuture, RedialFuture};
 
 /// Default umask for the synthetic mode the Linux backend reports, matching the
 /// 0o755 directories / 0o644 files a process with the usual umask creates.
@@ -109,6 +109,47 @@ pub fn reopen_through(
                     );
                     Err(SynoFsError::Io(format!("{e}")))
                 }
+            }
+        })
+    }
+}
+
+/// How many connections a mount reads over unless told otherwise: its session
+/// and three more.
+///
+/// Measured, not guessed: from a home uplink losing about 3% of what the NAS
+/// sent, one connection ran at 1.7 MB/s and three at 5.1, so each adds about
+/// as much as the first. Four is still a small number of sessions to hold on
+/// the NAS for one mount, and past it a home link's own bandwidth starts to
+/// be the limit instead.
+pub const DEFAULT_SMB_CONNECTIONS: usize = 4;
+
+/// How to open one more stream to the NAS on the leg the mount is on, for
+/// [`SmbTransport::with_read_connections`](synology_filestation_smb::SmbTransport::with_read_connections).
+///
+/// The same question the redial asks — [`Chain::reach_smb`] — and the same
+/// answer: a dial on the direct leg, another connection through the tunnel
+/// already up on the other. What differs is that nothing died. So it says
+/// nothing above debug, where the redial warns: its "the stream lasted Ns"
+/// is the record of a session that keeps falling over, and a mount opening
+/// its read connections would bury it.
+pub fn another_connection(
+    chain: Arc<Chain>,
+    dial: Dial,
+) -> impl Fn() -> ConnectionFuture + Send + Sync + 'static + use<> {
+    move || {
+        let chain = chain.clone();
+        Box::pin(async move {
+            match chain.reach_smb().await {
+                Ok(SmbRoute::Tunnelled { host, connection }) => {
+                    Ok((Box::new(connection) as BoxedStream, host))
+                }
+                Ok(SmbRoute::Direct { host }) => {
+                    let stream = dial_direct(&host, dial).await?;
+                    Ok((stream, host))
+                }
+                Ok(SmbRoute::Unavailable) => Err(SynoFsError::NotSupported),
+                Err(e) => Err(SynoFsError::Io(format!("{e}"))),
             }
         })
     }
@@ -1640,5 +1681,89 @@ mod fuse_connection_tests {
 
         let text = read_mountinfo(&path).expect("mountinfo was read");
         assert_eq!(fuse_connection(&text, (0, 75)), Some(75));
+    }
+}
+
+#[cfg(test)]
+mod another_connection_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use synology_filestation_connect::{
+        Endpoints, NoTunnel, Prober, TransportPolicy, DEFAULT_RECHECK,
+    };
+
+    use crate::log_capture::LogCapture;
+
+    struct Answers(bool);
+
+    #[async_trait]
+    impl Prober for Answers {
+        async fn smb_reachable(&self, _host: &str) -> bool {
+            self.0
+        }
+    }
+
+    fn chain_to(host: &str, answers: bool) -> Arc<Chain> {
+        Arc::new(Chain::new(
+            TransportPolicy::default(),
+            Endpoints::public_only(host),
+            Box::new(Answers(answers)),
+            Box::new(NoTunnel),
+            DEFAULT_RECHECK,
+        ))
+    }
+
+    const DIAL: Dial = Dial {
+        port: 445,
+        patience: Duration::from_secs(5),
+    };
+
+    /// The extra connections a mount reads over go where its session went,
+    /// and say which server they reached, since that is the name the session
+    /// on them authenticates against.
+    #[tokio::test]
+    async fn another_connection_on_the_direct_leg_is_a_dial_to_that_host() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a port to answer on");
+        let host = listener.local_addr().expect("its address").to_string();
+        let accepted = tokio::spawn(async move { listener.accept().await.map(|_| ()) });
+
+        let (_stream, named) = another_connection(chain_to(&host, true), DIAL)()
+            .await
+            .unwrap_or_else(|e| panic!("a stream: {e}"));
+
+        assert_eq!(named, host);
+        assert!(accepted.await.expect("the accept task ran").is_ok());
+    }
+
+    /// Opening one more connection is not a recovery, and must not read like
+    /// one: the redial's "the stream lasted Ns; reopened" warning is the
+    /// diagnostic for a session that keeps dying, and a mount opening its
+    /// read connections would bury it.
+    #[tokio::test]
+    async fn opening_another_connection_does_not_warn() {
+        let logs = LogCapture::at_the_default_level();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a port to answer on");
+        let host = listener.local_addr().expect("its address").to_string();
+        let accepting = tokio::spawn(async move { listener.accept().await.map(|_| ()) });
+
+        another_connection(chain_to(&host, true), DIAL)()
+            .await
+            .unwrap_or_else(|e| panic!("a stream: {e}"));
+        let _ = accepting.await;
+
+        let text = logs.text();
+        assert!(!text.contains("lasted"), "got: {text}");
+        assert!(!text.contains("WARN"), "got: {text}");
+    }
+
+    /// No SMB leg, no connection — and no dial to find that out.
+    #[tokio::test]
+    async fn with_no_leg_to_smb_there_is_no_other_connection() {
+        let opened = another_connection(chain_to("127.0.0.1:9", false), DIAL)().await;
+        assert!(opened.is_err());
     }
 }

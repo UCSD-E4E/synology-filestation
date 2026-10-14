@@ -456,7 +456,13 @@ async fn reach(
     // account with no domain does. So what the badge reports is the session,
     // not the probe; `Legs` says which, and says so in the log when it
     // changes.
-    match Legs::start(chain, &cfg).await {
+    match Legs::start(
+        chain,
+        &cfg,
+        synology_filestation_fuse::DEFAULT_SMB_CONNECTIONS,
+    )
+    .await
+    {
         Some(legs) => (
             synology_filestation_smb::attach(client, legs.session().clone()),
             Some(legs),
