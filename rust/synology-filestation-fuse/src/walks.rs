@@ -766,6 +766,7 @@ impl Core {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{OnceLock, Weak};
 
@@ -918,7 +919,11 @@ mod tests {
                 walking_secs: WALK_FOR.as_secs(),
                 dirs_opened: WALK_DIRS + 1,
                 dirs_open: 1,
-                latest: "/home/u/mnt/share/deep".into(),
+                // Joined as the platform joins paths: a backslash on Windows.
+                latest: Path::new("/home/u/mnt")
+                    .join("share/deep")
+                    .display()
+                    .to_string(),
             }
         );
 
