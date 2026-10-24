@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Linq;
 using CommunityToolkit.Mvvm.ComponentModel;
@@ -23,6 +24,17 @@ public sealed partial class WalkersBannerViewModel : ObservableObject
     private readonly WalkerWatch _watch;
     private readonly Action<uint> _stop;
     private readonly Action<string> _log;
+
+    /// <summary>How many refreshes a failure stays on its row: half a minute
+    /// at <see cref="TransportWatch.Interval"/>. Long enough to read, and not
+    /// so long it is still there, describing an old attempt, for the rest of
+    /// a walk that can last days.</summary>
+    public const int ErrorRefreshes = 6;
+
+    /// <summary>Walkers Stop was sent to, until they are gone or seen to be
+    /// still walking. SIGTERM can be handled or ignored, and a row that
+    /// vanished and quietly came back read as a success.</summary>
+    private readonly HashSet<uint> _stopped = new();
 
     /// <param name="stop">Ends a walker; throws, with a message worth showing,
     /// when it cannot.</param>
@@ -50,6 +62,7 @@ public sealed partial class WalkersBannerViewModel : ObservableObject
             _log($"[walk] {WalkerPresenter.Headline(walker)}: {walker.Command}");
         }
 
+        _stopped.IntersectWith(update.Shown.Select(w => w.Pid));
         foreach (var gone in Items.Where(i => update.Shown.All(w => w.Pid != i.Pid)).ToList())
         {
             Items.Remove(gone);
@@ -63,6 +76,13 @@ public sealed partial class WalkersBannerViewModel : ObservableObject
                 Items.Add(item);
             }
             item.Show(walker);
+            if (_stopped.Remove(walker.Pid))
+            {
+                item.Fail(
+                    $"It is still running after Stop, so it may be ignoring the signal. " +
+                    $"kill -9 {walker.Pid} ends it for certain.");
+                _log($"[walk] {item.Program} (pid {walker.Pid}) is still walking after Stop.");
+            }
         }
     }
 
@@ -70,20 +90,23 @@ public sealed partial class WalkersBannerViewModel : ObservableObject
     public void Clear()
     {
         Items.Clear();
+        _stopped.Clear();
         _watch.Reset();
     }
 
     private void Stop(WalkerItemViewModel item)
     {
+        item.ClearError();
         try
         {
             _stop(item.Pid);
         }
         catch (Exception e)
         {
-            item.Error = e.Message;
+            item.Fail(e.Message);
             return;
         }
+        _stopped.Add(item.Pid);
         _log($"[walk] Stopped {item.Program} (pid {item.Pid}).");
         Items.Remove(item);
     }
@@ -130,8 +153,27 @@ public sealed partial class WalkerItemViewModel : ObservableObject
 
     public bool HasError => Error.Length > 0;
 
+    /// <summary>Refreshes left before <see cref="Error"/> is cleared.</summary>
+    private int _errorTicks;
+
+    internal void Fail(string message)
+    {
+        Error = message;
+        _errorTicks = WalkersBannerViewModel.ErrorRefreshes;
+    }
+
+    internal void ClearError()
+    {
+        Error = "";
+        _errorTicks = 0;
+    }
+
     internal void Show(MountWalker walker)
     {
+        if (_errorTicks > 0 && --_errorTicks == 0)
+        {
+            Error = "";
+        }
         Program = WalkerPresenter.Program(walker);
         Headline = WalkerPresenter.Headline(walker);
         Summary = WalkerPresenter.Summary(walker);

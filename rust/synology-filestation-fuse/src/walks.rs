@@ -262,7 +262,114 @@ impl Procs for LinuxProcs {
 }
 
 /// Every process that has opened a directory on the mount lately.
+///
+/// What `opendir` and `releasedir` report goes down a channel to a thread of
+/// its own, which does all the work: reading `/proc` is a few syscalls, and
+/// `/proc/<pid>/cmdline` waits on the target's mmap lock, which a process
+/// faulting in a page of a file on this very mount can be holding. On the
+/// FUSE event loop that is a way for the mount to wedge itself. The event
+/// loop only sends.
 pub struct Walks {
+    core: Arc<Core>,
+    events: Option<std::sync::mpsc::Sender<Event>>,
+}
+
+enum Event {
+    Opened {
+        fh: u64,
+        tid: u32,
+        path: String,
+        at: Instant,
+    },
+    Released {
+        fh: u64,
+    },
+}
+
+impl Walks {
+    /// Watching the mount at `mountpoint`, from this process.
+    #[cfg(target_os = "linux")]
+    pub fn new(mountpoint: PathBuf) -> Self {
+        Self::spawn(Arc::new(LinuxProcs), std::process::id(), mountpoint)
+    }
+
+    /// With its own thread; it ends when this is dropped.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    fn spawn(procs: Arc<dyn Procs>, own: u32, mountpoint: PathBuf) -> Self {
+        let core = Arc::new(Core::new(procs, own, mountpoint));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = Arc::clone(&core);
+        let spawned = std::thread::Builder::new()
+            .name("walks".into())
+            .spawn(move || worker.run(rx));
+        match spawned {
+            Ok(_) => Self {
+                core,
+                events: Some(tx),
+            },
+            Err(e) => {
+                tracing::warn!("could not start the thread that watches for walks: {e}");
+                Self { core, events: None }
+            }
+        }
+    }
+
+    /// Without a thread: every call is answered on the caller's.
+    #[cfg(test)]
+    pub(crate) fn with(procs: Arc<dyn Procs>, own: u32, mountpoint: PathBuf) -> Self {
+        Self {
+            core: Arc::new(Core::new(procs, own, mountpoint)),
+            events: None,
+        }
+    }
+
+    /// Thread `tid` opened the directory at NAS path `path` as handle `fh`.
+    pub fn opened(&self, fh: u64, tid: u32, path: &str) {
+        let at = Instant::now();
+        match &self.events {
+            Some(tx) => {
+                let _ = tx.send(Event::Opened {
+                    fh,
+                    tid,
+                    path: path.to_string(),
+                    at,
+                });
+            }
+            None => {
+                self.core.opened_at(fh, tid, path, at);
+            }
+        }
+    }
+
+    /// Handle `fh` was closed.
+    pub fn released(&self, fh: u64) {
+        match &self.events {
+            Some(tx) => {
+                let _ = tx.send(Event::Released { fh });
+            }
+            None => self.core.released(fh),
+        }
+    }
+
+    /// The processes walking the mount now, by pid. Never reads `/proc`.
+    pub fn walkers(&self) -> Vec<Walker> {
+        self.core.walkers_at(Instant::now())
+    }
+
+    /// Ask walker `pid` to exit (`SIGTERM`).
+    ///
+    /// Only a process walking now, and only while its id still names the
+    /// process that was seen walking: ids are reused, and the one a window
+    /// showed a minute ago may belong to something else by the time the button
+    /// is pressed. [`Procs::terminate`] makes that check and the signal one
+    /// step.
+    pub fn stop(&self, pid: u32) -> Result<(), StopError> {
+        self.core.stop_at(pid, Instant::now())
+    }
+}
+
+/// The state, and everything that changes it.
+struct Core {
     procs: Arc<dyn Procs>,
     /// This process: the mount reading itself is never a walker.
     own: u32,
@@ -285,6 +392,8 @@ struct Inner {
 struct Track {
     /// What tells this process from a later one given the same id.
     started: u64,
+    /// Read only once the walk is reported: most processes that open a
+    /// directory never are, and reading it is the expensive part.
     command: Cmdline,
     /// When the current run of opens began, and when the latest was.
     first: Instant,
@@ -295,16 +404,22 @@ struct Track {
     open: u64,
     /// NAS path of the latest open.
     latest: String,
-    /// Whether this run was reported as a walk.
+    /// Whether this run was reported as a walk. Only reported walks are
+    /// listed, so the list and the log never disagree.
     reported: bool,
 }
 
 impl Track {
     fn walking(&self, now: Instant) -> bool {
-        self.open >= HELD_DIRS
+        self.held()
             || (now.duration_since(self.last) < QUIET
                 && self.opened >= WALK_DIRS
                 && now.duration_since(self.first) >= WALK_FOR)
+    }
+
+    /// Walking by what it holds, however long since it last opened anything.
+    fn held(&self) -> bool {
+        self.open >= HELD_DIRS
     }
 
     /// Gone quiet and holding nothing: nothing left to watch.
@@ -316,19 +431,13 @@ impl Track {
 /// What a call found that is to be logged once the lock is let go.
 #[derive(Default)]
 struct News {
-    started: Option<Walker>,
+    /// Walks that have just started: their command is still to be read.
+    started: Vec<Process>,
     stopped: Vec<Walker>,
 }
 
-impl Walks {
-    /// Watching the mount at `mountpoint`, from this process.
-    #[cfg(target_os = "linux")]
-    pub fn new(mountpoint: PathBuf) -> Self {
-        Self::with(Arc::new(LinuxProcs), std::process::id(), mountpoint)
-    }
-
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pub(crate) fn with(procs: Arc<dyn Procs>, own: u32, mountpoint: PathBuf) -> Self {
+impl Core {
+    fn new(procs: Arc<dyn Procs>, own: u32, mountpoint: PathBuf) -> Self {
         Self {
             procs,
             own,
@@ -337,13 +446,33 @@ impl Walks {
         }
     }
 
-    /// Thread `tid` opened the directory at NAS path `path` as handle `fh`.
-    pub fn opened(&self, fh: u64, tid: u32, path: &str) {
-        let _ = self.opened_at(fh, tid, path, Instant::now());
+    /// The thread behind [`Walks::spawn`]: events as they come, and a sweep
+    /// whenever none has come for [`PRUNE_EVERY`], so a walk that qualifies
+    /// by time alone, or ends, is said so without waiting for an open.
+    fn run(&self, events: std::sync::mpsc::Receiver<Event>) {
+        use std::sync::mpsc::RecvTimeoutError;
+        loop {
+            match events.recv_timeout(PRUNE_EVERY) {
+                Ok(Event::Opened { fh, tid, path, at }) => {
+                    self.opened_at(fh, tid, &path, at);
+                }
+                Ok(Event::Released { fh }) => self.released(fh),
+                Err(RecvTimeoutError::Timeout) => {
+                    self.tick(Instant::now(), false);
+                }
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
+        }
     }
 
-    /// [`Walks::opened`] at `now`: the walker, when this is the open that made
-    /// it one.
+    /// Sweep, and say what changed: the walks that started.
+    fn tick(&self, now: Instant, force: bool) -> Vec<Walker> {
+        let mut news = News::default();
+        self.prune(&mut self.inner.lock().unwrap(), now, force, &mut news);
+        self.announce(news, now)
+    }
+
+    /// An open at `now`: the walker, when this is the open that made it one.
     ///
     /// The usual open, by a thread seen in the last [`RESOLVE_EVERY`], is one
     /// lock and no syscalls. Otherwise `/proc` is read between two locks,
@@ -354,7 +483,7 @@ impl Walks {
         }
         let mut news = News::default();
 
-        let cached = {
+        {
             let mut inner = self.inner.lock().unwrap();
             self.prune(&mut inner, now, false, &mut news);
             let cached = inner
@@ -362,55 +491,53 @@ impl Walks {
                 .get(&tid)
                 .filter(|(_, at)| now.duration_since(*at) < RESOLVE_EVERY)
                 .map(|(process, _)| *process);
-            if let Some(process) = cached {
-                if process.pid == self.own {
+            match cached {
+                Some(process) if process.pid == self.own => {
                     drop(inner);
-                    self.announce(news);
+                    self.announce(news, now);
                     return None;
                 }
-                if inner
-                    .tracks
-                    .get(&process.pid)
-                    .is_some_and(|t| t.started == process.started)
+                Some(process)
+                    if inner
+                        .tracks
+                        .get(&process.pid)
+                        .is_some_and(|t| t.started == process.started) =>
                 {
-                    let started = self.record(&mut inner, process, None, fh, path, now, &mut news);
-                    news.started = started;
+                    self.record(&mut inner, process, fh, path, now, &mut news);
                     drop(inner);
-                    return self.announce(news);
+                    return self.announce(news, now).into_iter().next();
                 }
+                // Not known, or known as a process its id no longer names:
+                // ask again. A stale entry trusted here would hand the live
+                // process's track to the one that has exited.
+                _ => {}
             }
-            cached
-        };
+        }
 
-        let Some(process) = cached.or_else(|| self.procs.identify(tid)) else {
-            self.announce(news);
+        let Some(process) = self.procs.identify(tid) else {
+            self.announce(news, now);
             return None;
         };
-        let command = (process.pid != self.own).then(|| self.procs.command(process.pid));
-
         let mut inner = self.inner.lock().unwrap();
         inner.threads.insert(tid, (process, now));
-        if let Some(command) = command {
-            let started = self.record(&mut inner, process, Some(command), fh, path, now, &mut news);
-            news.started = started;
+        if process.pid != self.own {
+            self.record(&mut inner, process, fh, path, now, &mut news);
         }
         drop(inner);
-        self.announce(news)
+        self.announce(news, now).into_iter().next()
     }
 
-    /// Count an open by `process`, starting its track (with `command`) if it
-    /// has none, or if the one under its id belongs to an earlier process.
-    #[allow(clippy::too_many_arguments)]
+    /// Count an open by `process`, starting its track if it has none, or if
+    /// the one under its id belongs to an earlier process.
     fn record(
         &self,
         inner: &mut Inner,
         process: Process,
-        command: Option<Cmdline>,
         fh: u64,
         path: &str,
         now: Instant,
         news: &mut News,
-    ) -> Option<Walker> {
+    ) {
         let pid = process.pid;
         if inner
             .tracks
@@ -429,9 +556,7 @@ impl Walks {
         inner.handles.insert(fh, pid);
         let track = inner.tracks.entry(pid).or_insert_with(|| Track {
             started: process.started,
-            // Read before the lock; missing only if the track was swept out
-            // in the moment between, which costs the banner a name.
-            command: command.unwrap_or_default(),
+            command: Cmdline::default(),
             first: now,
             last: now,
             opened: 0,
@@ -439,7 +564,9 @@ impl Walks {
             latest: String::new(),
             reported: false,
         });
-        if now.duration_since(track.last) >= QUIET {
+        // A pause ends a run of opens, but not a walk held open: a `find`
+        // resumed after ^Z is the same walk, with the same start.
+        if now.duration_since(track.last) >= QUIET && !track.held() {
             if track.reported {
                 news.stopped.push(self.walker(pid, track, track.last));
             }
@@ -453,14 +580,11 @@ impl Walks {
         track.latest = path.to_string();
         if !track.reported && track.walking(now) {
             track.reported = true;
-            Some(self.walker(pid, track, now))
-        } else {
-            None
+            news.started.push(process);
         }
     }
 
-    /// Handle `fh` was closed.
-    pub fn released(&self, fh: u64) {
+    fn released(&self, fh: u64) {
         let mut inner = self.inner.lock().unwrap();
         if let Some(pid) = inner.handles.remove(&fh) {
             if let Some(track) = inner.tracks.get_mut(&pid) {
@@ -469,24 +593,15 @@ impl Walks {
         }
     }
 
-    /// The processes walking the mount now, by pid.
-    pub fn walkers(&self) -> Vec<Walker> {
-        self.walkers_at(Instant::now())
-    }
-
     fn walkers_at(&self, now: Instant) -> Vec<Walker> {
-        let mut news = News::default();
-        let mut walkers: Vec<_> = {
-            let mut inner = self.inner.lock().unwrap();
-            self.prune(&mut inner, now, false, &mut news);
-            inner
-                .tracks
-                .iter()
-                .filter(|(_, track)| track.walking(now))
-                .map(|(pid, track)| self.walker(*pid, track, now))
-                .collect()
-        };
-        self.announce(news);
+        let inner = self.inner.lock().unwrap();
+        let mut walkers: Vec<_> = inner
+            .tracks
+            .iter()
+            .filter(|(_, track)| track.reported && track.walking(now))
+            .map(|(pid, track)| self.walker(*pid, track, now))
+            .collect();
+        drop(inner);
         walkers.sort_by_key(|w| w.pid);
         walkers
     }
@@ -497,13 +612,14 @@ impl Walks {
         let mut news = News::default();
         self.prune(&mut self.inner.lock().unwrap(), now, true, &mut news);
         let stopped = news.stopped.clone();
-        self.announce(news);
+        self.announce(news, now);
         stopped
     }
 
-    /// End the walks that no longer are one, and forget processes that have
-    /// gone quiet holding nothing, and threads not seen for a while. At most
-    /// every [`PRUNE_EVERY`] unless `force`d.
+    /// Settle every track against `now`: report the walks that have started
+    /// (one can, by time alone, between opens), end the ones that no longer
+    /// are one, and forget processes gone quiet holding nothing and threads
+    /// not seen for a while. At most every [`PRUNE_EVERY`] unless `force`d.
     ///
     /// A walk ends when its process stops qualifying, whether or not it still
     /// holds directories: a `find` suspended with ^Z keeps its handles, and
@@ -518,9 +634,16 @@ impl Walks {
         }
         inner.pruned = Some(now);
         for (pid, track) in inner.tracks.iter_mut() {
-            if track.reported && !track.walking(now) {
+            let walking = track.walking(now);
+            if track.reported && !walking {
                 news.stopped.push(self.walker(*pid, track, track.last));
                 track.reported = false;
+            } else if !track.reported && walking {
+                track.reported = true;
+                news.started.push(Process {
+                    pid: *pid,
+                    started: track.started,
+                });
             }
         }
         inner.tracks.retain(|_, track| !track.finished(now));
@@ -529,8 +652,9 @@ impl Walks {
             .retain(|_, (_, at)| now.duration_since(*at) < RESOLVE_EVERY);
     }
 
-    /// Log what a call found; the walker that started, if one did.
-    fn announce(&self, news: News) -> Option<Walker> {
+    /// Read the command of each walk that started, with no lock held, and
+    /// log what a call found. The walkers that started.
+    fn announce(&self, news: News, now: Instant) -> Vec<Walker> {
         for w in &news.stopped {
             tracing::info!(
                 "pid {} ({}) has stopped walking the mount, after {} directories in {}",
@@ -540,7 +664,20 @@ impl Walks {
                 spoken(w.walking_secs)
             );
         }
-        if let Some(w) = &news.started {
+        let mut started = Vec::new();
+        for process in news.started {
+            let command = self.procs.command(process.pid);
+            let walker = {
+                let mut inner = self.inner.lock().unwrap();
+                match inner.tracks.get_mut(&process.pid) {
+                    Some(track) if track.started == process.started => {
+                        track.command = command;
+                        self.walker(process.pid, track, now)
+                    }
+                    // Gone in the moment the lock was let go.
+                    _ => continue,
+                }
+            };
             let mount = self.mountpoint.display();
             tracing::warn!(
                 "pid {} ({}) is walking the whole mount: {} directories in {}, {} open now, \
@@ -548,17 +685,18 @@ impl Walks {
                  reads every directory on the NAS and runs for days. If that is not what was \
                  meant, stop it (`kill {}`); keep such searches off the mount with \
                  `find -xdev` or by pruning {mount}.",
-                w.pid,
-                w.program,
-                w.dirs_opened,
-                spoken(w.walking_secs),
-                w.dirs_open,
-                w.latest,
-                w.command,
-                w.pid,
+                walker.pid,
+                walker.program,
+                walker.dirs_opened,
+                spoken(walker.walking_secs),
+                walker.dirs_open,
+                walker.latest,
+                walker.command,
+                walker.pid,
             );
+            started.push(walker);
         }
-        news.started
+        started
     }
 
     fn walker(&self, pid: u32, track: &Track, now: Instant) -> Walker {
@@ -577,21 +715,14 @@ impl Walks {
         }
     }
 
-    /// Ask walker `pid` to exit (`SIGTERM`).
-    ///
-    /// Only a process walking now, and only while its id still names the
-    /// process that was seen walking: ids are reused, and the one a window
-    /// showed a minute ago may belong to something else by the time the button
-    /// is pressed. [`Procs::terminate`] makes that check and the signal one
-    /// step.
-    pub fn stop(&self, pid: u32) -> Result<(), StopError> {
-        self.stop_at(pid, Instant::now())
-    }
-
     fn stop_at(&self, pid: u32, now: Instant) -> Result<(), StopError> {
         let (process, command) = {
             let inner = self.inner.lock().unwrap();
-            let Some(track) = inner.tracks.get(&pid).filter(|t| t.walking(now)) else {
+            let Some(track) = inner
+                .tracks
+                .get(&pid)
+                .filter(|t| t.reported && t.walking(now))
+            else {
                 return Err(StopError::NotWalking);
             };
             let process = Process {
@@ -606,15 +737,24 @@ impl Walks {
                 Ok(())
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let mut inner = self.inner.lock().unwrap();
-                if inner
-                    .tracks
-                    .get(&pid)
-                    .is_some_and(|t| t.started == process.started)
+                // It exited on its own. Its walk is over, and the log says so.
+                let mut news = News::default();
                 {
-                    inner.tracks.remove(&pid);
-                    inner.handles.retain(|_, p| *p != pid);
+                    let mut inner = self.inner.lock().unwrap();
+                    if inner
+                        .tracks
+                        .get(&pid)
+                        .is_some_and(|t| t.started == process.started)
+                    {
+                        if let Some(track) = inner.tracks.remove(&pid) {
+                            if track.reported {
+                                news.stopped.push(self.walker(pid, &track, track.last));
+                            }
+                        }
+                        inner.handles.retain(|_, p| *p != pid);
+                    }
                 }
+                self.announce(news, now);
                 Err(StopError::Gone)
             }
             Err(e) => Err(StopError::Io(e)),
@@ -637,7 +777,10 @@ mod tests {
         terminated: Mutex<Vec<u32>>,
         identified: AtomicUsize,
         /// The watch this answers for, to catch a call made under its lock.
-        walks: OnceLock<Weak<Walks>>,
+        walks: OnceLock<Weak<Core>>,
+        commands: AtomicUsize,
+        /// The names of the threads every call was made on.
+        callers: Mutex<Vec<Option<String>>>,
         under_lock: AtomicUsize,
     }
 
@@ -658,6 +801,10 @@ mod tests {
         }
 
         fn check_lock(&self) {
+            self.callers
+                .lock()
+                .unwrap()
+                .push(std::thread::current().name().map(String::from));
             if let Some(walks) = self.walks.get().and_then(Weak::upgrade) {
                 if walks.inner.try_lock().is_err() {
                     self.under_lock.fetch_add(1, Ordering::SeqCst);
@@ -676,6 +823,7 @@ mod tests {
         }
         fn command(&self, pid: u32) -> Cmdline {
             self.check_lock();
+            self.commands.fetch_add(1, Ordering::SeqCst);
             let started = self.started.lock().unwrap().get(&pid).copied().unwrap_or(0);
             Cmdline {
                 program: "find".into(),
@@ -694,9 +842,9 @@ mod tests {
 
     const OWN: u32 = 1;
 
-    fn watch() -> (Arc<Fake>, Arc<Walks>) {
+    fn watch() -> (Arc<Fake>, Arc<Core>) {
         let fake = Arc::new(Fake::default());
-        let walks = Arc::new(Walks::with(fake.clone(), OWN, PathBuf::from("/home/u/mnt")));
+        let walks = Arc::new(Core::new(fake.clone(), OWN, PathBuf::from("/home/u/mnt")));
         fake.walks.set(Arc::downgrade(&walks)).unwrap();
         (fake, walks)
     }
@@ -704,7 +852,7 @@ mod tests {
     /// `n` opens and immediate closes by `tid`, evenly over `over`, starting
     /// at `t0` and numbering handles from `fh`. The last open's result.
     fn walk(
-        walks: &Walks,
+        walks: &Core,
         tid: u32,
         fh: &mut u64,
         t0: Instant,
@@ -722,7 +870,7 @@ mod tests {
     }
 
     /// `HELD_DIRS` handles opened by `tid` at `at`, left open.
-    fn hold(walks: &Walks, tid: u32, fh: &mut u64, at: Instant) -> Option<Walker> {
+    fn hold(walks: &Core, tid: u32, fh: &mut u64, at: Instant) -> Option<Walker> {
         let mut reported = None;
         for _ in 0..HELD_DIRS {
             reported = reported.or(walks.opened_at(*fh, tid, "/share/d", at));
@@ -1026,6 +1174,151 @@ mod tests {
         assert!(
             walks.walkers_at(t0).is_empty(),
             "a gone walker is not listed"
+        );
+    }
+
+    #[test]
+    fn the_caller_of_opened_never_does_the_work() {
+        // `opened` is called on the FUSE event loop, and reading
+        // /proc/<pid>/cmdline waits on that process's mmap lock, which a
+        // process faulting in a page of a file on this mount can be holding.
+        let fake = Arc::new(Fake::default());
+        fake.spawn(100, 7, &[]);
+        let walks = Walks::spawn(fake.clone(), OWN, PathBuf::from("/m"));
+        for fh in 0..HELD_DIRS {
+            walks.opened(fh, 100, "/share");
+        }
+        let listed = (0..200)
+            .find_map(|_| {
+                let w = walks.walkers();
+                if w.is_empty() {
+                    std::thread::sleep(Duration::from_millis(10));
+                    None
+                } else {
+                    Some(w)
+                }
+            })
+            .expect("the walker is listed once the thread catches up");
+        assert_eq!(listed[0].command, "find / -name x # 100@7");
+
+        let callers = fake.callers.lock().unwrap();
+        assert!(!callers.is_empty());
+        assert!(
+            callers.iter().all(|name| name.as_deref() == Some("walks")),
+            "{callers:?}"
+        );
+    }
+
+    #[test]
+    fn a_command_is_read_only_for_a_walk() {
+        // Every `ls` opens a directory; none of them is worth a read of its
+        // command line.
+        let (fake, walks) = watch();
+        let t0 = Instant::now();
+        for pid in 200..300 {
+            fake.spawn(pid, 7, &[]);
+            walks.opened_at(pid as u64, pid, "/share", t0);
+            walks.released(pid as u64);
+        }
+        assert_eq!(fake.commands.load(Ordering::SeqCst), 0);
+
+        fake.spawn(100, 7, &[]);
+        hold(&walks, 100, &mut 1000, t0);
+        assert_eq!(fake.commands.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_held_walk_resumed_after_a_pause_is_the_same_walk() {
+        // `bfs` holding its directories, suspended with ^Z, then `fg`: still
+        // walking all along, so no end and no second start.
+        let (fake, walks) = watch();
+        fake.spawn(100, 7, &[]);
+        let t0 = Instant::now();
+        let mut fh = 0;
+        hold(&walks, 100, &mut fh, t0);
+
+        let resumed = t0 + QUIET + Duration::from_secs(60);
+        assert!(walks.prune_at(resumed).is_empty(), "never stopped");
+        assert_eq!(walks.opened_at(fh, 100, "/share/next", resumed), None);
+        let listed = walks.walkers_at(resumed);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].walking_secs,
+            (QUIET + Duration::from_secs(60)).as_secs()
+        );
+        assert_eq!(listed[0].dirs_opened, HELD_DIRS + 1);
+    }
+
+    #[test]
+    fn a_stale_thread_does_not_take_the_live_process_s_track() {
+        // Process A (pid 100) exits and B is given its id within a minute.
+        // B's thread 101 is looked up fresh; B's main thread, 100, is still
+        // remembered as A's.
+        let (fake, walks) = watch();
+        fake.spawn(100, 7, &[]);
+        let t0 = Instant::now();
+        walks.opened_at(1, 100, "/share", t0);
+        walks.released(1);
+        fake.exit(100);
+        fake.spawn(100, 8, &[101]);
+
+        let soon = t0 + Duration::from_secs(10);
+        walks.opened_at(2, 101, "/share", soon);
+        walks.opened_at(3, 100, "/share", soon);
+
+        let inner = walks.inner.lock().unwrap();
+        let track = &inner.tracks[&100];
+        assert_eq!(track.started, 8);
+        assert_eq!(track.opened, 2);
+        assert_eq!(track.open, 2);
+    }
+
+    #[test]
+    fn a_walk_that_qualifies_by_time_alone_is_reported_before_it_is_listed() {
+        // 5,001 directories in 9.5 minutes, then nothing for a while: at ten
+        // minutes it is walking, and the log must say so before the window
+        // does, or the two disagree.
+        let (fake, walks) = watch();
+        fake.spawn(100, 7, &[]);
+        let t0 = Instant::now();
+        let mut fh = 1;
+        walk(
+            &walks,
+            100,
+            &mut fh,
+            t0,
+            WALK_FOR - Duration::from_secs(30),
+            WALK_DIRS + 1,
+        );
+        let at = t0 + WALK_FOR;
+        assert!(
+            walks.walkers_at(at).is_empty(),
+            "not listed before reported"
+        );
+
+        let started = walks.tick(at, true);
+        assert_eq!(started.iter().map(|w| w.pid).collect::<Vec<_>>(), [100]);
+        assert_eq!(walks.walkers_at(at).len(), 1);
+
+        let quiet = t0 + WALK_FOR - Duration::from_secs(30) + QUIET;
+        assert_eq!(walks.prune_at(quiet).len(), 1, "and its end is said too");
+    }
+
+    #[test]
+    fn a_walker_that_exits_before_stop_is_logged_as_stopped() {
+        let capture = crate::log_capture::LogCapture::at_the_default_level();
+        let (fake, walks) = watch();
+        fake.spawn(100, 7, &[]);
+        let t0 = Instant::now();
+        hold(&walks, 100, &mut 0, t0);
+        fake.exit(100);
+
+        assert!(matches!(walks.stop_at(100, t0), Err(StopError::Gone)));
+        let text = capture.text();
+        assert!(text.contains("pid 100 (find) is walking"), "got: {text}");
+        assert!(
+            text.contains("pid 100 (find) has stopped walking"),
+            "got: {text}"
         );
     }
 

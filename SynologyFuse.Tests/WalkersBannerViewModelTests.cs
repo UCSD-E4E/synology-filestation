@@ -121,6 +121,54 @@ public class WalkersBannerViewModelTests
     }
 
     [Fact]
+    public void A_stop_that_does_not_end_it_says_so()
+    {
+        // SIGTERM can be handled, or wait behind a SIGSTOP. A row that vanished
+        // and came back five seconds later, with nothing said, read as success.
+        var h = new Harness();
+        h.Live.Add(Walker(42));
+        h.Banner.Refresh();
+        h.Banner.Items.Single().StopCommand.Execute(null);
+        Assert.Empty(h.Banner.Items);
+
+        h.Banner.Refresh();
+
+        var item = Assert.Single(h.Banner.Items);
+        Assert.Contains("still", item.Error);
+        Assert.Contains("kill -9 42", item.Error);
+        Assert.Single(h.Log, l => l.Contains("still walking after Stop"));
+
+        h.Banner.Refresh();
+        Assert.Single(h.Log, l => l.Contains("still walking after Stop"));
+    }
+
+    [Fact]
+    public void A_stop_error_fades_and_a_retry_clears_it()
+    {
+        var fails = true;
+        var h = new Harness { StopFails = _ => fails ? new InvalidOperationException("boom") : null };
+        h.Live.Add(Walker(42));
+        h.Banner.Refresh();
+        var item = h.Banner.Items.Single();
+
+        item.StopCommand.Execute(null);
+        Assert.Equal("boom", item.Error);
+        for (var i = 0; i < WalkersBannerViewModel.ErrorRefreshes; i++)
+        {
+            Assert.True(item.HasError, $"still shown after {i} refreshes");
+            h.Banner.Refresh();
+        }
+        Assert.False(item.HasError);
+
+        item.StopCommand.Execute(null);
+        Assert.True(item.HasError);
+        fails = false;
+        item.StopCommand.Execute(null);
+        Assert.Empty(h.Banner.Items);
+        Assert.False(item.HasError, "a retry clears the last failure");
+    }
+
+    [Fact]
     public void Ignore_hides_it_for_the_rest_of_its_walk()
     {
         var h = new Harness();
