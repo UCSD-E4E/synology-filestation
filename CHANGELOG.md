@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.13.0](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-fuse-v0.12.0...synology-filestation-fuse-v0.13.0) (2026-10-24)
+
+
+### Features
+
+* **ffi:** list and stop processes walking the mount ([b112320](https://github.com/UCSD-E4E/synology-filestation/commit/b112320c00acfdcfa4a14fb712f2484ef770a2a8))
+* **fuse:** notice a process walking the whole NAS ([7df6519](https://github.com/UCSD-E4E/synology-filestation/commit/7df6519c1949fb8f898b4bbdb1307f3a0b4abd08))
+* **gui:** show and stop processes walking the NAS ([997e290](https://github.com/UCSD-E4E/synology-filestation/commit/997e29098e3176b852477de4fa3a1ad31997fa03))
+
+
+### Bug Fixes
+
+* **fuse:** keep the FUSE-only test helper out of other platforms' builds ([70df07d](https://github.com/UCSD-E4E/synology-filestation/commit/70df07d0f335ff24e13089a42d0dfc8c59479064))
+* settle the review of walk detection ([5f8de0e](https://github.com/UCSD-E4E/synology-filestation/commit/5f8de0e01893391e6d6dbfe7d44c3371d4ad00bb))
+
 ## [0.12.0](https://github.com/UCSD-E4E/synology-filestation/compare/synology-filestation-fuse-v0.11.0...synology-filestation-fuse-v0.12.0) (2026-10-14)
 
 
