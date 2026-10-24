@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Text.Json;
 using SynologyFuse.Gui.Interop;
@@ -175,6 +176,28 @@ public sealed class SynoClient : IDisposable
             _client, mountpoint, cacheTtl, readCacheMb, prefetchBlocks, out var mount, ref err);
         Check(rc, ref err);
         _mount = mount;
+    }
+
+    /// <summary>The processes walking the whole mount now; none when nothing is
+    /// mounted. See <see cref="WalkerWatch"/>.</summary>
+    public IReadOnlyList<MountWalker> Walkers()
+    {
+        if (_disposed || _mount == IntPtr.Zero) return Array.Empty<MountWalker>();
+        var err = default(NativeError);
+        int rc = syno_mount_walkers(_mount, out var json, ref err);
+        Check(rc, ref err);
+        return JsonSerializer.Deserialize<MountWalker[]>(TakeString(json), JsonOpts)
+            ?? Array.Empty<MountWalker>();
+    }
+
+    /// <summary>Ask walker <paramref name="pid"/> to exit. Throws
+    /// <see cref="SynoException"/> saying why when it cannot.</summary>
+    public void StopWalker(uint pid)
+    {
+        if (_disposed || _mount == IntPtr.Zero)
+            throw new SynoException(SynoStatus.NotFound, 0, "nothing is mounted");
+        var err = default(NativeError);
+        Check(syno_mount_stop_walker(_mount, pid, ref err), ref err);
     }
 
     /// <summary>Unmount, if mounted. Blocks until the background worker exits.</summary>

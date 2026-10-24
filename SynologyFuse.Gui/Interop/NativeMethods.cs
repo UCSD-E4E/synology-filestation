@@ -129,6 +129,17 @@ internal static partial class NativeMethods
     [LibraryImport(Lib)]
     internal static partial void syno_unmount(IntPtr mount);
 
+    /// <summary>The processes walking the whole mount, as a JSON array of
+    /// <c>{pid, command, walking_secs, dirs_opened, dirs_open, latest}</c>; always
+    /// <c>[]</c> off Linux. Cheap: never touches the network.</summary>
+    [LibraryImport(Lib)]
+    internal static partial int syno_mount_walkers(IntPtr mount, out IntPtr outJson, ref NativeError err);
+
+    /// <summary>SIGTERM walker <paramref name="pid"/>; <c>NotFound</c> when it is not
+    /// walking the mount, or its id now names another process.</summary>
+    [LibraryImport(Lib)]
+    internal static partial int syno_mount_stop_walker(IntPtr mount, uint pid, ref NativeError err);
+
     // ── Logging ────────────────────────────────────────────────────────────────
 
     [LibraryImport(Lib)]
