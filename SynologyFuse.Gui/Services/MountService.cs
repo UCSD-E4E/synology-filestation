@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using SynologyFuse.Gui.Interop;
@@ -76,6 +77,19 @@ public sealed class MountService : IDisposable
     public SynoTransport Transport => _client?.Transport ?? _tested;
 
     private SynoTransport _tested = SynoTransport.Unknown;
+
+    /// <summary>The processes walking the whole mounted volume now; none when
+    /// nothing is mounted. See <see cref="WalkerWatch"/>.</summary>
+    public IReadOnlyList<MountWalker> Walkers =>
+        _client is { IsMounted: true } client ? client.Walkers() : Array.Empty<MountWalker>();
+
+    /// <summary>Ask walker <paramref name="pid"/> to exit.</summary>
+    public void StopWalker(uint pid)
+    {
+        if (_client is not { IsMounted: true } client)
+            throw new SynoException(NativeMethods.SynoStatus.NotFound, 0, "nothing is mounted");
+        client.StopWalker(pid);
+    }
 
     /// <summary>An empty setting means "not set", which the native side spells
     /// null. A blank string would be a domain of "" and a profile path of "".</summary>

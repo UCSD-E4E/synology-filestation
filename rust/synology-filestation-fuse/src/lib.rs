@@ -225,6 +225,7 @@ mod fs;
 pub mod legs;
 pub mod logfile;
 mod spill;
+pub mod walks;
 
 #[cfg(target_os = "macos")]
 mod webdav;
@@ -316,6 +317,9 @@ pub struct MountHandle {
     client: Arc<SynologyClient>,
     #[allow(dead_code)]
     inner: PlatformMount,
+    /// Who is walking the mount; FUSE only, since only it sees which process
+    /// asked. See [`walks`].
+    walks: Option<Arc<walks::Walks>>,
 }
 
 impl MountHandle {
@@ -325,6 +329,20 @@ impl MountHandle {
     /// best-effort unmount is the right contract.
     pub fn stop(self) {
         // Cleanup happens in `PlatformMount`'s `Drop` as `self` goes out of scope.
+    }
+
+    /// The processes walking the whole mount now (see [`walks`]). Always empty
+    /// off Linux.
+    pub fn walkers(&self) -> Vec<walks::Walker> {
+        self.walks.as_ref().map(|w| w.walkers()).unwrap_or_default()
+    }
+
+    /// Ask walker `pid` to exit; see [`walks::Walks::stop`].
+    pub fn stop_walker(&self, pid: u32) -> Result<(), walks::StopError> {
+        match &self.walks {
+            Some(w) => w.stop(pid),
+            None => Err(walks::StopError::NotWalking),
+        }
     }
 }
 
@@ -726,6 +744,7 @@ pub fn spawn_mount_reading_over(
         READ_BLOCK_SIZE / (1024 * 1024)
     );
 
+    let walks = Arc::new(walks::Walks::new(mountpoint.clone()));
     let fs = SynologyFS::new(
         client.clone(),
         cache,
@@ -735,7 +754,8 @@ pub fn spawn_mount_reading_over(
         owner,
         opts.prefetch_blocks,
     )
-    .reading_over(connections);
+    .reading_over(connections)
+    .watching(walks.clone());
 
     // As a non-root user, allow_other requires `user_allow_other` in
     // /etc/fuse.conf; running as root always permits it.
@@ -779,6 +799,7 @@ pub fn spawn_mount_reading_over(
             mountpoint,
             connection,
         },
+        walks: Some(walks),
     })
 }
 
@@ -979,6 +1000,7 @@ pub fn spawn_mount(
             shutdown: Some(shutdown_tx),
             server: Some(server),
         },
+        walks: None,
     })
 }
 
@@ -1177,6 +1199,7 @@ pub fn spawn_mount(
                 shutdown: Some(shutdown_tx),
                 worker: Some(worker),
             },
+            walks: None,
         }),
         Ok(Err(msg)) => {
             let _ = worker.join();

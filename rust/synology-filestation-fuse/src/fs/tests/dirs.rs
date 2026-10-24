@@ -79,7 +79,7 @@ fn names(snapshot: &Snapshot) -> Vec<String> {
 fn a_directory_read_in_pieces_is_listed_once() {
     let f = fixture_with(DEFAULT_PREFETCH_BLOCKS, 0);
     mount_dir_listing(&f, 10, Duration::ZERO);
-    let fh = f.fs.open_dir();
+    let fh = f.fs.open_dir(0, "/share");
 
     let first = readdir(&f, fh, 0);
     let later = readdir(&f, fh, 5);
@@ -97,7 +97,7 @@ fn a_directory_read_in_pieces_is_listed_once() {
 fn reading_a_directory_from_the_start_again_lists_it_again() {
     let f = fixture_with(DEFAULT_PREFETCH_BLOCKS, 0);
     mount_dir_listing(&f, 3, Duration::ZERO);
-    let fh = f.fs.open_dir();
+    let fh = f.fs.open_dir(0, "/share");
 
     readdir(&f, fh, 0);
     readdir(&f, fh, 0);
@@ -111,7 +111,7 @@ fn reading_a_directory_from_the_start_again_lists_it_again() {
 fn two_readers_of_one_directory_share_one_listing() {
     let f = fixture_with(DEFAULT_PREFETCH_BLOCKS, 0);
     mount_dir_listing(&f, 3, Duration::from_millis(500));
-    let (a, b) = (f.fs.open_dir(), f.fs.open_dir());
+    let (a, b) = (f.fs.open_dir(0, "/share"), f.fs.open_dir(0, "/share"));
 
     let first = start(&f, a, 0);
     let second = start(&f, b, 0);
@@ -146,7 +146,7 @@ fn two_readers_of_one_directory_share_one_listing() {
 fn reading_a_directory_does_not_wait_for_the_nas() {
     let f = fixture_with(DEFAULT_PREFETCH_BLOCKS, 0);
     mount_dir_listing(&f, 3, Duration::from_secs(2));
-    let fh = f.fs.open_dir();
+    let fh = f.fs.open_dir(0, "/share");
 
     let started = Instant::now();
     let answer = start(&f, fh, 0);
@@ -169,7 +169,7 @@ fn reading_a_directory_does_not_wait_for_the_nas() {
 fn closing_a_directory_lets_go_of_its_listing() {
     let f = fixture_with(DEFAULT_PREFETCH_BLOCKS, 0);
     mount_dir_listing(&f, 3, Duration::ZERO);
-    let fh = f.fs.open_dir();
+    let fh = f.fs.open_dir(0, "/share");
     readdir(&f, fh, 0);
 
     f.fs.release_dir(fh);
@@ -197,7 +197,7 @@ fn a_failed_listing_leaves_nothing_behind() {
             })))
             .mount(&f.server),
     );
-    let fh = f.fs.open_dir();
+    let fh = f.fs.open_dir(0, "/share");
 
     let answer = start(&f, fh, 0)
         .recv_timeout(Duration::from_secs(10))
@@ -208,4 +208,28 @@ fn a_failed_listing_leaves_nothing_behind() {
         f.fs.flights.lock().unwrap().is_empty(),
         "nothing left in flight for a listing that is over"
     );
+}
+
+#[test]
+fn directories_opened_count_against_the_process_that_asked() {
+    use crate::walks::{LinuxProcs, Walks, HELD_DIRS};
+
+    let mut f = fixture();
+    // As if this test process were someone else's: the mount ignores itself.
+    let walks = Arc::new(Walks::with(Arc::new(LinuxProcs), 0, "/m".into()));
+    f.fs = f.fs.watching(walks.clone());
+
+    // The kernel names the thread that asked, not its process.
+    let tid = unsafe { libc::gettid() } as u32;
+    let handles: Vec<_> = (0..HELD_DIRS).map(|_| f.fs.open_dir(tid, DIR)).collect();
+    let walkers = walks.walkers();
+    assert_eq!(walkers.len(), 1, "{walkers:?}");
+    assert_eq!(walkers[0].pid, std::process::id());
+    assert_eq!(walkers[0].dirs_open, HELD_DIRS);
+    assert_eq!(walkers[0].latest, "/m/share/big");
+
+    for fh in handles {
+        f.fs.release_dir(fh);
+    }
+    assert!(walks.walkers().is_empty(), "closed handles no longer count");
 }

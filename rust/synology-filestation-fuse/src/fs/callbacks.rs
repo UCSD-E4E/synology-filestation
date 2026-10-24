@@ -168,13 +168,13 @@ impl Filesystem for SynologyFS {
     /// pass reads (see `dirs`). The reply is also the only place to tell the
     /// kernel it may cache the directory, and fuser's default says nothing.
     /// See [`dir_open_flags`].
-    fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
-        if self.get_path_for_ino(ino.0).is_none() {
+    fn opendir(&self, req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        let Some(path) = self.get_path_for_ino(ino.0) else {
             reply.error(Errno::ENOENT);
             return;
-        }
+        };
         reply.opened(
-            FileHandle(self.open_dir()),
+            FileHandle(self.open_dir(req.pid(), &path)),
             dir_open_flags(self.dir_cache.is_enabled()),
         );
     }

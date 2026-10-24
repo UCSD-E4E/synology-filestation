@@ -108,6 +108,62 @@
           </Grid>
         </Border>
 
+        <!-- Walkers banner. A search from / or the home folder that wanders
+             into the mount reads every folder on the NAS for days, and the
+             program that started it has usually stopped listening; this is
+             the only place that says so. One row per process, each with the
+             command line (selectable, to tell which search it is) and Stop. -->
+        <Border IsVisible="{Binding Walkers.IsVisible}"
+                Background="#FFF3CD"
+                BorderBrush="#FFE69C"
+                BorderThickness="1"
+                CornerRadius="4"
+                Padding="12,8"
+                Margin="0,0,0,10">
+          <StackPanel Spacing="8">
+            <ItemsControl ItemsSource="{Binding Walkers.Items}">
+              <ItemsControl.ItemTemplate>
+                <DataTemplate x:DataType="vm:WalkerItemViewModel">
+                  <Grid ColumnDefinitions="*,Auto,Auto" Margin="0,0,0,6">
+                    <StackPanel Grid.Column="0" Spacing="2">
+                      <TextBlock Text="{Binding Headline}"
+                                 FontWeight="SemiBold"
+                                 Foreground="#664D03"
+                                 TextWrapping="Wrap" />
+                      <TextBlock Text="{Binding Summary}"
+                                 Foreground="#664D03"
+                                 TextWrapping="Wrap" />
+                      <SelectableTextBlock Text="{Binding Command}"
+                                           Foreground="#664D03"
+                                           Opacity="0.75"
+                                           FontSize="11"
+                                           FontFamily="monospace"
+                                           TextWrapping="Wrap" />
+                      <TextBlock Text="{Binding Error}"
+                                 IsVisible="{Binding HasError}"
+                                 Foreground="#721C24"
+                                 TextWrapping="Wrap" />
+                    </StackPanel>
+                    <Button Grid.Column="1"
+                            Content="Stop"
+                            Command="{Binding StopCommand}"
+                            VerticalAlignment="Top"
+                            Margin="8,0,4,0" />
+                    <Button Grid.Column="2"
+                            Content="Ignore"
+                            Command="{Binding IgnoreCommand}"
+                            VerticalAlignment="Top" />
+                  </Grid>
+                </DataTemplate>
+              </ItemsControl.ItemTemplate>
+            </ItemsControl>
+            <TextBlock Text="{Binding Walkers.Remedy}"
+                       Foreground="#664D03"
+                       FontSize="12"
+                       TextWrapping="Wrap" />
+          </StackPanel>
+        </Border>
+
         <!-- Update available banner -->
         <Border IsVisible="{Binding ShowUpdateBanner}"
                 Background="#D1ECF1"

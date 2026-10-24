@@ -30,6 +30,7 @@ use synology_filestation_core::error::SynoFsError;
 use synology_filestation_core::types::SynoFileInfo;
 use synology_filestation_core::ThrottleConfig;
 use synology_filestation_fuse::legs::{Legs, DEFAULT_WATCH_INTERVAL};
+use synology_filestation_fuse::walks::{StopError, Walker};
 use synology_filestation_fuse::{
     is_otp_required, live_read_connections, spawn_mount_reading_over, MountOptions,
 };
@@ -485,9 +486,9 @@ async fn reach(
 
 /// Opaque live-mount handle.
 pub struct SynoMount {
-    // Never read: dropping it is what unmounts, and teardown drops the whole
-    // mount rather than reaching in for this.
-    _handle: synology_filestation_fuse::MountHandle,
+    // Dropping it is what unmounts, and teardown drops the whole mount rather
+    // than reaching in for this. Read only to ask who is walking it.
+    handle: synology_filestation_fuse::MountHandle,
     // Keeps the runtime alive for the duration of the mount (the FUSE/WinFsp
     // callbacks block on it). Dropped after the mount is torn down.
     _runtime: Arc<Runtime>,
@@ -1242,7 +1243,7 @@ pub unsafe extern "C" fn syno_mount(
         ) {
             Ok(handle) => {
                 let mount = Box::new(SynoMount {
-                    _handle: handle,
+                    handle,
                     _runtime: c.runtime.clone(),
                 });
                 *out = Box::into_raw(mount);
@@ -1291,6 +1292,69 @@ pub unsafe extern "C" fn syno_unmount(mount: *mut SynoMount) {
             );
         }
     }));
+}
+
+// ─── Walkers ─────────────────────────────────────────────────────────────────
+
+/// The processes walking the whole mount now, as a JSON array in `*out_json`
+/// (free it with [`syno_string_free`]). Each element is
+/// `{pid, program, command, walking_secs, dirs_opened, dirs_open, latest}`; see
+/// `synology_filestation_fuse::walks`. Always `[]` off Linux, where the mount
+/// cannot tell which process asked.
+///
+/// Cheap: it reads what the mount has already counted, and never touches the
+/// network, so a window can ask every few seconds.
+///
+/// # Safety
+/// `mount` must be a live handle from [`syno_mount`] or null; `out_json` must
+/// be non-null.
+#[no_mangle]
+pub unsafe extern "C" fn syno_mount_walkers(
+    mount: *const SynoMount,
+    out_json: *mut *mut c_char,
+    err: *mut SynoError,
+) -> i32 {
+    guard(err, || match mount.as_ref() {
+        Some(mount) => emit_json(out_json, &walkers_json(&mount.handle.walkers()), err),
+        None => set_err(err, SynoStatus::NullArg, 0, "mount must not be null"),
+    })
+}
+
+/// Ask walker `pid` to exit (`SIGTERM`). Refused with `NotFound` when that
+/// process is not walking the mount, or its id now names another process.
+///
+/// # Safety
+/// `mount` must be a live handle from [`syno_mount`] or null.
+#[no_mangle]
+pub unsafe extern "C" fn syno_mount_stop_walker(
+    mount: *const SynoMount,
+    pid: u32,
+    err: *mut SynoError,
+) -> i32 {
+    guard(err, || {
+        let Some(mount) = mount.as_ref() else {
+            return set_err(err, SynoStatus::NullArg, 0, "mount must not be null");
+        };
+        match mount.handle.stop_walker(pid) {
+            Ok(()) => SynoStatus::Ok as i32,
+            Err(e) => set_err(err, stop_status(&e), 0, &e.to_string()),
+        }
+    })
+}
+
+fn walkers_json(walkers: &[Walker]) -> serde_json::Value {
+    serde_json::to_value(walkers).unwrap_or_else(|_| serde_json::json!([]))
+}
+
+/// How a refused stop is reported.
+fn stop_status(e: &StopError) -> SynoStatus {
+    match e {
+        StopError::NotWalking | StopError::Gone => SynoStatus::NotFound,
+        StopError::Io(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            SynoStatus::PermissionDenied
+        }
+        StopError::Io(_) => SynoStatus::Io,
+    }
 }
 
 // ─── Logging ─────────────────────────────────────────────────────────────────
@@ -2100,5 +2164,67 @@ mod tests {
         // what any of them mean.
         assert!(SynoTransport::Https < SynoTransport::SmbOverVpn);
         assert!(SynoTransport::SmbOverVpn < SynoTransport::SmbDirect);
+    }
+    #[test]
+    fn walkers_are_listed_with_every_key() {
+        let walkers = [Walker {
+            pid: 42,
+            program: "bfs".into(),
+            command: "bfs / -name x".into(),
+            walking_secs: 700,
+            dirs_opened: 6000,
+            dirs_open: 1300,
+            latest: "/home/u/mnt/share/d".into(),
+        }];
+        assert_eq!(
+            walkers_json(&walkers),
+            serde_json::json!([{
+                "pid": 42,
+                "program": "bfs",
+                "command": "bfs / -name x",
+                "walking_secs": 700,
+                "dirs_opened": 6000,
+                "dirs_open": 1300,
+                "latest": "/home/u/mnt/share/d",
+            }])
+        );
+        assert_eq!(walkers_json(&[]), serde_json::json!([]));
+    }
+
+    #[test]
+    fn a_refused_stop_says_why() {
+        assert_eq!(
+            stop_status(&StopError::NotWalking) as i32,
+            SynoStatus::NotFound as i32
+        );
+        assert_eq!(
+            stop_status(&StopError::Gone) as i32,
+            SynoStatus::NotFound as i32
+        );
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            stop_status(&StopError::Io(denied)) as i32,
+            SynoStatus::PermissionDenied as i32
+        );
+        let other = std::io::Error::other("boom");
+        assert_eq!(
+            stop_status(&StopError::Io(other)) as i32,
+            SynoStatus::Io as i32
+        );
+    }
+
+    #[test]
+    fn walkers_of_no_mount_is_a_null_argument() {
+        let mut out = ptr::null_mut();
+        let mut err = empty_err();
+        let status = unsafe { syno_mount_walkers(ptr::null(), &mut out, &mut err) };
+        assert_eq!(status, SynoStatus::NullArg as i32);
+        assert!(out.is_null());
+        unsafe { syno_string_free(err.message) };
+
+        let mut err = empty_err();
+        let status = unsafe { syno_mount_stop_walker(ptr::null(), 42, &mut err) };
+        assert_eq!(status, SynoStatus::NullArg as i32);
+        unsafe { syno_string_free(err.message) };
     }
 }

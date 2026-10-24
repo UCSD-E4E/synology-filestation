@@ -57,6 +57,9 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
 
         _mountService.OutputReceived += OnOutput;
 
+        Walkers = new WalkersBannerViewModel(
+            new WalkerWatch(() => _mountService.Walkers), _mountService.StopWalker, AppendLog);
+
         var v = UpdateCheckService.CurrentVersion();
         Version = $"v{v.Major}.{v.Minor}.{v.Build}";
 
@@ -249,6 +252,14 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
     /// starts, so a stale failure never sits next to a fresh success.</summary>
     public ErrorBannerViewModel ErrorBanner { get; } = new();
 
+    // ── Walkers banner ────────────────────────────────────────────────────────
+
+    /// <summary>Processes reading every folder on the NAS, with a way to stop
+    /// each. Looked at on the transport tick while a volume is up. A failed
+    /// read is the watch's to absorb (see <see cref="WalkerWatch.Poll"/>), so
+    /// the tick never throws.</summary>
+    public WalkersBannerViewModel Walkers { get; }
+
     // ── Update banner ─────────────────────────────────────────────────────────
 
     [ObservableProperty]
@@ -371,6 +382,7 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
                 Transport = now;
                 AppendLog($"Now using {TransportBadge}.");
             }
+            Walkers.Refresh();
         };
         _transportTimer.Start();
     }
@@ -382,6 +394,7 @@ public sealed partial class MainWindowViewModel : ObservableObject, IDisposable
     {
         _transportTimer?.Stop();
         _transportTimer = null;
+        Walkers.Clear();
     }
 
     private bool CanConnect() =>
