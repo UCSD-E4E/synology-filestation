@@ -191,10 +191,13 @@ impl SynologyFS {
         }
     }
 
-    /// A handle for one pass over a directory.
-    pub(super) fn open_dir(&self) -> u64 {
+    /// A handle for one pass over the directory at `path`, for thread `tid`.
+    pub(super) fn open_dir(&self, tid: u32, path: &str) -> u64 {
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
         self.dir_handles.lock().unwrap().insert(fh, None);
+        if let Some(walks) = &self.walks {
+            walks.opened(fh, tid, path);
+        }
         fh
     }
 
@@ -205,6 +208,9 @@ impl SynologyFS {
         // every other open, read and close waits on it.
         let released = self.dir_handles.lock().unwrap().remove(&fh);
         drop(released);
+        if let Some(walks) = &self.walks {
+            walks.released(fh);
+        }
     }
 
     /// The snapshot `readdir` at `offset` on `fh` answers from, handed to

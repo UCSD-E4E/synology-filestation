@@ -8,6 +8,7 @@ use tracing::{debug, error, warn};
 
 use crate::cache::{DirCache, InodeCache, ReadCache};
 use crate::spill::SpillBuffer;
+use crate::walks::Walks;
 use synology_filestation_core::client::SynologyClient;
 use synology_filestation_core::error::SynoFsError;
 use synology_filestation_core::transport::WriteOpen;
@@ -85,6 +86,10 @@ pub struct SynologyFS {
     dir_handles: DirHandles,
     /// Listings being fetched, so a second reader waits for the first.
     flights: Flights,
+    /// Who is opening directories, so a process walking the whole NAS is
+    /// noticed. See [`crate::walks`]. None until [`SynologyFS::watching`]: a
+    /// filesystem nobody asks about has no reason to read `/proc`.
+    walks: Option<Arc<Walks>>,
 }
 
 impl SynologyFS {
@@ -135,7 +140,15 @@ impl SynologyFS {
             prefetch_tasks: Arc::new(Mutex::new(HashMap::new())),
             dir_handles: Arc::new(Mutex::new(HashMap::new())),
             flights: Arc::new(Mutex::new(HashMap::new())),
+            walks: None,
         }
+    }
+
+    /// Report directory opens to `walks`, which the mount shares with whoever
+    /// asks who is walking it.
+    pub fn watching(mut self, walks: Arc<Walks>) -> Self {
+        self.walks = Some(walks);
+        self
     }
 
     /// Read over however many connections `connections` says, from now on.
