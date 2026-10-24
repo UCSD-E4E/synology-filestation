@@ -314,8 +314,9 @@ impl Walks {
         }
     }
 
-    /// Without a thread: every call is answered on the caller's.
-    #[cfg(test)]
+    /// Without a thread: every call is answered on the caller's. For the
+    /// FUSE tests, so Linux only.
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn with(procs: Arc<dyn Procs>, own: u32, mountpoint: PathBuf) -> Self {
         Self {
             core: Arc::new(Core::new(procs, own, mountpoint)),
